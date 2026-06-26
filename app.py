@@ -7655,6 +7655,7 @@ def remote_assist_coturn_install():
       - --log-file=stdout
       - --external-ip={ip}
       - --listening-port=3478
+      - --listening-ip=0.0.0.0
       - --min-port=50000
       - --max-port=50050
       - --user={username}:{password}
@@ -59714,7 +59715,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <p>Please provide credentials and the public IP where the turn server will reside.</p>
   <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser"></div>
   <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 199.241.139.160" value="{{ settings.get('public_ip', '') }}"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('public_ip', '') }}"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
   <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
