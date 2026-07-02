@@ -62192,10 +62192,10 @@ function refreshRaVersion(manual){
   }).catch(function(){restoreCheckBtn();});
 }
 function doCoturnInstall(){
-  var u=document.getElementById('coturn-user').value, p=document.getElementById('coturn-pass').value, ip=document.getElementById('coturn-ip').value, msg=document.getElementById('coturn-install-msg');
+  var u=document.getElementById('coturn-user').value, p=document.getElementById('coturn-pass').value, ip=document.getElementById('coturn-ip').value, port=document.getElementById('coturn-port').value || '3478', msg=document.getElementById('install-coturn-msg') || document.getElementById('coturn-install-msg') || {textContent: ''};
   if(!u||!p||!ip){msg.textContent='All fields are required.';return;}
   msg.textContent='Installing...';
-  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip,port:port}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     if(d.error){msg.textContent=d.error;return;}
     msg.textContent='Success! Reloading...';
     setTimeout(function(){location.reload();},1000);
