@@ -8712,15 +8712,15 @@ def remote_assist_coturn_install():
     image: coturn/coturn:latest
     restart: unless-stopped
     ports:
-      - "3478:3478/tcp"
-      - "3478:3478/udp"
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
       - "50000-50050:50000-50050/udp"
     command:
       - -c
       - ""
       - --log-file=stdout
       - --external-ip={ip}
-      - --listening-port=3478
+      - --listening-port={port}
       - --listening-ip=0.0.0.0
       - --min-port=50000
       - --max-port=50050
