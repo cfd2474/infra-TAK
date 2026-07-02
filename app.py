@@ -8695,7 +8695,11 @@ def remote_assist_coturn_install():
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
     ip = data.get('ip', '').strip()
-    port = data.get('port', '3478').strip() or '3478'
+    port = data.get('port', '3478')
+    if isinstance(port, str): port = port.strip() or '3478'
+    else: port = str(port) or '3478'
+    import logging
+    logging.warning(f"DEBUG_INSTALL: data received={data}, port resolved to={port}")
     if not username or not password or not ip:
         return jsonify({'success': False, 'error': 'All fields are required.'})
     
