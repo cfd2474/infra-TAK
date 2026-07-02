@@ -8574,9 +8574,41 @@ def remote_assist_update_status_api():
     return jsonify(_remote_assist_update_status)
 
 
+
+def check_netbird_coturn_status():
+    import subprocess, json
+    has_netbird = False
+    netbird_coturn_container = None
+    turnserver_conf_path = None
+    try:
+        out = subprocess.check_output(["docker", "ps", "--format", "{{.Names}}"], text=True)
+        containers = [c.strip() for c in out.split('\n') if c.strip()]
+        if any("netbird" in c.lower() for c in containers):
+            has_netbird = True
+            
+        if has_netbird:
+            for c in containers:
+                c_lower = c.lower()
+                if "coturn" in c_lower and "remote-assist" not in c_lower and "infratak" not in c_lower:
+                    netbird_coturn_container = c
+                    break
+            
+            if netbird_coturn_container:
+                inspect_out = subprocess.check_output(["docker", "inspect", netbird_coturn_container], text=True)
+                data = json.loads(inspect_out)
+                for mount in data[0].get('Mounts', []):
+                    if mount.get('Destination') == '/etc/turnserver.conf':
+                        turnserver_conf_path = mount.get('Source')
+                        break
+    except Exception:
+        pass
+    
+    return has_netbird, netbird_coturn_container, turnserver_conf_path
+
 @app.route('/remote-assist')
 @login_required
 def remote_assist_page():
+
     from flask import make_response
     settings = load_settings()
     modules = detect_modules()
