@@ -8736,7 +8736,12 @@ def remote_assist_coturn_install():
         with open(override_path, 'w') as f:
             f.write(override_content)
         
-        _sp.run(['docker', 'compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.override.yml', 'up', '-d', 'coturn'], cwd=ra_dir, check=True)
+        result = _sp.run(['docker', 'compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.override.yml', 'up', '-d', 'coturn'], cwd=ra_dir, capture_output=True, text=True)
+        if result.returncode != 0:
+            if "port is already allocated" in result.stderr or "Bind for" in result.stderr:
+                return jsonify({'success': False, 'error': f"Port conflict detected! It looks like port {port} is already in use by another service on your server. Please enter a different port (e.g. 3479)."})
+            else:
+                return jsonify({'success': False, 'error': f"Failed to start Coturn:\n{result.stderr.strip()}"})
         
         settings['coturn_installed'] = True
         settings['coturn_username'] = username
