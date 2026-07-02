@@ -8598,6 +8598,9 @@ def remote_assist_page():
     has_netbird, nb_container, nb_conf = check_netbird_coturn_status()
     can_configure_nb_coturn = has_netbird and bool(nb_container) and bool(nb_conf)
     
+    netbird_coturn_in_use = settings.get('netbird_coturn_in_use', False)
+    netbird_coturn_missing = netbird_coturn_in_use and not bool(nb_container)
+    
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
@@ -8607,6 +8610,7 @@ def remote_assist_page():
         coturn_installed=coturn_installed, coturn_username=coturn_username,
         coturn_password=coturn_password, coturn_url=coturn_url, coturn_ip=coturn_ip,
         can_configure_nb_coturn=can_configure_nb_coturn,
+        netbird_coturn_missing=netbird_coturn_missing,
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -8645,6 +8649,7 @@ def remote_assist_coturn_configure_nb():
         settings['coturn_username'] = username
         settings['coturn_password'] = password
         settings['coturn_ip'] = ip_out
+        settings['netbird_coturn_in_use'] = True
         save_settings(settings)
         return jsonify({'status': 'ok'})
     except Exception as e:
@@ -8699,6 +8704,7 @@ def remote_assist_coturn_install():
         settings['coturn_username'] = username
         settings['coturn_password'] = password
         settings['coturn_ip'] = ip
+        settings['netbird_coturn_in_use'] = False
         save_settings(settings)
         return jsonify({'success': True})
     except Exception as e:
