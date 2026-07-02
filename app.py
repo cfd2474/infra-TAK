@@ -8625,7 +8625,8 @@ def remote_assist_page():
     coturn_username = settings.get('coturn_username', '')
     coturn_password = settings.get('coturn_password', '')
     coturn_ip = settings.get('coturn_ip', '')
-    coturn_url = f"turn:{coturn_ip}:3478" if coturn_ip else ""
+    coturn_port = settings.get('coturn_port', '3478')
+    coturn_url = f"turn:{coturn_ip}:{coturn_port}" if coturn_ip else ""
     
     has_netbird, nb_container, nb_conf = check_netbird_coturn_status()
     can_configure_nb_coturn = has_netbird and bool(nb_container) and bool(nb_conf)
@@ -8694,6 +8695,7 @@ def remote_assist_coturn_install():
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
     ip = data.get('ip', '').strip()
+    port = data.get('port', '3478').strip() or '3478'
     if not username or not password or not ip:
         return jsonify({'success': False, 'error': 'All fields are required.'})
     
@@ -8736,6 +8738,7 @@ def remote_assist_coturn_install():
         settings['coturn_username'] = username
         settings['coturn_password'] = password
         settings['coturn_ip'] = ip
+        settings['coturn_port'] = port
         settings['netbird_coturn_in_use'] = False
         save_settings(settings)
         return jsonify({'success': True})
@@ -62119,7 +62122,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <p>Please provide credentials and the public IP where the turn server will reside.</p>
   <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser"></div>
   <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('public_ip', '') }}"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('public_ip', '') }}"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="3478"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
   <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
