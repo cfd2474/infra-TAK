@@ -8595,6 +8595,9 @@ def remote_assist_page():
     coturn_ip = settings.get('coturn_ip', '')
     coturn_url = f"turn:{coturn_ip}:3478" if coturn_ip else ""
     
+    has_netbird, nb_container, nb_conf = check_netbird_coturn_status()
+    can_configure_nb_coturn = has_netbird and bool(nb_container) and bool(nb_conf)
+    
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
@@ -8603,11 +8606,49 @@ def remote_assist_page():
         remote_assist_logo_url=REMOTE_ASSIST_LOGO_URL,
         coturn_installed=coturn_installed, coturn_username=coturn_username,
         coturn_password=coturn_password, coturn_url=coturn_url, coturn_ip=coturn_ip,
+        can_configure_nb_coturn=can_configure_nb_coturn,
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
+
+@app.route('/api/remote-assist/coturn/configure-netbird', methods=['POST'])
+@login_required
+def remote_assist_coturn_configure_nb():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    
+    if not username or not password:
+        return jsonify({'error': 'Missing credentials'}), 400
+        
+    has_netbird, nb_container, conf_path = check_netbird_coturn_status()
+    if not has_netbird or not nb_container or not conf_path:
+        return jsonify({'error': 'NetBird Coturn is not available for configuration.'}), 400
+        
+    try:
+        import subprocess
+        with open(conf_path, 'r') as f:
+            c = f.read()
+        
+        user_line = f"user={username}:{password}"
+        if user_line not in c:
+            with open(conf_path, 'a') as f:
+                f.write(f"\n{user_line}\n")
+                
+        subprocess.run(["docker", "restart", nb_container], check=True)
+        ip_out = subprocess.check_output(["curl", "-s", "https://api.ipify.org"]).decode().strip()
+        
+        settings = load_settings()
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip_out
+        save_settings(settings)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/remote-assist/coturn/install', methods=['POST'])
 @login_required
@@ -61996,10 +62037,17 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
       <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall Coturn</button>
     {% else %}
+      {% if can_configure_nb_coturn %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">
+        NetBird installation detected with an existing Coturn container. You can configure NetBird's Coturn server instead of installing a new one.
+      </p>
+      <button class="btn btn-primary" onclick="document.getElementById('configure-nb-coturn-modal').classList.add('open')">Configure NetBird Coturn</button>
+      {% else %}
       <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">
         Install a local Coturn server for STUN/TURN capabilities to assist with WebRTC connections.
       </p>
       <button class="btn btn-primary" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install Coturn Server</button>
+      {% endif %}
     {% endif %}
   </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
@@ -62019,6 +62067,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="configure-nb-coturn-modal"><div class="modal">
+  <h3>Configure NetBird Coturn</h3>
+  <p>Please provide credentials to append to your NetBird Coturn configuration.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="nb-coturn-user" type="text" placeholder="turnuser"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('configure-nb-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doNBCoturnConfig()">Configure</button></div>
+  <div id="nb-coturn-config-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 <div class="modal-overlay" id="install-coturn-modal"><div class="modal">
   <h3>Install Coturn Server</h3>
