@@ -35,12 +35,12 @@ KEY = 'atlas'
 # the repo.
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
-ATLAS_TAG = 'v0.1.2'
+ATLAS_TAG = 'v0.1.3'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'f0c270174e688d4b93501ff16e5b08649b5c5584'
+ATLAS_SHA = 'a690aef7a8b485b4310d5c86b953fc16cceafa8f'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
