@@ -531,6 +531,35 @@ def _installed_version(ctx):
         return None
 
 
+def get_version_info(ctx):
+    """`{version, update_available, latest}` — the shape the console cards read.
+
+    ⚠️ The dashboard is where an operator actually notices an update; the
+    module's own page is somewhere they go only once they already suspect one.
+    `get_all_module_versions()` is what fills those cards, and a module absent
+    from it simply shows no badge — silently, because nothing is broken.
+
+    ⚠️ `update_available` is true only when *both* versions parsed and upstream
+    is genuinely higher. An unreachable GitHub leaves `latest` null and the flag
+    false, so a rate-limited box is never told it is current — it is told
+    nothing, which the card renders as no badge rather than a reassuring one.
+    """
+    installed = _installed_version(ctx)
+    latest = _latest_version()
+    here, there = _parse_version(installed), _parse_version(latest)
+
+    if there and not here:
+        # ⚠️ An install with no readable VERSION predates the file itself, which
+        # arrived in 1.0.0 — so it is older than any release we can see, and it
+        # is precisely the deployment that most needs telling. Reporting "no
+        # update" here would leave the oldest boxes the quietest.
+        update = bool(installed is None or not installed)
+    else:
+        update = bool(here and there and there > here)
+
+    return {'version': installed or '', 'latest': latest, 'update_available': update}
+
+
 def _run_update(ctx):
     """Fetch the newest release and rebuild in place. Data is never touched.
 
@@ -806,13 +835,13 @@ def register(ctx):
         GitHub's 60/hour spent) leaves it False and `latest` null, so the page
         can say "could not check" instead of claiming the box is current.
         """
-        installed = _installed_version(ctx)
-        latest = _latest_version()
-        here, there = _parse_version(installed), _parse_version(latest)
+        info = get_version_info(ctx)
+        # The page distinguishes "no version" from an empty string; the cards
+        # want a string. One source of truth, one conversion.
         return jsonify({
-            'version': installed,
-            'latest': latest,
-            'update_available': bool(here and there and there > here),
+            'version': info['version'] or None,
+            'latest': info['latest'],
+            'update_available': info['update_available'],
         })
 
     def update_view():

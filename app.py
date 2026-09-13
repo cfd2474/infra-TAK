@@ -31418,6 +31418,10 @@ def get_all_module_versions():
     if modules.get('tak_video_restreamer', {}).get('installed'):
         # registry-resident since v10.1.24 — modules/tvr.py owns the SHA compare
         _set('tak_video_restreamer', lambda: mod_registry.tvr.get_version_info(mod_registry.get_ctx()))
+    if modules.get('atlas', {}).get('installed'):
+        # Registry-resident: modules/atlas.py owns the compare, which is by
+        # release tag rather than by commit.
+        _set('atlas', lambda: mod_registry.atlas.get_version_info(mod_registry.get_ctx()))
     if modules.get('simulator', {}).get('installed'):
         # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
