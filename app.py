@@ -20639,29 +20639,14 @@ def guarddog_update():
     try:
         _auto_update_guarddog()
         # Ensure update-check units exist and are enabled.
-        # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer, which ran
-        # tak-updates-watch.sh — a duplicate of the _update_notify_loop() notifier. Now it
-        # removes them. Idempotent: silent no-op once the units are gone.
-        service_path = '/etc/systemd/system/takupdatesguard.service'
-        timer_path = '/etc/systemd/system/takupdatesguard.timer'
-        if os.path.exists(service_path) or os.path.exists(timer_path):
-            # mode='seq': disable/stop legitimately fail when the unit is already gone or
-            # masked, and that must not stop the rm — this has to converge on every box.
-            _run_priv_chain([
-                ['systemctl', 'disable', '--now', 'takupdatesguard.timer'],
-                ['systemctl', 'stop', 'takupdatesguard.service'],
-                ['rm', '-f', timer_path],
-                ['rm', '-f', service_path],
-                ['systemctl', 'daemon-reload'],
-            ], 'seq', timeout=30)
-            # Verify rather than assume — a removal that silently did nothing is the whole
-            # reason this customer got two emails a day for months.
-            if os.path.exists(service_path) or os.path.exists(timer_path):
-                print('[update-notify] WARNING: legacy takupdatesguard units still present '
-                      'after removal attempt', flush=True)
-            else:
-                print('[update-notify] removed legacy takupdatesguard timer/service '
-                      '(duplicate update emails - v10.1.69 W5)', flush=True)
+        # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer. It now
+        # removes them — see _startup_retire_updates_timer(), which is the primary path
+        # (startup, so it rides the console update). Called here too so a Guard Dog deploy
+        # cannot silently reinstate what startup removed.
+        try:
+            _startup_retire_updates_timer()
+        except Exception as _rt_err:
+            print(f'[guarddog] retire updates timer failed (non-fatal): {_rt_err}', flush=True)
         # Auto-vacuum timer (daily 3am) — install if script exists but timer doesn't
         av_script = '/opt/tak-guarddog/tak-auto-vacuum.sh'
         av_svc_path = '/etc/systemd/system/takautovacuum.service'
@@ -21028,6 +21013,41 @@ def _update_notify_check_once():
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
     return {'pending': pending, 'emailed': emailed}
+
+
+def _startup_retire_updates_timer():
+    """v10.1.69 W5: remove the legacy takupdatesguard timer/service.
+
+    It ran tak-updates-watch.sh, a SECOND update-notification path that mailed the same
+    pending updates as _update_notify_loop() on its own 6 h cycle. Each deduped only
+    against itself, so neither could see the other's mail and customers got two emails
+    per update set (field report, Charles Laird/NC 2026-09-12 — two subjects 75 min apart
+    on two 6 h cycles).
+
+    Runs at STARTUP, not from the Guard Dog deploy route: fixes ride the console update
+    ([[feedback-console-path-delivery]]). Idempotent — silent no-op once the units are gone."""
+    service_path = '/etc/systemd/system/takupdatesguard.service'
+    timer_path = '/etc/systemd/system/takupdatesguard.timer'
+    if not (os.path.exists(service_path) or os.path.exists(timer_path)):
+        return False
+    # mode='seq': disable/stop legitimately fail when a unit is already masked or stopped,
+    # and that must not stop the rm — this has to converge on every box.
+    _run_priv_chain([
+        ['systemctl', 'disable', '--now', 'takupdatesguard.timer'],
+        ['systemctl', 'stop', 'takupdatesguard.service'],
+        ['rm', '-f', timer_path],
+        ['rm', '-f', service_path],
+        ['systemctl', 'daemon-reload'],
+    ], 'seq', timeout=30)
+    # Verify rather than assume — a removal that silently did nothing is exactly how this
+    # customer got two emails a day for months.
+    if os.path.exists(service_path) or os.path.exists(timer_path):
+        print('Startup migration: WARNING legacy takupdatesguard units still present after '
+              'removal attempt', flush=True)
+        return False
+    print('Startup migration: removed legacy takupdatesguard timer/service '
+          '(duplicate update emails - v10.1.69 W5)', flush=True)
+    return True
 
 
 def _update_notify_loop():
@@ -76769,6 +76789,11 @@ def _startup_migrations():
         # v10.1.50: converge grace_period FIRST. _startup_caddy_selfheal() returns early
         # on a Caddyfile that parses — which is nearly every box — so hanging this off it
         # would have healed almost nothing.
+        try:
+            _startup_retire_updates_timer()
+        except Exception as _rt_err:
+            print(f"Startup migration: retire updates timer error (non-fatal): {_rt_err}",
+                  flush=True)
         try:
             _startup_caddy_grace_period_converge()
         except Exception as _gp_err:
