@@ -22,10 +22,17 @@ Three things about that shape the whole module:
 holds the certificate for `atlas.<fqdn>`; two clients contending for :80 does not
 resolve in a config file, it means one of them quietly stops renewing.
 """
+import json
 import os
 import secrets
 import shutil
 import subprocess
+# ⚠️ Module level. `ensure_authentik_app` sleeps between attempts while it
+# waits for Authentik's authorization flow; in app.py that name came from a
+# module-level import, and moving the function here left it unbound. It only
+# fires when the flow is not ready on the first try — a fresh box — so it
+# would have waited for the worst possible moment to surface.
+import time
 
 from . import register_module, job_log
 
@@ -417,7 +424,7 @@ def deploy(ctx, job, params):
             # Without an application the outpost has nothing to authorise, so
             # Caddy's forward_auth never sets the identity headers ATLAS reads
             # and the console answers 401 to everyone, permanently.
-            ctx['_ensure_authentik_atlas_app'](fqdn, token, plog=plog, settings=s)
+            ensure_authentik_app(ctx, fqdn, token, plog=plog, settings=s)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -448,6 +455,244 @@ def deploy(ctx, job, params):
     except Exception as exc:
         plog(f'ERROR: {exc}')
         job.update({'running': False, 'complete': False, 'error': True})
+
+
+# --------------------------------------------------------------------------- #
+# Authentik, and the CA Caddy needs
+#
+# ⚠️ These live here rather than in app.py. They are ATLAS's own logic — how
+# ATLAS registers itself with Authentik, how it is restricted to
+# administrators, and where its device CA has to be copied for Caddy to read.
+# Nothing else in infra-TAK calls them, so nothing else should carry them: the
+# module adapts to the console, not the other way round.
+#
+# What they *do* need from the console arrives through ctx, which is the
+# sanctioned direction (rule 10: a module imports nothing from app.py).
+# --------------------------------------------------------------------------- #
+
+def sync_device_ca_for_caddy():
+    """Deploy a Caddy-readable copy of ATLAS's device CA; return its path or None.
+
+    ATLAS issues its own client certificates to enrolled tablets, and Caddy has
+    to verify them at the device listener. The CA lives in the module's install
+    directory, which is root-owned — and Caddy runs as the unprivileged `caddy`
+    user, so pointing `client_auth` there makes Caddy fail to start. Same
+    problem, same answer, as the custom-certificate copy below.
+
+    ⚠️ Only the *certificate* is copied. The CA private key stays where it is:
+    Caddy needs to verify signatures, which takes the public half alone, and a
+    copy of the key readable by a web server is a fleet's device identity one
+    file-read away.
+    """
+    import shutil, pwd
+    for base_dir in ('/root/atlas', os.path.expanduser('~/atlas')):
+        src = os.path.join(base_dir, 'pki', 'ca.crt')
+        if os.path.exists(src):
+            break
+    else:
+        return None
+    try:
+        try:
+            caddy_pw = pwd.getpwnam('caddy')
+            base = caddy_pw.pw_dir if os.path.isdir(caddy_pw.pw_dir) else '/var/lib/caddy'
+        except KeyError:
+            caddy_pw = None
+            base = '/var/lib/caddy'
+        dest_dir = os.path.join(base, KEY)
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, 'device-ca.crt')
+        shutil.copyfile(src, dest)
+        os.chmod(dest, 0o644)
+        if caddy_pw:
+            os.chown(dest_dir, caddy_pw.pw_uid, caddy_pw.pw_gid)
+            os.chown(dest, caddy_pw.pw_uid, caddy_pw.pw_gid)
+        return dest
+    except Exception as exc:
+        print('[' + KEY + '] could not stage device CA for Caddy: ' + str(exc), flush=True)
+        return None
+
+
+def _restrict_to_admins(ak_url, ak_headers, plog=None):
+    """Bind "Allow authentik Admins" to the ATLAS application. Returns True when
+    the application is restricted, False when it is NOT.
+
+    ⚠️ This cannot wait for the startup access-policy converge. That converge
+    is default-deny and would catch ATLAS eventually — but it runs when the
+    console *boots*, and a module deploy does not reboot the console. In between,
+    the application exists with no binding at all, and ATLAS is configured with an
+    empty admin group precisely because it trusts Authentik to decide. That
+    combination is an MDM console — remote wipe, factory reset, policy push —
+    reachable by every authenticated user on the box, for however long it takes
+    somebody to restart the console. Observed live before this existed.
+
+    A failure here is reported as a failure. An access control that quietly did
+    not apply is worse than one never attempted, because the deploy log would
+    say the console is admin-only.
+    """
+    import urllib.request as _urlreq
+    import urllib.error
+
+    def log(msg):
+        if plog:
+            plog(msg)
+
+    def _get(path):
+        req = _urlreq.Request(f'{ak_url}/api/v3/{path}', headers=ak_headers)
+        return json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
+
+    policy_name = 'Allow authentik Admins'
+    try:
+        app_pk = _get('core/applications/atlas/')['pk']
+
+        policy_pk = None
+        for p in _get('policies/all/?page_size=200').get('results', []):
+            if p.get('name') == policy_name:
+                policy_pk = p.get('pk')
+                break
+        if not policy_pk:
+            log(f"  ✗ ATLAS is NOT restricted: no {policy_name!r} policy exists. "
+                f"Run Authentik → Reconfigure, then bind it to the ATLAS MDM "
+                f"application by hand.")
+            return False
+
+        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
+        if any(str(b.get('policy')) == str(policy_pk) or
+               (b.get('policy_obj', {}) or {}).get('name') == policy_name
+               for b in bindings):
+            log("  ✓ Console restricted to Authentik administrators (already bound)")
+            return True
+
+        req = _urlreq.Request(f'{ak_url}/api/v3/policies/bindings/',
+            data=json.dumps({'target': app_pk, 'policy': policy_pk,
+                             'order': 0, 'negate': False, 'enabled': True,
+                             'timeout': 30}).encode(),
+            headers=ak_headers, method='POST')
+        _urlreq.urlopen(req, timeout=10)
+        log("  ✓ Console restricted to Authentik administrators")
+        return True
+    except Exception as e:
+        log(f"  ✗ ATLAS is NOT restricted — every authenticated user can reach "
+            f"the console ({str(e)[:80]}). Bind {policy_name!r} to the ATLAS MDM "
+            f"application in Authentik before using this deployment.")
+        return False
+
+
+def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create the ATLAS MDM proxy provider + application in Authentik.
+
+    Same pattern as the TAK Video Restreamer: Caddy's forward_auth protects
+    atlas.FQDN and the embedded outpost decides who gets in.
+
+    ⚠️ Creating the application is what makes ATLAS admin-only. The startup
+    access-policy converge is default-deny — anything not on the user-visible
+    allowlist gets bound to "Allow authentik Admins" — so an MDM console that
+    can factory-reset a fleet is restricted without a policy written here. A
+    deployment that skipped this step would not be "open": ATLAS would answer
+    401 to everyone forever, because nothing would ever set the identity
+    headers it reads.
+    """
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = ctx['_get_authentik_api_url'](settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping ATLAS proxy provider")
+                return False
+
+        provider_pk = None
+        # ⚠️ Built in statements, not inside an f-string. Nesting the same quote
+        # character inside an f-string is Python 3.12 syntax (PEP 701) and a
+        # SyntaxError on the 3.10 that Ubuntu 22.04 ships — which would stop this
+        # module importing at all, taking the tile with it.
+        if settings:
+            _host_name = ctx['_get_service_domain'](settings, KEY)
+        else:
+            _host_name = 'atlas.' + fqdn
+        _atlas_host = 'https://' + _host_name
+        _cookie = f'.{fqdn.split(":")[0]}'
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'ATLAS MDM Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': _atlas_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=ATLAS+MDM', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': _atlas_host, 'cookie_domain': _cookie}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'ATLAS MDM', 'slug': 'atlas',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'ATLAS MDM' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/atlas/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'ATLAS MDM' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
+            ctx['_authentik_application_open_in_new_tab'](_ak_url, _ak_headers, 'atlas', plog=log)
+            _restrict_to_admins(_ak_url, _ak_headers, plog=log)
+        else:
+            log("  ⚠ Could not create or find the ATLAS proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -491,8 +736,6 @@ def _latest_version(use_cache=True):
     ⚠️ None means *unknown*, not *up to date*. A rate-limited or offline box
     must never be told it is current; it is told nothing, and the page says so.
     """
-    import json
-    import time
     import urllib.request
 
     now = time.time()
@@ -725,7 +968,7 @@ def uninstall(ctx, job, params):
 def _caddy_ca_dir():
     """Where app.py stages a Caddy-readable copy of the device CA, or None.
 
-    Mirrors _sync_atlas_device_ca_for_caddy: Caddy runs unprivileged and cannot
+    Mirrors sync_device_ca_for_caddy above: Caddy runs unprivileged and cannot
     read the install directory, so the certificate is copied into its own home.
     A stale copy left behind would have Caddy verifying client certificates
     against a CA that no longer exists.
