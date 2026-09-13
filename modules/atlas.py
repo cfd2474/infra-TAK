@@ -34,14 +34,19 @@ KEY = 'atlas'
 # Source, pinned. Rule 8: a tag *and* the commit it resolved to, verified after
 # fetch — a moving branch is not a pin, and a tag can be moved by whoever owns
 # the repo.
-ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
+# The repository is public, so there is no credential in this file and none
+# needed on the box.
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
-ATLAS_TAG = 'v0.1.4'
+# Where the update check asks what the newest release is. Unauthenticated,
+# which the public repository allows and which keeps any credential out of a
+# world-readable module file.
+ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
+ATLAS_TAG = 'v1.0.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'a45f87be9e5538bb40ca60483660bc3302f3eddf'
+ATLAS_SHA = '7038f1b66950bbf3b517f64ec4285c2a87e6f98c'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -154,7 +159,10 @@ def detect(ctx):
         ctx['save_settings'](s)
         enabled = True
 
-    return {'installed': enabled, 'running': running}
+    # The version comes from the checkout, so the tile cannot disagree with the
+    # footer of the console it is describing.
+    return {'installed': enabled, 'running': running,
+            'version': _installed_version(ctx) if enabled else None}
 
 
 # --------------------------------------------------------------------------- #
@@ -163,51 +171,22 @@ def detect(ctx):
 
 
 def deploy_validate(data):
-    """The deploy key, if the source repository is still private.
+    """Nothing to validate: the repository is public and takes no credential."""
+    return {}, None
 
-    Returned as params rather than read from settings so it never has to be
-    typed twice, and so an empty value means "public repo, clone over HTTPS"
-    rather than an error.
+
+def _stale_deploy_key(dirpath):
+    """Paths of the key a private-repo install left behind, if still present.
+
+    The repository is public now, so this key opens nothing. It is removed on
+    deploy rather than left to rot: a credential kept past its purpose is only
+    ever a liability, and nobody audits a file they have forgotten exists.
     """
-    key = (data or {}).get('deploy_key') or ''
-    if key and 'PRIVATE KEY' not in key:
-        return None, 'That does not look like an SSH private key.'
-    return {'deploy_key': key.strip()}, None
+    base = os.path.dirname(dirpath)
+    return [p for p in (os.path.join(base, f'.{KEY}_deploy_key'),
+                        os.path.join(base, f'.{KEY}_deploy_key.pub'))
+            if os.path.exists(p)]
 
-
-def _deploy_key_path(dirpath):
-    """Beside the install directory, never inside it.
-
-    ⚠️ A key inside the clone is inside a git working tree, and one `git add -A`
-    in a debugging session puts a private key in a commit.
-    """
-    return os.path.join(os.path.dirname(dirpath), f'.{KEY}_deploy_key')
-
-
-def _write_deploy_key(ctx, dirpath, key_text, plog):
-    """Put the deploy key somewhere git can use it, readable by nobody else.
-
-    ⚠️ Mode 600 and outside the clone. A key inside the install directory would
-    be inside a git working tree, and one `git add -A` in a debugging session
-    puts a private key in a commit.
-    """
-    key_path = _deploy_key_path(dirpath)
-    # ⚠️ `perm`, not `mode`: `_write_priv(path, content, mode='w', perm=None)`
-    # takes the *open* mode there. Passing 0o600 as `mode` opens the file in
-    # mode "384" and leaves a private key world-readable.
-    ctx['_write_priv'](key_path, key_text.rstrip('\n') + '\n', perm=0o600)
-    plog('  Deploy key written (mode 600, outside the clone)')
-    return key_path
-
-
-def _git_env(key_path):
-    if not key_path:
-        return None
-    env = dict(os.environ)
-    env['GIT_SSH_COMMAND'] = (
-        f'ssh -i {key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-    )
-    return env
 
 
 def _verify_pin(ctx, dirpath, plog):
@@ -263,22 +242,22 @@ def deploy(ctx, job, params):
         # placed on the box by an operator who would rather not paste a private
         # key into a web form at all. The last one is the reason this checks the
         # filesystem — the key never has to travel.
-        key_text = params.get('deploy_key') or settings.get(f'{KEY}_deploy_key') or ''
-        if key_text:
-            key_path = _write_deploy_key(ctx, dirpath, key_text, plog)
-        else:
-            existing = _deploy_key_path(dirpath)
-            key_path = existing if os.path.exists(existing) else None
-            if key_path:
-                plog(f'  Using the deploy key already on this box ({key_path})')
-        repo = ATLAS_REPO_SSH if key_path else ATLAS_REPO_HTTPS
+        # A key left over from when this repository was private opens nothing
+        # now. Removed here rather than left to rot.
+        for stale in _stale_deploy_key(dirpath):
+            try:
+                os.remove(stale)
+                plog(f'  Removed the obsolete deploy key ({stale})')
+            except OSError:
+                pass
+        repo = ATLAS_REPO_HTTPS
 
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {ATLAS_TAG}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
             r = subprocess.run(
                 ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', ATLAS_TAG],
-                capture_output=True, text=True, timeout=300, env=_git_env(key_path),
+                capture_output=True, text=True, timeout=300, env=None,
             )
             if r.returncode != 0:
                 raise RuntimeError(f'git fetch failed: {r.stderr[-300:]}')
@@ -288,7 +267,7 @@ def deploy(ctx, job, params):
             plog(f'  Cloning {repo} @ {ATLAS_TAG}')
             r = subprocess.run(
                 ['git', 'clone', '--depth=1', '--branch', ATLAS_TAG, repo, dirpath],
-                capture_output=True, text=True, timeout=600, env=_git_env(key_path),
+                capture_output=True, text=True, timeout=600, env=None,
             )
             if r.returncode != 0:
                 hint = ''
@@ -391,8 +370,6 @@ def deploy(ctx, job, params):
         s[f'{KEY}_enabled'] = True
         s[f'{KEY}_pg_password'] = pg_password
         s[f'{KEY}_commit_sha'] = commit
-        if key_text:
-            s[f'{KEY}_deploy_key'] = key_text
         ctx['save_settings'](s)
         ctx['generate_caddyfile'](s)
         if ctx['_caddy_reload'](plog):
@@ -443,6 +420,163 @@ def deploy(ctx, job, params):
 
 
 # --------------------------------------------------------------------------- #
+# Versions, and updating to a newer one
+# --------------------------------------------------------------------------- #
+
+#: ⚠️ Slot-local, deliberately NOT the registry's deploy job slot. An update
+#: and a deploy must never share a lock or a log: they can be started from
+#: different pages seconds apart, and interleaving their output would make both
+#: unreadable at exactly the moment somebody needs to read one.
+_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+#: Cheap cache for the upstream tag check. GitHub allows 60 unauthenticated
+#: requests an hour per IP and the console polls this for a badge; without a
+#: cache a busy box spends its whole allowance and the badge silently blanks.
+_latest_cache = {'value': None, 'at': 0.0}
+_LATEST_TTL = 900
+
+
+def _parse_version(text):
+    """``v1.2.3`` -> ``(1, 2, 3)``. None for anything that is not three numbers.
+
+    ⚠️ Comparison is on the tuple, never the string: ``0.10.0`` sorts before
+    ``0.9.0`` alphabetically, which would quietly stop offering updates at the
+    tenth release of any series.
+    """
+    if not text:
+        return None
+    parts = str(text).strip().lstrip('vV').split('.')
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _latest_version(use_cache=True):
+    """The newest release tag upstream, or None when it cannot be established.
+
+    ⚠️ None means *unknown*, not *up to date*. A rate-limited or offline box
+    must never be told it is current; it is told nothing, and the page says so.
+    """
+    import json
+    import time
+    import urllib.request
+
+    now = time.time()
+    if use_cache and _latest_cache['value'] and now - _latest_cache['at'] < _LATEST_TTL:
+        return _latest_cache['value']
+    try:
+        request = urllib.request.Request(
+            ATLAS_REPO_API + '/tags?per_page=50',
+            headers={'Accept': 'application/vnd.github+json',
+                     'User-Agent': 'infra-TAK-atlas-module'},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            tags = json.loads(response.read().decode())
+    except Exception:
+        return _latest_cache['value']
+
+    versions = [v for v in (_parse_version(t.get('name')) for t in tags) if v]
+    if not versions:
+        return _latest_cache['value']
+    newest = '.'.join(str(p) for p in max(versions))
+    _latest_cache.update({'value': newest, 'at': now})
+    return newest
+
+
+def _installed_version(ctx):
+    """The version on disk, read from the checkout rather than from settings.
+
+    ⚠️ This is the same VERSION file the running console shows in its footer,
+    so the two cannot disagree. A settings value could, if a deploy half-finished
+    — and an update badge that contradicts the footer is worse than no badge.
+    """
+    try:
+        with open(os.path.join(atlas_dir(ctx), 'VERSION'), encoding='utf-8') as handle:
+            return handle.read().strip().lstrip('vV') or None
+    except OSError:
+        return None
+
+
+def _run_update(ctx):
+    """Fetch the newest release and rebuild in place. Data is never touched.
+
+    ⚠️ This is `deploy` minus everything that would destroy state: no volume
+    is removed and the install directory survives, so the database, the device CA
+    and every enrolled tablet come through it intact. That is the whole
+    difference between updating and reinstalling.
+
+    The applications shipped with the new release load on start, and the agent
+    among them is offered to the fleet — an update that left every device on
+    the previous agent would be a fleet running a build this server no longer is.
+    """
+    from datetime import datetime
+
+    global _update_status
+    log = []
+
+    def plog(msg):
+        log.append('[' + datetime.now().strftime('%H:%M:%S') + '] ' + msg)
+        _update_status['log'] = list(log)
+        print('[' + KEY + '] update: ' + msg, flush=True)
+
+    _update_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    try:
+        dirpath = atlas_dir(ctx)
+        if not os.path.isdir(os.path.join(dirpath, '.git')):
+            raise RuntimeError('ATLAS is not installed from a git checkout')
+
+        target = _latest_version(use_cache=False)
+        if not target:
+            raise RuntimeError('Could not reach GitHub to find the newest release')
+        current = _installed_version(ctx)
+        plog('Installed ' + (current or 'unknown') + ' → available ' + target)
+
+        here, there = _parse_version(current), _parse_version(target)
+        if here and there and there <= here:
+            plog('✓ Already on the newest release — nothing to do')
+            _update_status.update({'running': False, 'complete': True, 'error': False})
+            return
+
+        tag = 'v' + target
+        plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')
+        # The module rewrites .env and the compose override on every deploy, so
+        # the working tree is dirty on tracked files and a plain pull aborts with
+        # "local changes would be overwritten".
+        ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
+        r = subprocess.run(
+            ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise RuntimeError('git fetch failed: ' + (r.stderr or '')[-300:])
+        ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
+        plog('✓ Source now at ' + tag)
+
+        plog('━━━ Step 2/3: Rebuilding ━━━')
+        # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
+        # device CA with it, and every enrolled tablet would need a factory reset.
+        r = _compose(ctx, 'up -d --build api', timeout=1800)
+        if r.returncode != 0:
+            raise RuntimeError('docker compose up failed: ' + (r.stderr or '')[-500:])
+        plog('✓ Containers rebuilt — database and device CA untouched')
+        plog('  The agent and launcher from this release load on start, and the')
+        plog('  new agent is offered to the fleet on each device\'s next check-in.')
+
+        plog('━━━ Step 3/3: Recording ━━━')
+        s = ctx['load_settings']()
+        s[KEY + '_version'] = target
+        ctx['save_settings'](s)
+        plog('✓ ATLAS updated to v' + target)
+        _update_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog('ERROR: ' + str(exc))
+        _update_status.update({'running': False, 'complete': False, 'error': True})
+
+
+# --------------------------------------------------------------------------- #
 # Uninstall
 # --------------------------------------------------------------------------- #
 
@@ -482,6 +616,17 @@ def uninstall(ctx, job, params):
 
     # The install directory carries the device CA, the bundle signing key, the
     # uploaded artifacts and the generated .env.
+    # The obsolete deploy key goes with everything else now. It was kept while
+    # the repository was private, because removing it would have failed the next
+    # install at `git clone`. A public repository takes no credential, so a
+    # private key left on the box is pure liability.
+    for stale in _stale_deploy_key(dirpath):
+        try:
+            os.remove(stale)
+            steps.append(f'Obsolete deploy key removed ({os.path.basename(stale)})')
+        except OSError:
+            pass
+
     for path, label in ((dirpath, 'Install directory (device CA, artifacts, .env)'),
                         (_caddy_ca_dir(), "Caddy's copy of the device CA")):
         try:
@@ -494,14 +639,13 @@ def uninstall(ctx, job, params):
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
     steps.append(f'Firewall rule for {DEVICE_PORT}/tcp removed')
 
-    # ⚠️ Every generated secret goes, the deploy key excepted. Leaving
+    # ⚠️ Every generated value goes. Leaving
     # atlas_pg_password behind would hand the next install a password for a
     # database that no longer exists — harmless only by luck, since the volume
     # it belonged to is gone.
     s = ctx['load_settings']()
     for key in [k for k in list(s) if k.startswith(f'{KEY}_')]:
-        if key != f'{KEY}_deploy_key':
-            s.pop(key, None)
+        s.pop(key, None)
     s[f'{KEY}_enabled'] = False
     ctx['save_settings'](s)
     ctx['generate_caddyfile'](s)
@@ -514,7 +658,6 @@ def uninstall(ctx, job, params):
     except Exception:
         steps.append('ATLAS application not in Authentik (not configured)')
 
-    steps.append('Deploy key kept — it is how the next install fetches ATLAS')
     return {'success': True, 'steps': steps}
 
 
@@ -624,11 +767,35 @@ def register(ctx):
         return jsonify({'lines': lines[-200:]})
 
     def version_view():
-        s = ctx['load_settings']()
+        """What is installed, what is available, and whether that is a newer one.
+
+        ⚠️ `update_available` is only ever True when *both* versions parsed and
+        the upstream one is genuinely higher. An unknown latest (offline, or
+        GitHub's 60/hour spent) leaves it False and `latest` null, so the page
+        can say "could not check" instead of claiming the box is current.
+        """
+        installed = _installed_version(ctx)
+        latest = _latest_version()
+        here, there = _parse_version(installed), _parse_version(latest)
         return jsonify({
-            'version': (s.get(f'{KEY}_commit_sha') or '')[:12] or ATLAS_TAG,
-            'latest': None,
-            'update_available': False,
+            'version': installed,
+            'latest': latest,
+            'update_available': bool(here and there and there > here),
+        })
+
+    def update_view():
+        import threading
+        if _update_status['running']:
+            return jsonify({'success': False, 'error': 'An update is already running'})
+        threading.Thread(target=_run_update, args=(ctx,), daemon=True).start()
+        return jsonify({'success': True})
+
+    def update_status_view():
+        return jsonify({
+            'running': _update_status['running'],
+            'complete': _update_status['complete'],
+            'error': _update_status['error'],
+            'entries': list(_update_status['log']),
         })
 
     register_module({
@@ -657,6 +824,10 @@ def register(ctx):
              'endpoint': f'{KEY}_logs', 'view': logs_view},
             {'url': f'/api/{KEY}/version', 'methods': ['GET'],
              'endpoint': f'{KEY}_version', 'view': version_view},
+            {'url': f'/api/{KEY}/update', 'methods': ['POST'],
+             'endpoint': f'{KEY}_update', 'view': update_view},
+            {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],
+             'endpoint': f'{KEY}_update_status', 'view': update_status_view},
         ],
         # One public port. The console is Caddy-only on 443, the agent package is
         # a Caddy path route on the well-known port, and the database never
@@ -665,6 +836,6 @@ def register(ctx):
         'service_units': [],
         'settings_keys': [
             f'{KEY}_enabled', f'{KEY}_pg_password', f'{KEY}_commit_sha',
-            f'{KEY}_deploy_key', f'{KEY}_domain',
+            f'{KEY}_version', f'{KEY}_domain',
         ],
     })
