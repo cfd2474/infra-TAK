@@ -36,7 +36,11 @@ KEY = 'atlas'
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 ATLAS_TAG = 'v0.1.0'
-ATLAS_SHA = '7f42a9d770b0eb948b6427136219283375f35d19'  # what v0.1.0 resolves to
+# ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
+# `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
+# is the commit it points at — two different hashes, and comparing them made
+# every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
+ATLAS_SHA = '3715b486cbb89cc47354431dcf47cd1939a1621c'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -174,6 +178,12 @@ def _verify_pin(ctx, dirpath, plog):
     ⚠️ A tag is a pointer and whoever owns the repository can move it. Rule 8
     wants the SHA checked *after* the fetch, which is the only moment the
     difference is observable.
+
+    ⚠️ `ATLAS_SHA` must be the **commit** the tag dereferences to. An annotated
+    tag is itself an object with its own hash, so `git rev-parse <tag>` and the
+    HEAD of a clone made from it are different strings — and comparing them
+    fails every time, which reads exactly like a tag that has been tampered
+    with. Record `git rev-parse '<tag>^{}'`.
     """
     r = ctx['_module_git'](dirpath, 'rev-parse', 'HEAD', timeout=10)
     head = (r.stdout or '').strip()

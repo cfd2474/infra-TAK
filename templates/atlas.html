@@ -43,6 +43,11 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       ⏳ The first deploy clones the repository and builds images — allow 5–10 minutes.
     </p>
 
+    {% if atlas_have_key %}
+    <p class="note" style="margin-top:16px;color:var(--green)">
+      ✓ A deploy key is already on this box — nothing to paste.
+    </p>
+    {% else %}
     <div style="margin-top:18px">
       <div class="card-title" style="margin-bottom:8px">Deploy key (only while the source repository is private)</div>
       <p class="note" style="margin-bottom:8px">
@@ -53,9 +58,15 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       <textarea class="key" id="deployKey" spellcheck="false"
                 placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
     </div>
+    {% endif %}
 
     <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" style="margin-top:16px">Deploy ATLAS</button>
-    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log.</div>
+    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
+  </div>
+
+  <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
+    <div class="card-title">Deploy log</div>
+    <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
   </div>
   {% else %}
   <div class="card">
@@ -86,12 +97,6 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
   {% endif %}
 
-  {% if deploy_log %}
-  <div class="card">
-    <div class="card-title">Deploy log</div>
-    <div class="log-box">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
-  </div>
-  {% endif %}
 </div>
 
 <div class="modal-overlay" id="uninstallModal">
@@ -133,10 +138,23 @@ function startDeploy(){
   }).catch(() => { btn.disabled = false; });
 }
 
+function renderLog(entries){
+  const card = document.getElementById('deployCard');
+  const box = document.getElementById('deployLog');
+  if (!box) return;
+  if (card) card.style.display = '';
+  // The route returns `entries`, not `log` — reading the wrong key showed an
+  // empty box for the whole deploy and nothing to explain a failure.
+  box.textContent = (entries || []).join('
+');
+  box.scrollTop = box.scrollHeight;
+}
+
 function pollDeploy(){
   if (!polling) return;
   fetch('/api/atlas/log', {credentials:'same-origin'}).then(r => r.json()).then(d => {
-    if (d.complete && !d.error) { polling = false; location.reload(); return; }
+    renderLog(d.entries);
+    if (d.complete && !d.error) { polling = false; setTimeout(() => location.reload(), 1200); return; }
     if (d.error && !d.running) {
       polling = false;
       const e = document.getElementById('deployError');
@@ -185,5 +203,6 @@ async function doUninstall(){
 
 {% if installed %}loadLogs();{% endif %}
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
+{% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
 </script>
 {% endblock %}

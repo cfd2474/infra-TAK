@@ -40429,10 +40429,17 @@ def atlas_page():
     atlas = modules.get('atlas', {})
     atlas_domain = _get_service_domain(settings, 'atlas')
     job = mod_registry.job_state('atlas')
+    # Whether a deploy key is already sitting on this box. The form asks for one
+    # only when there is nothing to use, so an operator is not invited to paste a
+    # private key that is already here.
+    atlas_have_key = (bool(settings.get('atlas_deploy_key'))
+                      or os.path.exists(mod_registry.atlas._deploy_key_path(
+                          mod_registry.atlas.atlas_dir(mod_registry.get_ctx()))))
     r = make_response(render_template('atlas.html',
         settings=settings, modules=modules, atlas=atlas,
         installed=atlas.get('installed'), running=atlas.get('running'),
         atlas_domain=atlas_domain,
+        atlas_have_key=atlas_have_key,
         deploy_log=job.get('log') or [],
         deploy_running=bool(job.get('running')),
         deploy_error=bool(job.get('error')),
