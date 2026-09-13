@@ -42044,6 +42044,71 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
     return True
 
 
+def _restrict_atlas_to_admins(ak_url, ak_headers, plog=None):
+    """Bind "Allow authentik Admins" to the ATLAS application. Returns True when
+    the application is restricted, False when it is NOT.
+
+    ⚠️ This cannot wait for the startup access-policy converge. That converge
+    is default-deny and would catch ATLAS eventually — but it runs when the
+    console *boots*, and a module deploy does not reboot the console. In between,
+    the application exists with no binding at all, and ATLAS is configured with an
+    empty admin group precisely because it trusts Authentik to decide. That
+    combination is an MDM console — remote wipe, factory reset, policy push —
+    reachable by every authenticated user on the box, for however long it takes
+    somebody to restart the console. Observed live before this existed.
+
+    A failure here is reported as a failure. An access control that quietly did
+    not apply is worse than one never attempted, because the deploy log would
+    say the console is admin-only.
+    """
+    import urllib.request as _urlreq
+    import urllib.error
+
+    def log(msg):
+        if plog:
+            plog(msg)
+
+    def _get(path):
+        req = _urlreq.Request(f'{ak_url}/api/v3/{path}', headers=ak_headers)
+        return json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
+
+    policy_name = 'Allow authentik Admins'
+    try:
+        app_pk = _get('core/applications/atlas/')['pk']
+
+        policy_pk = None
+        for p in _get('policies/all/?page_size=200').get('results', []):
+            if p.get('name') == policy_name:
+                policy_pk = p.get('pk')
+                break
+        if not policy_pk:
+            log(f"  ✗ ATLAS is NOT restricted: no {policy_name!r} policy exists. "
+                f"Run Authentik → Reconfigure, then bind it to the ATLAS MDM "
+                f"application by hand.")
+            return False
+
+        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
+        if any(str(b.get('policy')) == str(policy_pk) or
+               (b.get('policy_obj', {}) or {}).get('name') == policy_name
+               for b in bindings):
+            log("  ✓ Console restricted to Authentik administrators (already bound)")
+            return True
+
+        req = _urlreq.Request(f'{ak_url}/api/v3/policies/bindings/',
+            data=json.dumps({'target': app_pk, 'policy': policy_pk,
+                             'order': 0, 'negate': False, 'enabled': True,
+                             'timeout': 30}).encode(),
+            headers=ak_headers, method='POST')
+        _urlreq.urlopen(req, timeout=10)
+        log("  ✓ Console restricted to Authentik administrators")
+        return True
+    except Exception as e:
+        log(f"  ✗ ATLAS is NOT restricted — every authenticated user can reach "
+            f"the console ({str(e)[:80]}). Bind {policy_name!r} to the ATLAS MDM "
+            f"application in Authentik before using this deployment.")
+        return False
+
+
 def _ensure_authentik_atlas_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create the ATLAS MDM proxy provider + application in Authentik.
 
@@ -42146,6 +42211,7 @@ def _ensure_authentik_atlas_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flo
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
             _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'atlas', plog=log)
+            _restrict_atlas_to_admins(_ak_url, _ak_headers, plog=log)
         else:
             log("  ⚠ Could not create or find the ATLAS proxy provider")
     except Exception as e:
