@@ -966,7 +966,7 @@ def apply_security_headers(response):
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 VERSION = "10.1.70-alpha"
-GITHUB_REPO = "takwerx/infra-TAK"
+GITHUB_REPO = "cfd2474/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
 # The console is served over a network, so everyone who interacts with it is owed
@@ -7988,7 +7988,7 @@ def console_rollback_api():
         git_cfg = ['git', '-c', f'safe.directory={console_dir}']
         # Fetch the tag from origin
         fetch_r = subprocess.run(
-            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
+            git_cfg + ['fetch', 'https://github.com/cfd2474/infra-TAK.git',
                        f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
             cwd=console_dir, capture_output=True, text=True, timeout=60,
             env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
@@ -11716,7 +11716,7 @@ def connectivity_anchor_disconnect_api():
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
 _CONN_ANCHOR_BOOTSTRAP_COMMIT = '792e80bfa6a7e9004dadfde0a4807abf5483c89e'
 _CONN_ANCHOR_BOOTSTRAP_SHA256 = '52beb8a1584b260e1b4f1e247438224efce3e20f12fc2ec6e780b6298edae20a'
-_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
+_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/cfd2474/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
 _CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
