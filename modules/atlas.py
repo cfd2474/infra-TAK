@@ -57,6 +57,30 @@ APP_PORT = 8760
 # module as never running, forever.
 API_CONTAINER = 'takmdm-api-1'
 
+# ⚠️ The uid the application runs as inside its image, and the host directories
+# it must be able to write.
+#
+# ATLAS's Dockerfile drops to an unprivileged `takmdm` user pinned at uid 1000.
+# These three paths are bind-mounted from the install directory, which the
+# console creates as root — and Docker creates any that are still missing as
+# root too. Either way the container cannot write them, and the first thing it
+# tries is to generate the device CA:
+#
+#     PermissionError: [Errno 13] Permission denied: '/pki/ca.crt'
+#
+# The one-shot `init` service then exits 1, `api` never starts, and the deploy
+# fails at the build step with nothing in the compose output naming a
+# permission problem. So: create them, and hand them to uid 1000 first.
+APP_UID = 1000
+APP_GID = 1000
+
+# Writable bind mounts, from ATLAS's docker-compose.yml. `pki` holds the device
+# CA, `artifacts` the agent APK and generated packages, `cache` the APK
+# inspector's scratch space. The read-only mounts (nginx config, acme) belong
+# to ATLAS's own proxy service, which this module never starts — Caddy fronts
+# the deployment instead.
+WRITABLE_DIRS = ('pki', 'artifacts', 'cache')
+
 
 def _plog(msg):
     job_log(KEY, msg)
@@ -300,6 +324,21 @@ def deploy(ctx, job, params):
             _COMPOSE_OVERRIDE.format(app_port=APP_PORT),
         )
         plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{APP_PORT})')
+
+        # The container runs unprivileged; the directories it writes are ours.
+        # See APP_UID. Done here rather than after `up` because the very first
+        # thing the stack does is write the device CA into pki/.
+        for name in WRITABLE_DIRS:
+            path = os.path.join(dirpath, name)
+            os.makedirs(path, exist_ok=True)
+            os.chown(path, APP_UID, APP_GID)
+            # Anything already inside — a re-deploy over an existing install,
+            # or files the repository ships — needs the same owner, or the
+            # application can read its own CA but not renew it.
+            for root, dirs, files in os.walk(path):
+                for entry in dirs + files:
+                    os.chown(os.path.join(root, entry), APP_UID, APP_GID)
+        plog(f'✓ {", ".join(WRITABLE_DIRS)} owned by uid {APP_UID} (the container is not root)')
 
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
