@@ -3623,10 +3623,16 @@ async function loadSavedConfigs() {
         try {
           var _ar = await _fetchT('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: _src }) });
           _ad = await _ar.json();
-          if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) { _ad.restored_from = _src; break; }
+          // v10.1.70: pp_count was missing from BOTH tests, so a box whose only configs
+          // are PulsePoint restored correctly server-side and then reported nothing --
+          // the source was rejected, the list never refreshed, and the page still showed
+          // an empty state over a healthy restore. fn_cfg_restore has always returned
+          // pp_count; the old TC/PP code carried the comment "pp_configs aren't counted
+          // in the response", which was simply false. Same wrong premise, two places.
+          if (_ad.ok && _restoreYieldedConfigs(_ad)) { _ad.restored_from = _src; break; }
         } catch (_se) { /* try next source */ }
       }
-      if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) {
+      if (_ad.ok && _restoreYieldedConfigs(_ad)) {
         console.log('Auto-restored from ' + (_ad.restored_from || 'backup') + ':', _ad);
         _savedConfigs = []; _extraCounts = 0;
         await Promise.allSettled([
@@ -5832,18 +5838,28 @@ function feedIdFromName(configName) {
 //
 // Counts are tracked per kind because a single full deploy can wipe all three at once, and an
 // ArcGIS save is just as capable of dropping tc_configs as a TC save is.
-var _CFG_KINDS = [
-  { key: 'arcgis', url: '/arcgis-tak/config/load', restoreField: 'arcgis_count', label: 'ArcGIS/TFR/KML' },
-  { key: 'tc',     url: '/tc/config/load',         restoreField: 'tc_count',     label: 'Tablet Command' },
-  { key: 'pp',     url: '/pp/config/load',         restoreField: 'pp_count',     label: 'PulsePoint' }
-];
+// A hoisted FUNCTION, not a `var`. loadSavedConfigs() is invoked at top level far above
+// this point, and its auto-restore path now needs these: a `var` would still be
+// `undefined` there, and only an incidental `await` earlier in that function let the rest
+// of the script initialise it in time. That is not something the persistence path should
+// depend on -- a future early-return or one removed `await` would turn it into a
+// TypeError in the exact code that rescues a wiped context. Function declarations hoist
+// completely, so this is correct no matter who calls first.
+function _cfgKinds() {
+  return [
+    { key: 'arcgis', url: '/arcgis-tak/config/load', restoreField: 'arcgis_count', label: 'ArcGIS/TFR/KML' },
+    { key: 'tc',     url: '/tc/config/load',         restoreField: 'tc_count',     label: 'Tablet Command' },
+    { key: 'pp',     url: '/pp/config/load',         restoreField: 'pp_count',     label: 'PulsePoint' }
+  ];
+}
 
 // Live count per kind. -1 means "unreadable" — never treat that as zero, or an endpoint
 // hiccup would look like a wipe and trigger a destructive restore.
 async function _liveConfigCounts() {
   var out = {};
-  for (var i = 0; i < _CFG_KINDS.length; i++) {
-    var k = _CFG_KINDS[i];
+  var kinds = _cfgKinds();
+  for (var i = 0; i < kinds.length; i++) {
+    var k = kinds[i];
     out[k.key] = -1;
     try {
       var d = await _fetchT(k.url).then(function(r) { return r.json(); });
@@ -5853,10 +5869,21 @@ async function _liveConfigCounts() {
   return out;
 }
 
+// Did a restore yield ANY config of any kind? Used by the page-load auto-restore, which
+// runs only when live context looks completely empty -- so there is nothing to shrink and
+// "any configs at all" is the right bar. (The post-deploy guard below has a stricter one:
+// it must not LOSE anything.) Counting all three kinds here is the point: see the v10.1.70
+// note at the call site.
+function _restoreYieldedConfigs(rd) {
+  if (!rd) return false;
+  return _cfgKinds().some(function(k) { return Number(rd[k.restoreField]) > 0; });
+}
+
 // Does this restore result bring every kind back to at least what we had?
 function _restoreCoversExpected(rd, expected) {
-  for (var i = 0; i < _CFG_KINDS.length; i++) {
-    var k = _CFG_KINDS[i];
+  var kinds = _cfgKinds();
+  for (var i = 0; i < kinds.length; i++) {
+    var k = kinds[i];
     if (!(expected[k.key] > 0)) continue;          // nothing of this kind to protect
     if (!(Number(rd[k.restoreField]) >= expected[k.key])) return false;
   }
@@ -5869,12 +5896,12 @@ function _restoreCoversExpected(rd, expected) {
 async function _restoreContextIfWiped(expected, statusId) {
   if (typeof expected === 'number') expected = { arcgis: expected };   // legacy call shape
   expected = expected || {};
-  var protecting = _CFG_KINDS.some(function(k) { return expected[k.key] > 0; });
+  var protecting = _cfgKinds().some(function(k) { return expected[k.key] > 0; });
   if (!protecting) return true;                                  // nothing to protect
   await new Promise(function(r) { setTimeout(r, 4000); });        // let Node-RED settle
 
   var live = await _liveConfigCounts();
-  var shrank = _CFG_KINDS.filter(function(k) {
+  var shrank = _cfgKinds().filter(function(k) {
     return expected[k.key] > 0 && live[k.key] >= 0 && live[k.key] < expected[k.key];
   });
   if (!shrank.length) {
