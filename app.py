@@ -3610,6 +3610,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+    atlas_nav = modules.get('atlas', {})
+    if atlas_nav.get('installed'):
+        parts.append(link('/atlas', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">📱</span><span>ATLAS MDM</span>', 'ATLAS MDM'))
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
@@ -24123,6 +24126,48 @@ def _caddy_acme_validate_isolated(cfg):
                 pass
 
 
+def _sync_atlas_device_ca_for_caddy():
+    """Deploy a Caddy-readable copy of ATLAS's device CA; return its path or None.
+
+    ATLAS issues its own client certificates to enrolled tablets, and Caddy has
+    to verify them at the device listener. The CA lives in the module's install
+    directory, which is root-owned — and Caddy runs as the unprivileged `caddy`
+    user, so pointing `client_auth` there makes Caddy fail to start. Same
+    problem, same answer, as the custom-certificate copy below.
+
+    ⚠️ Only the *certificate* is copied. The CA private key stays where it is:
+    Caddy needs to verify signatures, which takes the public half alone, and a
+    copy of the key readable by a web server is a fleet's device identity one
+    file-read away.
+    """
+    import shutil, pwd
+    for base_dir in ('/root/atlas', os.path.expanduser('~/atlas')):
+        src = os.path.join(base_dir, 'pki', 'ca.crt')
+        if os.path.exists(src):
+            break
+    else:
+        return None
+    try:
+        try:
+            caddy_pw = pwd.getpwnam('caddy')
+            base = caddy_pw.pw_dir if os.path.isdir(caddy_pw.pw_dir) else '/var/lib/caddy'
+        except KeyError:
+            caddy_pw = None
+            base = '/var/lib/caddy'
+        dest_dir = os.path.join(base, 'atlas')
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, 'device-ca.crt')
+        shutil.copyfile(src, dest)
+        os.chmod(dest, 0o644)
+        if caddy_pw:
+            os.chown(dest_dir, caddy_pw.pw_uid, caddy_pw.pw_gid)
+            os.chown(dest, caddy_pw.pw_uid, caddy_pw.pw_gid)
+        return dest
+    except Exception as exc:
+        print(f"atlas: could not stage device CA for Caddy: {exc}", flush=True)
+        return None
+
+
 def _sync_custom_cert_for_caddy():
     """Deploy a Caddy-readable copy of the custom cert/key and return its (cert, key) paths.
 
@@ -25268,6 +25313,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'webodm': 'webodm',
     'netbird': 'netbird',
     'remote_assist': 'remote',
+    'atlas': 'atlas',
 }
 
 def _get_service_domain(settings, service_key):
@@ -29019,6 +29065,77 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
+
+    atlas_mod = modules.get('atlas', {})
+    if atlas_mod.get('installed'):
+        at_host = sd.get('atlas') or _get_service_domain(settings, 'atlas')
+        at_up = '127.0.0.1:8760'
+        at_device_paths = '/api/v1/device/* /api/v1/enroll /api/v1/provisioning/*'
+        at_ca = _sync_atlas_device_ca_for_caddy()
+
+        # Administration console (443). Admin tooling, so Authentik fronts it and
+        # the device paths are refused here — a tablet cannot complete an
+        # interactive login, and an admin does not need the device API.
+        lines.append(f"# ATLAS MDM — administration console (443). Device channel is :8449 only.")
+        lines.append(f"{at_host} {{")
+        lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        lines.append(f"    @atlas_device path {at_device_paths}")
+        lines.append(f"    respond @atlas_device 404")
+        lines.append(f"    reverse_proxy {at_up}")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
+
+        # The agent package, in the clear on the well-known port.
+        #
+        # A tablet in out-of-box setup is fetching this before it has been told
+        # anything, often on a guest network that blocks high ports. Declaring
+        # the site as http:// suppresses Caddy's automatic redirect to TLS for
+        # this host, which is the point: an Android setup wizard follows no
+        # redirect here. Integrity comes from the signature checksum carried in
+        # the provisioning QR, which the wizard verifies before installing.
+        lines.append(f"# ATLAS MDM — agent package, plain HTTP (device provisioning, no redirect)")
+        lines.append(f"http://{at_host} {{")
+        lines.append(f"    @atlas_apk path /api/v1/provisioning/agent.apk")
+        lines.append(f"    handle @atlas_apk {{")
+        lines.append(f"        reverse_proxy {at_up}")
+        lines.append(f"    }}")
+        lines.append(f"    handle {{")
+        lines.append(f"        redir https://{{host}}{{uri}} permanent")
+        lines.append(f"    }}")
+        lines.append(f"}}")
+        lines.append("")
+
+        # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
+        if at_ca:
+            lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
+            lines.append(f"{at_host}:8449 {{")
+            lines.append(f"    tls {{")
+            # verify_if_given, NOT require_and_verify: a device enrolling for the
+            # first time has no certificate yet and calls /api/v1/enroll without
+            # one. Requiring a certificate at the listener would make enrolment
+            # impossible — the application decides which paths need an identity.
+            lines.append(f"        client_auth {{")
+            lines.append(f"            mode verify_if_given")
+            lines.append(f"            trust_pool file {{")
+            lines.append(f"                pem_file {at_ca}")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    @atlas_device path {at_device_paths}")
+            lines.append(f"    handle @atlas_device {{")
+            lines.append(f"        reverse_proxy {at_up} {{")
+            # The verified certificate, single-line base64 DER. Caddy's PEM
+            # placeholder carries real newlines and a header cannot.
+            #
+            # This SETS the header, which is what makes it safe: an inbound copy
+            # from a client is replaced, never appended to.
+            lines.append(f"            header_up X-SSL-Client-Cert {{http.request.tls.client.certificate_der_base64}}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    respond 404")
+            lines.append(f"}}")
+            lines.append("")
 
     ra_mod = modules.get('remote_assist', {})
     if ra_mod.get('installed'):
@@ -79328,6 +79445,9 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
+    # Resolve a module's hostname, honouring the operator's per-box
+    # override. The developer guide already instructs modules to use this.
+    '_get_service_domain': _get_service_domain,
     # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
     # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
     # eternal-grace-period hang inside the module registry, where the deploy-job runner's
