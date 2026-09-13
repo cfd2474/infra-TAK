@@ -48,12 +48,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.2.2'
+ATLAS_TAG = 'v1.3.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'bbf85e2907ba6a2c269300393aa619f51e37eb85'
+ATLAS_SHA = 'c578456c435bf0994b6cb0302a8a3de13a8d8d1e'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -760,6 +760,33 @@ def _latest_version(use_cache=True):
     return newest
 
 
+def _running_version():
+    """The version the container reports, or None if it cannot be asked.
+
+    ⚠️ This is the one that matters for "did the update work". The checkout and
+    the process can disagree: `docker compose up -d` without `--build` keeps the
+    old image, so `VERSION` can read 1.3.0 while the running app still serves
+    1.0.0. Reading the repo alone reports a successful deploy that never
+    happened.
+
+    Loopback and unauthenticated by design — the console runs beside the
+    container, not through Authentik.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            'http://127.0.0.1:%d/version' % APP_PORT, timeout=5
+        ) as response:
+            body = json.loads(response.read().decode())
+    except Exception:
+        return None
+    if body.get('service') != 'atlas-mdm':
+        # Something else is answering on that port; its version means nothing here.
+        return None
+    return (body.get('version') or '').strip().lstrip('vV') or None
+
+
 def _installed_version(ctx):
     """The version on disk, read from the checkout rather than from settings.
 
@@ -787,7 +814,12 @@ def get_version_info(ctx):
     false, so a rate-limited box is never told it is current — it is told
     nothing, which the card renders as no badge rather than a reassuring one.
     """
-    installed = _installed_version(ctx)
+    # ⚠️ The running container first, the checkout second. They agree on a
+    # healthy deployment; when they do not, the running one is the truth and the
+    # difference is a rebuild that did not take.
+    checked_out = _installed_version(ctx)
+    running = _running_version()
+    installed = running or checked_out
     latest = _latest_version()
     here, there = _parse_version(installed), _parse_version(latest)
 
@@ -800,7 +832,14 @@ def get_version_info(ctx):
     else:
         update = bool(here and there and there > here)
 
-    return {'version': installed or '', 'latest': latest, 'update_available': update}
+    info = {'version': installed or '', 'latest': latest, 'update_available': update}
+    # Surfaced rather than hidden: a checkout ahead of the process means the last
+    # rebuild did not take, and an operator reading only the version would see a
+    # number that is not what is serving their fleet.
+    if running and checked_out and running != checked_out:
+        info['stale_image'] = True
+        info['checked_out'] = checked_out
+    return info
 
 
 def _run_update(ctx):
