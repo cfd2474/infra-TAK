@@ -36,12 +36,12 @@ KEY = 'atlas'
 # the repo.
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
-ATLAS_TAG = 'v0.1.3'
+ATLAS_TAG = 'v0.1.4'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'a690aef7a8b485b4310d5c86b953fc16cceafa8f'
+ATLAS_SHA = 'a45f87be9e5538bb40ca60483660bc3302f3eddf'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -430,14 +430,12 @@ def deploy(ctx, job, params):
             plog(f'  Console:  https://{fqdn}/')
             plog(f'  Devices:  https://{fqdn}:{DEVICE_PORT}/  (mutual TLS)')
         plog('')
-        # ⚠️ Said here because the failure lands much later and reads as a bug.
-        # A deployment with no agent build cannot mint a provisioning QR at all:
-        # Android needs the signing checksum of the APK the tablet will download,
-        # ATLAS takes it from the uploaded build, and with nothing uploaded the
-        # token page refuses. The operator meets that on their first enrolment,
-        # several screens away from anything that mentions an upload.
-        plog('  Next: upload the ATLAS agent APK under Apps — a device cannot be')
-        plog('  enrolled until one exists, and the provisioning QR is built from it.')
+        # The agent and the launcher ship with the source and load into the
+        # library on first start, so enrolment works with no upload at all.
+        # Said out loud because an operator has no other way to know the
+        # library is not empty.
+        plog('  Bundled and ready: ATLAS Agent (device policy controller)')
+        plog('  and ATLAS Launcher. Enrollment tokens can be minted now.')
         job.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
         plog(f'ERROR: {exc}')
