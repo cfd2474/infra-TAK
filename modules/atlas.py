@@ -35,12 +35,12 @@ KEY = 'atlas'
 # the repo.
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
-ATLAS_TAG = 'v0.1.0'
+ATLAS_TAG = 'v0.1.1'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '3715b486cbb89cc47354431dcf47cd1939a1621c'
+ATLAS_SHA = '54ba8d8eda8ac9b49dbd8f7db0eb0877102aa685'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -50,8 +50,12 @@ DEVICE_PORT = 8449
 # The application, on loopback. Caddy is the only thing that talks to it.
 APP_PORT = 8760
 
-# Container name the compose project gives the API service, used by detect().
-API_CONTAINER = 'atlas-api-1'
+# ⚠️ The container the API runs as. ATLAS's compose file pins its project name
+# to `takmdm`, so the containers are `takmdm-*` no matter what directory the
+# module installs into — `--project-directory` does not override an explicit
+# `name:`. Guessing `atlas-api-1` from the module key made detect() report the
+# module as never running, forever.
+API_CONTAINER = 'takmdm-api-1'
 
 
 def _plog(msg):
@@ -274,9 +278,13 @@ def deploy(ctx, job, params):
             plog('    cannot be enrolled without a hostname to put in the QR.')
 
         device_url = f'https://{fqdn}:{DEVICE_PORT}' if fqdn else ''
+        console_url = f'https://{fqdn}' if fqdn else ''
+        apk_url = f'http://{fqdn}/api/v1/provisioning/agent.apk' if fqdn else ''
         ctx['_write_priv'](os.path.join(dirpath, '.env'), _ENV_TEMPLATE.format(
             pg_password=pg_password,
             device_url=device_url,
+            apk_url=apk_url,
+            console_url=console_url,
         ), perm=0o600)
         ctx['_write_priv'](
             os.path.join(dirpath, 'docker-compose.override.yml'),
@@ -395,16 +403,30 @@ def uninstall(ctx, job, params):
 
 _ENV_TEMPLATE = """# Written by the infra-TAK ATLAS module. Edited by hand at your own risk:
 # a re-deploy rewrites this file.
+#
+# ⚠️ Every name here must appear as ${{...}} in ATLAS's docker-compose.yml.
+# There is no `env_file`, so a variable written here and not referenced there
+# reaches nothing and fails silently.
+
+# Generated once and kept. Regenerating on a re-deploy would leave the existing
+# database unopenable by the application that owns it.
 TAKMDM_DB_PASSWORD={pg_password}
-POSTGRES_PASSWORD={pg_password}
 
 # Caddy terminates TLS with a publicly-issued certificate, so provisioning must
 # NOT tell devices to pin this deployment's own CA — they would fail the
 # handshake at enrolment with nothing on the tablet to explain it.
 TAKMDM_INCLUDE_SERVER_CA=0
 
-# What a device is told to talk to. Caddy's device vhost, not the app.
+# What a device is told to talk to: Caddy's device vhost, not the app.
 TAKMDM_SERVER_URL={device_url}
+
+# Where a tablet in out-of-box setup fetches the agent. Plain HTTP on the
+# well-known port, through Caddy — an Android setup wizard follows no redirect
+# and its integrity check is the signature checksum in the QR.
+TAKMDM_AGENT_APK_URL={apk_url}
+
+# The console's public origin, for the cross-origin check.
+TAKMDM_CONSOLE_ORIGIN={console_url}
 
 # Authentik terminates administrator sign-in and forwards the identity.
 TAKMDM_ADMIN_AUTH_MODE=forward_auth
