@@ -24,6 +24,7 @@ resolve in a config file, it means one of them quietly stops renewing.
 """
 import os
 import secrets
+import shutil
 import subprocess
 
 from . import register_module, job_log
@@ -449,39 +450,99 @@ def deploy(ctx, job, params):
 
 
 def uninstall(ctx, job, params):
-    """Stop ATLAS and take it off the network.
+    """Remove ATLAS completely. Nothing of it survives this call.
 
-    ⚠️ **The install directory stays, and with it the database volume and the
-    device CA.** Removing them would revoke every enrolled tablet's identity
-    irreversibly — a factory reset each, in person. Uninstall means "stop
-    serving this"; destroying a fleet's enrolment is a different act and should
-    look like one.
+    ⚠️ **This destroys the device CA and the database, and that is deliberate.**
+    Every enrolled tablet's identity is signed by that CA; once it is gone they
+    cannot be re-adopted, only factory reset in person. The console asks for a
+    password and says so before calling this.
+
+    The alternative — keeping the data "just in case" — was worse in practice:
+    an operator who uninstalls expects the box to be as it was, and a leftover
+    database silently decided the *next* install's fate, because Postgres only
+    honours POSTGRES_PASSWORD on an empty volume. Install regenerates all of it.
+
+    ⚠️ The deploy key is *not* removed. It lives beside the install directory,
+    not inside it, and it is the credential for fetching ATLAS rather than any
+    part of ATLAS — taking it would make the next install fail at `git clone`
+    with nothing on the page to explain why.
     """
     steps = []
     dirpath = atlas_dir(ctx)
 
+    # Volumes go with the containers: `down -v` is the only step that removes
+    # the database, and it needs the compose file, so it runs before the
+    # directory does.
     if os.path.isdir(dirpath):
-        _compose(ctx, 'down', timeout=180)
-        steps.append('Containers stopped and removed')
+        _compose(ctx, 'down -v --remove-orphans', timeout=300)
+        steps.append('Containers, network and database volume removed')
+    else:
+        steps.append('No install directory — nothing to stop')
+
+    r = _run(ctx, ['docker', 'image', 'rm', '-f', 'takmdm-api', 'takmdm-init'])
+    steps.append('Images removed' if r else 'Images already absent')
+
+    # The install directory carries the device CA, the bundle signing key, the
+    # uploaded artifacts and the generated .env.
+    for path, label in ((dirpath, 'Install directory (device CA, artifacts, .env)'),
+                        (_caddy_ca_dir(), "Caddy's copy of the device CA")):
+        try:
+            if path and os.path.isdir(path):
+                shutil.rmtree(path)
+                steps.append(f'{label} removed')
+        except OSError as exc:
+            steps.append(f'{label} NOT removed: {exc}')
 
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
     steps.append(f'Firewall rule for {DEVICE_PORT}/tcp removed')
 
+    # ⚠️ Every generated secret goes, the deploy key excepted. Leaving
+    # atlas_pg_password behind would hand the next install a password for a
+    # database that no longer exists — harmless only by luck, since the volume
+    # it belonged to is gone.
     s = ctx['load_settings']()
+    for key in [k for k in list(s) if k.startswith(f'{KEY}_')]:
+        if key != f'{KEY}_deploy_key':
+            s.pop(key, None)
     s[f'{KEY}_enabled'] = False
     ctx['save_settings'](s)
     ctx['generate_caddyfile'](s)
     ctx['_caddy_reload']()
-    steps.append('Caddy vhosts removed')
+    steps.append('Generated settings cleared and Caddy vhosts removed')
 
     try:
         ctx['_deregister_authentik_proxy_app'](s, KEY, 'ATLAS MDM Proxy')
-        steps.append('Authentik application deregistered')
+        steps.append('ATLAS application removed from Authentik')
     except Exception:
-        steps.append('Authentik application not deregistered (not configured)')
+        steps.append('ATLAS application not in Authentik (not configured)')
 
-    steps.append('Install directory kept — database and device CA are still there')
+    steps.append('Deploy key kept — it is how the next install fetches ATLAS')
     return {'success': True, 'steps': steps}
+
+
+def _caddy_ca_dir():
+    """Where app.py stages a Caddy-readable copy of the device CA, or None.
+
+    Mirrors _sync_atlas_device_ca_for_caddy: Caddy runs unprivileged and cannot
+    read the install directory, so the certificate is copied into its own home.
+    A stale copy left behind would have Caddy verifying client certificates
+    against a CA that no longer exists.
+    """
+    for base in ('/var/lib/caddy', os.path.expanduser('~caddy')):
+        candidate = os.path.join(base, KEY)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _run(ctx, argv):
+    """Best-effort root command; True when it succeeded."""
+    try:
+        p = subprocess.run(ctx['_sudo_wrap'](list(argv)), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=120)
+        return p.returncode == 0
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #

@@ -97,13 +97,16 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   <div class="modal">
     <h3>Uninstall ATLAS</h3>
     <p class="note">
-      Stops and removes the containers, closes 8449, and takes the Caddy vhosts
-      away.
+      Removes ATLAS completely: containers, images, the database volume, the
+      install directory, the Caddy vhosts, the firewall rule, and the ATLAS
+      application in Authentik. Installing again rebuilds all of it from
+      scratch.
     </p>
-    <p class="note" style="margin-top:10px;color:var(--yellow)">
-      ⚠️ The install directory stays, and with it the database and the device CA.
-      Removing those would revoke every enrolled tablet's identity — each would
-      need a factory reset, in person.
+    <p class="note" style="margin-top:10px;color:var(--red)">
+      ⚠️ <strong>This destroys the device CA and the database.</strong> Every
+      enrolled tablet's identity is signed by that CA. Once it is gone they
+      cannot be re-adopted — each needs a factory reset, in person. There is no
+      undo and no backup taken.
     </p>
     <input type="password" id="uninstallPw" placeholder="Console password">
     <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
