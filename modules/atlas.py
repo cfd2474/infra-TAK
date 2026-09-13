@@ -81,6 +81,15 @@ def _compose_argv(ctx, *action):
 
 
 def _compose(ctx, action, timeout=180):
+    """Run `docker compose <action>` in the install directory, via the broker.
+
+    ⚠️ **`action` is a string, not argv.** `_broker_compose` does
+    `shlex.split(action)` on it, so a list arrives as a file-like object and
+    dies with `'list' object has no attribute 'read'` — an error that names
+    neither compose nor the argument that was wrong. `control_map` is the
+    opposite: the registry sudo-wraps and runs that one itself, so it takes a
+    real argv list. Two neighbouring seams, two conventions.
+    """
     return ctx['_broker_compose'](atlas_dir(ctx), action, timeout=timeout)
 
 
@@ -298,7 +307,7 @@ def deploy(ctx, job, params):
         # `api` alone: it depends_on db and the one-shot migration step, and
         # naming it keeps ATLAS's own nginx out of a deployment where Caddy is
         # the only thing that should be terminating TLS.
-        r = _compose(ctx, ['up', '-d', '--build', 'api'], timeout=1800)
+        r = _compose(ctx, 'up -d --build api', timeout=1800)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed:\n{(r.stderr or "")[-500:]}')
         plog('✓ Containers built and started')
@@ -374,7 +383,7 @@ def uninstall(ctx, job, params):
     dirpath = atlas_dir(ctx)
 
     if os.path.isdir(dirpath):
-        _compose(ctx, ['down'], timeout=180)
+        _compose(ctx, 'down', timeout=180)
         steps.append('Containers stopped and removed')
 
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
