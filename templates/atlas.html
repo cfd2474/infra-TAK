@@ -145,8 +145,12 @@ function renderLog(entries){
   if (card) card.style.display = '';
   // The route returns `entries`, not `log` — reading the wrong key showed an
   // empty box for the whole deploy and nothing to explain a failure.
-  box.textContent = (entries || []).join('
-');
+  // ⚠️ Joined with a char code on purpose. A backslash-n escape written
+  // here by a generator arrived as a real newline inside a JS string
+  // literal, which is a syntax error — and a syntax error anywhere in this
+  // block means startDeploy is never defined and the button does nothing at
+  // all, silently. Third time this bit; the escape is simply not used now.
+  box.textContent = (entries || []).join(String.fromCharCode(10));
   box.scrollTop = box.scrollHeight;
 }
 
