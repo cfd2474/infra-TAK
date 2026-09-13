@@ -3138,6 +3138,28 @@ def detect_modules():
         'route': '/webodm',
         'priority': 12,
     }
+    # ATLAS MDM — registry-resident (modules/atlas.py). Identity and probes come
+    # from the descriptor; this block is what puts the tile on the Marketplace at
+    # all, because detect_modules() enumerates rather than iterating the registry.
+    _atlas_desc = mod_registry.MODULES.get('atlas')
+    try:
+        _atlas_state = _atlas_desc['detect'](mod_registry.get_ctx()) if _atlas_desc else {}
+    except Exception:
+        _atlas_state = {}
+    if _atlas_desc:
+        modules['atlas'] = {'name': _atlas_desc['name'],
+            'installed': bool(_atlas_state.get('installed')), 'running': bool(_atlas_state.get('running')),
+            'description': _atlas_desc['description'], 'icon': _atlas_desc['icon'],
+            'icon_url': _atlas_desc.get('icon_url'), 'route': _atlas_desc['route'],
+            'priority': _atlas_desc['priority'], 'conflicts': list(_atlas_desc.get('conflicts') or [])}
+    else:
+        # boot race only: the registry loads at the bottom of app.py, so an early
+        # daemon-thread poll in that window reports the tile not-installed once.
+        modules['atlas'] = {'name': 'ATLAS MDM', 'installed': False, 'running': False,
+            'description': 'Android device management for ATAK tablets — policies, apps, enrolment',
+            'icon': '📱', 'icon_url': None,
+            'route': '/atlas', 'priority': 16, 'conflicts': []}
+
     # TAK Video Restreamer — registry-resident since v10.1.24 (modules/tvr.py):
     # tile identity + probes (incl. the enabled-flag self-heal) come from the
     # descriptor, not an inline block. Conflict metadata carried, not redesigned.
@@ -40391,6 +40413,32 @@ def webodm_uninstall():
 
 # ── TAK Video Restreamer routes ───────────────────────────────────────────────
 
+
+
+@app.route('/atlas')
+@login_required
+def atlas_page():
+    """The ATLAS module page.
+
+    Hand-written like every other module page: the registry generates the four
+    API routes, not the page that calls them.
+    """
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    atlas = modules.get('atlas', {})
+    atlas_domain = _get_service_domain(settings, 'atlas')
+    job = mod_registry.job_state('atlas')
+    r = make_response(render_template('atlas.html',
+        settings=settings, modules=modules, atlas=atlas,
+        installed=atlas.get('installed'), running=atlas.get('running'),
+        atlas_domain=atlas_domain,
+        deploy_log=job.get('log') or [],
+        deploy_running=bool(job.get('running')),
+        deploy_error=bool(job.get('error')),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
 
 
 @app.route('/tak-video-restreamer')
