@@ -189,6 +189,36 @@ def _stale_deploy_key(dirpath):
 
 
 
+def _write_build_file(dirpath, plog=None):
+    """Record the checked-out revision where the container can still read it.
+
+    ⚠️ `.dockerignore` excludes `.git`, and it should — but that leaves the
+    running console unable to answer "is this exactly the code I think it is".
+    It reported `revision unknown` on every InfraTAK deployment while the footer
+    happily showed a version, which is the worse half of both worlds: a number
+    to trust and no way to check it.
+
+    ATLAS reads this file at `app/version.py:_from_file`, which exists for
+    precisely this case. Written before the image is built, so it is copied in.
+    """
+    try:
+        r = subprocess.run(
+            ['git', '-C', dirpath, 'log', '-1', '--format=%h %cs'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        revision, _, committed = r.stdout.strip().partition(' ')
+        with open(os.path.join(dirpath, 'BUILD'), 'w', encoding='utf-8') as handle:
+            handle.write('revision=%s\ncommitted=%s\ndirty=false\n'
+                         % (revision, committed))
+        if plog:
+            plog('  \u2713 Build stamp written (revision %s)' % revision)
+        return revision
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _verify_pin(ctx, dirpath, plog):
     """Check the checkout is the commit we meant to install.
 
@@ -275,6 +305,7 @@ def deploy(ctx, job, params):
                     hint = ' — the repository is private; supply a read-only deploy key'
                 raise RuntimeError(f'git clone failed{hint}: {r.stderr[-300:]}')
         commit = _verify_pin(ctx, dirpath, plog)
+        _write_build_file(dirpath, plog)
         plog('✓ Source in place')
 
         # ── 3/7 Configuration ─────────────────────────────────────────────────
@@ -553,6 +584,7 @@ def _run_update(ctx):
         if r.returncode != 0:
             raise RuntimeError('git fetch failed: ' + (r.stderr or '')[-300:])
         ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
+        _write_build_file(dirpath, plog)
         plog('✓ Source now at ' + tag)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
