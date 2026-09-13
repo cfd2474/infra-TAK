@@ -966,7 +966,7 @@ def apply_security_headers(response):
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 VERSION = "10.1.70-alpha"
-GITHUB_REPO = "takwerx/infra-TAK"
+GITHUB_REPO = "cfd2474/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
 # The console is served over a network, so everyone who interacts with it is owed
@@ -3138,6 +3138,28 @@ def detect_modules():
         'route': '/webodm',
         'priority': 12,
     }
+    # ATLAS MDM — registry-resident (modules/atlas.py). Identity and probes come
+    # from the descriptor; this block is what puts the tile on the Marketplace at
+    # all, because detect_modules() enumerates rather than iterating the registry.
+    _atlas_desc = mod_registry.MODULES.get('atlas')
+    try:
+        _atlas_state = _atlas_desc['detect'](mod_registry.get_ctx()) if _atlas_desc else {}
+    except Exception:
+        _atlas_state = {}
+    if _atlas_desc:
+        modules['atlas'] = {'name': _atlas_desc['name'],
+            'installed': bool(_atlas_state.get('installed')), 'running': bool(_atlas_state.get('running')),
+            'description': _atlas_desc['description'], 'icon': _atlas_desc['icon'],
+            'icon_url': _atlas_desc.get('icon_url'), 'route': _atlas_desc['route'],
+            'priority': _atlas_desc['priority'], 'conflicts': list(_atlas_desc.get('conflicts') or [])}
+    else:
+        # boot race only: the registry loads at the bottom of app.py, so an early
+        # daemon-thread poll in that window reports the tile not-installed once.
+        modules['atlas'] = {'name': 'ATLAS MDM', 'installed': False, 'running': False,
+            'description': 'Android device management for ATAK tablets — policies, apps, enrolment',
+            'icon': '📱', 'icon_url': '/static/logos/atlas-banner.png',
+            'route': '/atlas', 'priority': 16, 'conflicts': []}
+
     # TAK Video Restreamer — registry-resident since v10.1.24 (modules/tvr.py):
     # tile identity + probes (incl. the enabled-flag self-heal) come from the
     # descriptor, not an inline block. Conflict metadata carried, not redesigned.
@@ -3610,6 +3632,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+    atlas_nav = modules.get('atlas', {})
+    if atlas_nav.get('installed'):
+        parts.append(link('/atlas', '<img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" style="height:auto;width:100%;max-width:150px;object-fit:contain;display:block">', 'ATLAS MDM'))
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
@@ -7963,7 +7988,7 @@ def console_rollback_api():
         git_cfg = ['git', '-c', f'safe.directory={console_dir}']
         # Fetch the tag from origin
         fetch_r = subprocess.run(
-            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
+            git_cfg + ['fetch', 'https://github.com/cfd2474/infra-TAK.git',
                        f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
             cwd=console_dir, capture_output=True, text=True, timeout=60,
             env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
@@ -11691,7 +11716,7 @@ def connectivity_anchor_disconnect_api():
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
 _CONN_ANCHOR_BOOTSTRAP_COMMIT = '792e80bfa6a7e9004dadfde0a4807abf5483c89e'
 _CONN_ANCHOR_BOOTSTRAP_SHA256 = '52beb8a1584b260e1b4f1e247438224efce3e20f12fc2ec6e780b6298edae20a'
-_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
+_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/cfd2474/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
 _CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
@@ -25427,6 +25452,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'webodm': 'webodm',
     'netbird': 'netbird',
     'remote_assist': 'remote',
+    'atlas': 'atlas',
 }
 
 def _get_service_domain(settings, service_key):
@@ -29179,6 +29205,103 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
 
+    atlas_mod = modules.get('atlas', {})
+    if atlas_mod.get('installed'):
+        at_host = sd.get('atlas') or _get_service_domain(settings, 'atlas')
+        at_up = '127.0.0.1:8760'
+        at_device_paths = '/api/v1/device/* /api/v1/enroll /api/v1/provisioning/*'
+        at_ca = mod_registry.atlas.sync_device_ca_for_caddy()
+
+        # Administration console (443). Admin tooling, so Authentik fronts it and
+        # the device paths are refused here — a tablet cannot complete an
+        # interactive login, and an admin does not need the device API.
+        lines.append(f"# ATLAS MDM — administration console (443). Device channel is :8449 only.")
+        lines.append(f"{at_host} {{")
+        lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            # ⚠️ The strip runs FIRST, before forward_auth re-adds the authentic
+            # values. ATLAS trusts x-authentik-username / -groups to decide who
+            # is an administrator, so a client that could set them itself would
+            # own the fleet. Same reasoning as the mTLS certificate header.
+            _emit_ak_header_strip("        ")
+            _emit_outpost_callback_rescue(f"https://{at_host}/")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            # Refused before authentication, not after: a tablet cannot complete
+            # an interactive login, so sending it into the SSO round-trip would
+            # turn a clean 404 into a redirect loop.
+            lines.append(f"        @atlas_device path {at_device_paths}")
+            lines.append(f"        respond @atlas_device 404")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy {at_up}")
+            lines.append(f"    }}")
+        else:
+            # ⚠️ Not published without Authentik. ATLAS has two auth modes and no
+            # middle one: forward_auth (which nothing would satisfy here, so the
+            # console would answer 401 forever) or disabled (which would put an
+            # unauthenticated fleet-management console on the public internet).
+            # The honest answer is an SSH tunnel, which is what the deploy log
+            # tells the operator to use.
+            lines.append(f"    respond 404")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
+
+        # The agent package, in the clear on the well-known port.
+        #
+        # A tablet in out-of-box setup is fetching this before it has been told
+        # anything, often on a guest network that blocks high ports. Declaring
+        # the site as http:// suppresses Caddy's automatic redirect to TLS for
+        # this host, which is the point: an Android setup wizard follows no
+        # redirect here. Integrity comes from the signature checksum carried in
+        # the provisioning QR, which the wizard verifies before installing.
+        lines.append(f"# ATLAS MDM — agent package, plain HTTP (device provisioning, no redirect)")
+        lines.append(f"http://{at_host} {{")
+        lines.append(f"    @atlas_apk path /api/v1/provisioning/agent.apk")
+        lines.append(f"    handle @atlas_apk {{")
+        lines.append(f"        reverse_proxy {at_up}")
+        lines.append(f"    }}")
+        lines.append(f"    handle {{")
+        lines.append(f"        redir https://{{host}}{{uri}} permanent")
+        lines.append(f"    }}")
+        lines.append(f"}}")
+        lines.append("")
+
+        # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
+        if at_ca:
+            lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
+            lines.append(f"{at_host}:8449 {{")
+            lines.append(f"    tls {{")
+            # verify_if_given, NOT require_and_verify: a device enrolling for the
+            # first time has no certificate yet and calls /api/v1/enroll without
+            # one. Requiring a certificate at the listener would make enrolment
+            # impossible — the application decides which paths need an identity.
+            lines.append(f"        client_auth {{")
+            lines.append(f"            mode verify_if_given")
+            lines.append(f"            trust_pool file {{")
+            lines.append(f"                pem_file {at_ca}")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    @atlas_device path {at_device_paths}")
+            lines.append(f"    handle @atlas_device {{")
+            lines.append(f"        reverse_proxy {at_up} {{")
+            # The verified certificate, single-line base64 DER. Caddy's PEM
+            # placeholder carries real newlines and a header cannot.
+            #
+            # This SETS the header, which is what makes it safe: an inbound copy
+            # from a client is replaced, never appended to.
+            lines.append(f"            header_up X-SSL-Client-Cert {{http.request.tls.client.certificate_der_base64}}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    respond 404")
+            lines.append(f"}}")
+            lines.append("")
+
     ra_mod = modules.get('remote_assist', {})
     if ra_mod.get('installed'):
         ra_host = sd.get('remote_assist') or _get_service_domain(settings, 'remote_assist')
@@ -31412,6 +31535,10 @@ def get_all_module_versions():
     if modules.get('tak_video_restreamer', {}).get('installed'):
         # registry-resident since v10.1.24 — modules/tvr.py owns the SHA compare
         _set('tak_video_restreamer', lambda: mod_registry.tvr.get_version_info(mod_registry.get_ctx()))
+    if modules.get('atlas', {}).get('installed'):
+        # Registry-resident: modules/atlas.py owns the compare, which is by
+        # release tag rather than by commit.
+        _set('atlas', lambda: mod_registry.atlas.get_version_info(mod_registry.get_ctx()))
     if modules.get('simulator', {}).get('installed'):
         # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
@@ -40433,6 +40560,35 @@ def webodm_uninstall():
 
 # ── TAK Video Restreamer routes ───────────────────────────────────────────────
 
+
+
+@app.route('/atlas')
+@login_required
+def atlas_page():
+    """The ATLAS module page.
+
+    Hand-written like every other module page: the registry generates the four
+    API routes, not the page that calls them.
+    """
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    atlas = modules.get('atlas', {})
+    atlas_domain = _get_service_domain(settings, 'atlas')
+    job = mod_registry.job_state('atlas')
+    # ⚠️ No deploy key any more: the ATLAS repository is public, so the module
+    # clones over HTTPS with no credential. The helper this used to call is gone
+    # — leaving the call here would have raised AttributeError on the page.
+    r = make_response(render_template('atlas.html',
+        settings=settings, modules=modules, atlas=atlas,
+        installed=atlas.get('installed'), running=atlas.get('running'),
+        atlas_domain=atlas_domain,
+        deploy_log=job.get('log') or [],
+        deploy_running=bool(job.get('running')),
+        deploy_error=bool(job.get('error')),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
 
 
 @app.route('/tak-video-restreamer')
@@ -79533,6 +79689,9 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
+    # Resolve a module's hostname, honouring the operator's per-box
+    # override. The developer guide already instructs modules to use this.
+    '_get_service_domain': _get_service_domain,
     # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
     # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
     # eternal-grace-period hang inside the module registry, where the deploy-job runner's
@@ -79562,6 +79721,12 @@ _MODULE_CTX = {
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
     '_get_authentik_api_url': _get_authentik_api_url,
+    # Shared Authentik plumbing. `_outpost_add_providers_safe` carries a
+    # contract worth not reimplementing per module: it never removes an
+    # existing provider, and restarts authentik-server only on a real
+    # change, because the embedded outpost does not hot-reload a new host.
+    '_outpost_add_providers_safe': _outpost_add_providers_safe,
+    '_authentik_application_open_in_new_tab': _authentik_application_open_in_new_tab,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
     'VERSION': VERSION,
