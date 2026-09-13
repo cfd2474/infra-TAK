@@ -1,0 +1,296 @@
+{% extends 'base.html' %}
+{% block title %}ATLAS MDM — infra-TAK{% endblock %}
+{% block page_css %}<style>
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.mono{font-family:'JetBrains Mono',monospace}
+.atlas-banner{height:44px;width:auto;max-width:100%;object-fit:contain;display:block}
+.atlas-link{color:var(--cyan);text-decoration:none}
+.badge-new{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3);border-radius:999px;padding:2px 10px;font-size:11px;font-weight:700}
+.spinner-row{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-secondary)}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.atlas-link:hover{text-decoration:underline}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
+.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
+.url-row:last-child{border-bottom:none}
+.note{font-size:12px;color:var(--text-dim);line-height:1.7}
+textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--border);border-radius:8px;color:#94a3b8;font-family:'JetBrains Mono',monospace;font-size:11px;padding:10px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal input{width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:12px}
+</style>{% endblock %}
+
+{% block content %}
+<div class="main">
+  <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
+
+  {% if not installed %}
+  <div class="card">
+    <div class="card-title">Install</div>
+    <p class="note">
+      Android device management for ATAK tablets — policies, app catalogues,
+      enrolment by QR, and a device channel secured with client certificates.
+    </p>
+    <p class="note" style="margin-top:12px">
+      The console is published at <span class="mono">{{ atlas_domain or 'atlas.&lt;your-domain&gt;' }}</span>
+      behind Authentik, and enrolled devices talk to
+      <span class="mono">:8449</span> over mutual TLS. The database never leaves
+      the container network.
+    </p>
+    <p class="note" style="margin-top:12px;color:var(--yellow)">
+      ⏳ The first deploy clones the repository and builds images — allow 5–10 minutes.
+    </p>
+
+    <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" style="margin-top:16px">Deploy ATLAS</button>
+    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
+  </div>
+
+  <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
+    <div class="card-title">Deploy log</div>
+    <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="card-title">Status</div>
+    <div class="url-row"><strong>Console</strong>
+      <a class="mono atlas-link" href="https://{{ atlas_domain }}/"
+         target="_blank" rel="noopener noreferrer">https://{{ atlas_domain }}/ ↗</a></div>
+    <div class="url-row"><strong>Version</strong>
+      <span class="mono" id="versionNow">checking…</span>
+      <span id="updateBadge" class="badge-new" hidden></span></div>
+
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="updateBtn" onclick="startUpdate()" hidden>Update ATLAS</button>
+      <button class="btn btn-secondary" onclick="control('restart')">Restart</button>
+      <button class="btn btn-secondary" onclick="control('stop')">Stop</button>
+      <button class="btn btn-secondary" onclick="loadLogs()">Refresh logs</button>
+      <button class="btn btn-danger" onclick="openUninstall()">Uninstall</button>
+    </div>
+  </div>
+
+  <div class="card" id="updateCard" hidden>
+    <div class="card-title">Update log</div>
+    <div class="log-box" id="updateLog"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Logs</div>
+    <div class="log-box" id="logBox">Loading…</div>
+  </div>
+  {% endif %}
+
+</div>
+
+<div class="modal-overlay" id="uninstallModal">
+  <div class="modal">
+    <h3>Uninstall ATLAS</h3>
+    <p class="note">
+      Removes ATLAS completely: containers, images, the database volume, the
+      install directory, the Caddy vhosts, the firewall rule, and the ATLAS
+      application in Authentik. Installing again rebuilds all of it from
+      scratch.
+    </p>
+    <p class="note" style="margin-top:10px;color:var(--red)">
+      ⚠️ <strong>This destroys the device CA and the database.</strong> Every
+      enrolled tablet's identity is signed by that CA. Once it is gone they
+      cannot be re-adopted — each needs a factory reset, in person. There is no
+      undo and no backup taken.
+    </p>
+    <input type="password" id="uninstallPw" placeholder="Console password">
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end" id="uninstallButtons">
+      <button class="btn btn-secondary" onclick="closeUninstall()">Cancel</button>
+      <button class="btn btn-danger" id="uninstallGo" onclick="doUninstall()">Uninstall</button>
+    </div>
+    <!-- The operator pressed uninstall and got silence for the length of a
+         `docker compose down -v`. Nothing said it had started, so the only
+         honest reading was that the click had missed. -->
+    <div id="uninstallBusy" hidden style="margin-top:14px">
+      <div class="spinner-row">
+        <span class="spinner"></span>
+        <span>Uninstalling… stopping containers and removing data.</span>
+      </div>
+      <p class="note" style="margin-top:8px">
+        This takes up to a minute. The page reloads itself when it is done.
+      </p>
+    </div>
+    <div id="uninstallSteps" hidden class="log-box" style="height:150px;margin-top:12px"></div>
+    <div id="uninstallError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
+<script>
+let polling = false;
+
+function startDeploy(){
+  const btn = document.getElementById('deployBtn');
+  btn.disabled = true;
+  fetch('/api/atlas/deploy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({}),
+    credentials: 'same-origin'
+  }).then(r => r.json()).then(d => {
+    if (d.error) { btn.disabled = false; alert(d.error); return; }
+    polling = true; pollDeploy();
+  }).catch(() => { btn.disabled = false; });
+}
+
+function renderLog(entries){
+  const card = document.getElementById('deployCard');
+  const box = document.getElementById('deployLog');
+  if (!box) return;
+  if (card) card.style.display = '';
+  // The route returns `entries`, not `log` — reading the wrong key showed an
+  // empty box for the whole deploy and nothing to explain a failure.
+  // ⚠️ Joined with a char code on purpose. A backslash-n escape written
+  // here by a generator arrived as a real newline inside a JS string
+  // literal, which is a syntax error — and a syntax error anywhere in this
+  // block means startDeploy is never defined and the button does nothing at
+  // all, silently. Third time this bit; the escape is simply not used now.
+  box.textContent = (entries || []).join(String.fromCharCode(10));
+  box.scrollTop = box.scrollHeight;
+}
+
+function pollDeploy(){
+  if (!polling) return;
+  fetch('/api/atlas/log', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    renderLog(d.entries);
+    if (d.complete && !d.error) { polling = false; setTimeout(() => location.reload(), 1200); return; }
+    if (d.error && !d.running) {
+      polling = false;
+      const e = document.getElementById('deployError');
+      if (e) e.style.display = '';
+      return;
+    }
+    setTimeout(pollDeploy, 2000);
+  }).catch(() => setTimeout(pollDeploy, 4000));
+}
+
+function control(action){
+  fetch('/api/atlas/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: action}),
+    credentials: 'same-origin'
+  }).then(() => setTimeout(() => location.reload(), 1500));
+}
+
+function loadLogs(){
+  fetch('/api/atlas/logs', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    const box = document.getElementById('logBox');
+    if (!box) return;
+    box.textContent = (d.lines || []).join('\n') || '(no output)';
+    box.scrollTop = box.scrollHeight;
+  });
+}
+
+function openUninstall(){ document.getElementById('uninstallModal').classList.add('open'); }
+function closeUninstall(){ document.getElementById('uninstallModal').classList.remove('open'); }
+
+async function doUninstall(){
+  const pw = document.getElementById('uninstallPw').value;
+  const err = document.getElementById('uninstallError');
+  const busy = document.getElementById('uninstallBusy');
+  const buttons = document.getElementById('uninstallButtons');
+  const steps = document.getElementById('uninstallSteps');
+
+  // The request blocks for the length of a `docker compose down -v`. Without
+  // this the dialog sat there unchanged and the only honest reading was that
+  // the click had missed.
+  err.style.display = 'none';
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    const r = await fetch('/api/atlas/uninstall', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+      credentials: 'same-origin'
+    });
+    const d = await r.json();
+    if (d.success) {
+      busy.hidden = true;
+      steps.hidden = false;
+      steps.textContent = (d.steps || ['Removed.']).join(String.fromCharCode(10));
+      setTimeout(function(){ location.reload(); }, 2500);
+      return;
+    }
+    err.textContent = d.error || 'Uninstall failed.';
+  } catch (e) {
+    err.textContent = 'Uninstall failed: ' + e;
+  }
+  // Back to a usable dialog: a wrong password must be retryable.
+  busy.hidden = true;
+  buttons.hidden = false;
+  err.style.display = '';
+}
+
+// ── Version and updates ────────────────────────────────────────────────────
+function loadVersion(){
+  const now = document.getElementById('versionNow');
+  if (!now) return;
+  fetch('/api/atlas/version', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    now.textContent = d.version ? ('v' + d.version) : 'unknown';
+    const badge = document.getElementById('updateBadge');
+    const btn = document.getElementById('updateBtn');
+    if (d.update_available && d.latest) {
+      // ⚠️ Only when a newer version was actually established. A latest of null
+      // means the check could not run, which is not the same as being current.
+      if (badge) { badge.textContent = 'v' + d.latest + ' available'; badge.hidden = false; }
+      if (btn) btn.hidden = false;
+    } else if (!d.latest && badge) {
+      badge.textContent = 'update check unavailable';
+      badge.style.color = 'var(--text-dim)';
+      badge.hidden = false;
+    }
+  }).catch(() => { now.textContent = 'unknown'; });
+}
+
+let updatePolling = false;
+
+function startUpdate(){
+  const btn = document.getElementById('updateBtn');
+  if (btn) btn.disabled = true;
+  fetch('/api/atlas/update', {method:'POST', credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+      if (d.error) { if (btn) btn.disabled = false; alert(d.error); return; }
+      updatePolling = true;
+      pollUpdate();
+    }).catch(() => { if (btn) btn.disabled = false; });
+}
+
+function pollUpdate(){
+  if (!updatePolling) return;
+  fetch('/api/atlas/update-status', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    const card = document.getElementById('updateCard');
+    const box = document.getElementById('updateLog');
+    if (card) card.hidden = false;
+    if (box) {
+      box.textContent = (d.entries || []).join(String.fromCharCode(10));
+      box.scrollTop = box.scrollHeight;
+    }
+    if (d.complete && !d.error) {
+      updatePolling = false;
+      setTimeout(function(){ location.reload(); }, 1500);
+      return;
+    }
+    if (d.error && !d.running) { updatePolling = false; return; }
+    setTimeout(pollUpdate, 2000);
+  }).catch(() => setTimeout(pollUpdate, 4000));
+}
+
+{% if installed %}loadLogs(); loadVersion();{% endif %}
+{% if deploy_running %}polling = true; pollDeploy();{% endif %}
+{% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
+</script>
+{% endblock %}
