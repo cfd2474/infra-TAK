@@ -577,6 +577,10 @@ def register(ctx):
         'name': 'ATLAS MDM',
         'description': 'Android device management for ATAK tablets — policies, apps, enrolment',
         'icon': '\U0001F4F1',  # 📱 as an escape: a literal surrogate pair corrupts on edit
+        # ATLAS's own banner, the one its web UI wears. The console and
+        # marketplace tiles hide the module name when a logo is present, so
+        # this is the wordmark artwork rather than the bare mark.
+        'icon_url': '/static/logos/atlas-banner.png',
         'route': '/atlas',
         'template': 'atlas.html',
         'priority': 16,

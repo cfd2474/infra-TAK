@@ -10,6 +10,9 @@
 .btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
 .btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
 .mono{font-family:'JetBrains Mono',monospace}
+.atlas-banner{height:44px;width:auto;max-width:100%;object-fit:contain;display:block}
+.atlas-link{color:var(--cyan);text-decoration:none}
+.atlas-link:hover{text-decoration:underline}
 .log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
 .url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
 .url-row:last-child{border-bottom:none}
@@ -24,7 +27,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
 
 {% block content %}
 <div class="main">
-  <h1 class="section-title">📱 ATLAS MDM</h1>
+  <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
 
   {% if not installed %}
   <div class="card">
@@ -72,17 +75,8 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   <div class="card">
     <div class="card-title">Status</div>
     <div class="url-row"><strong>Console</strong>
-      <span class="mono">https://{{ atlas_domain }}/</span></div>
-    <div class="url-row"><strong>Devices</strong>
-      <span class="mono">https://{{ atlas_domain }}:8449/</span> — mutual TLS</div>
-    <div class="url-row"><strong>Agent package</strong>
-      <span class="mono">http://{{ atlas_domain }}/api/v1/provisioning/agent.apk</span></div>
-    <p class="note" style="margin-top:14px">
-      The agent package is served in the clear, deliberately: a tablet fetches it
-      during out-of-box setup, before it has been told anything and often on a
-      network that blocks high ports. Its integrity comes from the signature
-      checksum carried in the provisioning QR.
-    </p>
+      <a class="mono atlas-link" href="https://{{ atlas_domain }}/"
+         target="_blank" rel="noopener noreferrer">https://{{ atlas_domain }}/ ↗</a></div>
     <div style="margin-top:16px;display:flex;gap:8px">
       <button class="btn btn-secondary" onclick="control('restart')">Restart</button>
       <button class="btn btn-secondary" onclick="control('stop')">Stop</button>

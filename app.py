@@ -3157,7 +3157,7 @@ def detect_modules():
         # daemon-thread poll in that window reports the tile not-installed once.
         modules['atlas'] = {'name': 'ATLAS MDM', 'installed': False, 'running': False,
             'description': 'Android device management for ATAK tablets — policies, apps, enrolment',
-            'icon': '📱', 'icon_url': None,
+            'icon': '📱', 'icon_url': '/static/logos/atlas-banner.png',
             'route': '/atlas', 'priority': 16, 'conflicts': []}
 
     # TAK Video Restreamer — registry-resident since v10.1.24 (modules/tvr.py):
@@ -3634,7 +3634,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
     atlas_nav = modules.get('atlas', {})
     if atlas_nav.get('installed'):
-        parts.append(link('/atlas', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">📱</span><span>ATLAS MDM</span>', 'ATLAS MDM'))
+        parts.append(link('/atlas', '<img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" style="height:auto;width:100%;max-width:150px;object-fit:contain;display:block">', 'ATLAS MDM'))
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
