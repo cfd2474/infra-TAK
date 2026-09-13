@@ -35,12 +35,12 @@ KEY = 'atlas'
 # the repo.
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
-ATLAS_TAG = 'v0.1.1'
+ATLAS_TAG = 'v0.1.2'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '54ba8d8eda8ac9b49dbd8f7db0eb0877102aa685'
+ATLAS_SHA = 'f0c270174e688d4b93501ff16e5b08649b5c5584'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -302,7 +302,27 @@ def deploy(ctx, job, params):
         plog('━━━ Step 3/7: Writing configuration ━━━')
         # Generated once and kept. Regenerating on a re-deploy would leave the
         # existing database unopenable by the application that owns it.
-        pg_password = settings.get(f'{KEY}_pg_password') or secrets.token_urlsafe(24)
+        #
+        # ⚠️ Persisted *here*, before anything uses it — not with the rest of the
+        # settings in step 6. Postgres applies POSTGRES_PASSWORD only when it
+        # initialises an empty volume and ignores it ever after, so the moment
+        # step 4 starts the database this value is baked in. A deploy that then
+        # failed anywhere before step 6 left no record of it, and the next
+        # attempt generated a fresh password against a volume that still held
+        # the old one:
+        #
+        #     FATAL: password authentication failed for user "takmdm"
+        #
+        # — with the API sitting on "waiting for database..." forever and the
+        # database permanently unopenable. Writing it first costs nothing: an
+        # abandoned deploy leaves a password for a database that may not exist,
+        # which is harmless, and a resumed one reuses it, which is the point.
+        pg_password = settings.get(f'{KEY}_pg_password')
+        if not pg_password:
+            pg_password = secrets.token_urlsafe(24)
+            s_early = ctx['load_settings']()
+            s_early[f'{KEY}_pg_password'] = pg_password
+            ctx['save_settings'](s_early)
         fqdn = ctx['_get_service_domain'](ctx['load_settings'](), KEY)
 
         if not fqdn:
@@ -383,7 +403,17 @@ def deploy(ctx, job, params):
         token = (ctx['_get_authentik_env_value'](s, 'AUTHENTIK_TOKEN') or
                  ctx['_get_authentik_env_value'](s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
         if fqdn and token:
-            plog('  Authentik present — the console is behind it, admins only.')
+            plog('  Registering the console with Authentik...')
+            # ⚠️ This is what makes the console reachable *and* restricted.
+            # Without an application the outpost has nothing to authorise, so
+            # Caddy's forward_auth never sets the identity headers ATLAS reads
+            # and the console answers 401 to everyone, permanently.
+            ctx['_ensure_authentik_atlas_app'](fqdn, token, plog=plog, settings=s)
+            # Re-emit now that the application exists: the console vhost only
+            # grows its forward_auth block once Authentik is in the picture.
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload'](plog)
+            plog('  ✓ Sign in with an Authentik administrator account.')
         else:
             # ⚠️ Degrading here does NOT mean an open console. ATLAS has two auth
             # modes and no middle one; without Authentik the honest answer is
@@ -478,6 +508,17 @@ TAKMDM_CONSOLE_ORIGIN={console_url}
 
 # Authentik terminates administrator sign-in and forwards the identity.
 TAKMDM_ADMIN_AUTH_MODE=forward_auth
+
+# ⚠️ Deliberately empty: Authentik decides, not ATLAS.
+#
+# ATLAS can require a group of its own, but on infra-TAK that would mean a
+# second place to manage access and a group the operator has never heard of —
+# and until somebody created it and added themselves, nobody could sign in at
+# all. infra-TAK's access-policy converge is default-deny: the ATLAS
+# application it registers is bound to "Allow authentik Admins" because it is
+# not on the user-visible allowlist. So the console is admin-only, enforced at
+# the identity provider, and blank here means "whoever Authentik let through".
+TAKMDM_ADMIN_GROUP=
 """
 
 _COMPOSE_OVERRIDE = """# Written by the infra-TAK ATLAS module.

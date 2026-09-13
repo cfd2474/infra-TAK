@@ -29101,9 +29101,35 @@ def generate_caddyfile(settings=None):
         lines.append(f"# ATLAS MDM — administration console (443). Device channel is :8449 only.")
         lines.append(f"{at_host} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
-        lines.append(f"    @atlas_device path {at_device_paths}")
-        lines.append(f"    respond @atlas_device 404")
-        lines.append(f"    reverse_proxy {at_up}")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            # ⚠️ The strip runs FIRST, before forward_auth re-adds the authentic
+            # values. ATLAS trusts x-authentik-username / -groups to decide who
+            # is an administrator, so a client that could set them itself would
+            # own the fleet. Same reasoning as the mTLS certificate header.
+            _emit_ak_header_strip("        ")
+            _emit_outpost_callback_rescue(f"https://{at_host}/")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            # Refused before authentication, not after: a tablet cannot complete
+            # an interactive login, so sending it into the SSO round-trip would
+            # turn a clean 404 into a redirect loop.
+            lines.append(f"        @atlas_device path {at_device_paths}")
+            lines.append(f"        respond @atlas_device 404")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy {at_up}")
+            lines.append(f"    }}")
+        else:
+            # ⚠️ Not published without Authentik. ATLAS has two auth modes and no
+            # middle one: forward_auth (which nothing would satisfy here, so the
+            # console would answer 401 forever) or disabled (which would put an
+            # unauthenticated fleet-management console on the public internet).
+            # The honest answer is an SSH tunnel, which is what the deploy log
+            # tells the operator to use.
+            lines.append(f"    respond 404")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
@@ -42013,6 +42039,115 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
             _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-video-restreamer', plog=log)
         else:
             log("  ⚠ Could not create or find TAK Video Restreamer proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
+
+def _ensure_authentik_atlas_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create the ATLAS MDM proxy provider + application in Authentik.
+
+    Same pattern as the TAK Video Restreamer: Caddy's forward_auth protects
+    atlas.FQDN and the embedded outpost decides who gets in.
+
+    ⚠️ Creating the application is what makes ATLAS admin-only. The startup
+    access-policy converge is default-deny — anything not on the user-visible
+    allowlist gets bound to "Allow authentik Admins" — so an MDM console that
+    can factory-reset a fleet is restricted without a policy written here. A
+    deployment that skipped this step would not be "open": ATLAS would answer
+    401 to everyone forever, because nothing would ever set the identity
+    headers it reads.
+    """
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping ATLAS proxy provider")
+                return False
+
+        provider_pk = None
+        _atlas_host = f'https://{_get_service_domain(settings, "atlas") if settings else f"atlas.{fqdn}"}'
+        _cookie = f'.{fqdn.split(":")[0]}'
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'ATLAS MDM Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': _atlas_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=ATLAS+MDM', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': _atlas_host, 'cookie_domain': _cookie}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'ATLAS MDM', 'slug': 'atlas',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'ATLAS MDM' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/atlas/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'ATLAS MDM' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'atlas', plog=log)
+        else:
+            log("  ⚠ Could not create or find the ATLAS proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
@@ -79527,6 +79662,7 @@ _MODULE_CTX = {
     '_install_docker_engine': _install_docker_engine,
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
+    '_ensure_authentik_atlas_app': _ensure_authentik_atlas_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
