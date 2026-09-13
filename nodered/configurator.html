@@ -5210,6 +5210,11 @@ async function selectConfig(idx) {
     });
     enable('2b');
     renderLayerSetup();
+    // v10.1.69 W3: count on load too. Without this, editing a saved config and re-saving
+    // leaves _featureCounts empty, _totalFeatureCount() returns -1, and the large-feed
+    // acknowledgment silently never fires — the guard would only ever protect freshly
+    // built feeds, not the edit path.
+    scheduleFeatureCount();
   } else if (c.source.layerId != null) {
     var cb = document.querySelector('.layerCb[value="' + c.source.layerId + '"]');
     if (cb) cb.checked = true;
