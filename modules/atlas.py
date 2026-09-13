@@ -428,6 +428,15 @@ def deploy(ctx, job, params):
         if fqdn:
             plog(f'  Console:  https://{fqdn}/')
             plog(f'  Devices:  https://{fqdn}:{DEVICE_PORT}/  (mutual TLS)')
+        plog('')
+        # ⚠️ Said here because the failure lands much later and reads as a bug.
+        # A deployment with no agent build cannot mint a provisioning QR at all:
+        # Android needs the signing checksum of the APK the tablet will download,
+        # ATLAS takes it from the uploaded build, and with nothing uploaded the
+        # token page refuses. The operator meets that on their first enrolment,
+        # several screens away from anything that mentions an upload.
+        plog('  Next: upload the ATLAS agent APK under Apps — a device cannot be')
+        plog('  enrolled until one exists, and the provisioning QR is built from it.')
         job.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
         plog(f'ERROR: {exc}')
