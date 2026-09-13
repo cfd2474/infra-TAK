@@ -36,7 +36,7 @@ KEY = 'atlas'
 ATLAS_REPO_SSH = 'git@github.com:cfd2474/TAK-MDM.git'
 ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 ATLAS_TAG = 'v0.1.0'
-ATLAS_SHA = ''  # set when the tag is cut; empty means "verify nothing", see _verify_pin
+ATLAS_SHA = '7f42a9d770b0eb948b6427136219283375f35d19'  # what v0.1.0 resolves to
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -133,6 +133,15 @@ def deploy_validate(data):
     return {'deploy_key': key.strip()}, None
 
 
+def _deploy_key_path(dirpath):
+    """Beside the install directory, never inside it.
+
+    ⚠️ A key inside the clone is inside a git working tree, and one `git add -A`
+    in a debugging session puts a private key in a commit.
+    """
+    return os.path.join(os.path.dirname(dirpath), f'.{KEY}_deploy_key')
+
+
 def _write_deploy_key(ctx, dirpath, key_text, plog):
     """Put the deploy key somewhere git can use it, readable by nobody else.
 
@@ -140,7 +149,7 @@ def _write_deploy_key(ctx, dirpath, key_text, plog):
     be inside a git working tree, and one `git add -A` in a debugging session
     puts a private key in a commit.
     """
-    key_path = os.path.join(os.path.dirname(dirpath), f'.{KEY}_deploy_key')
+    key_path = _deploy_key_path(dirpath)
     # ⚠️ `perm`, not `mode`: `_write_priv(path, content, mode='w', perm=None)`
     # takes the *open* mode there. Passing 0o600 as `mode` opens the file in
     # mode "384" and leaves a private key world-readable.
@@ -201,9 +210,20 @@ def deploy(ctx, job, params):
         # ── 2/7 Source ────────────────────────────────────────────────────────
         plog('')
         plog('━━━ Step 2/7: Fetching ATLAS ━━━')
+        # Three ways to have a key, in order of how deliberate they are:
+        # pasted into the deploy form, kept from a previous deploy, or already
+        # placed on the box by an operator who would rather not paste a private
+        # key into a web form at all. The last one is the reason this checks the
+        # filesystem — the key never has to travel.
         key_text = params.get('deploy_key') or settings.get(f'{KEY}_deploy_key') or ''
-        key_path = _write_deploy_key(ctx, dirpath, key_text, plog) if key_text else None
-        repo = ATLAS_REPO_SSH if key_text else ATLAS_REPO_HTTPS
+        if key_text:
+            key_path = _write_deploy_key(ctx, dirpath, key_text, plog)
+        else:
+            existing = _deploy_key_path(dirpath)
+            key_path = existing if os.path.exists(existing) else None
+            if key_path:
+                plog(f'  Using the deploy key already on this box ({key_path})')
+        repo = ATLAS_REPO_SSH if key_path else ATLAS_REPO_HTTPS
 
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {ATLAS_TAG}')
