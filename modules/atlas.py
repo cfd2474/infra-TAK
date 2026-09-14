@@ -24,6 +24,7 @@ resolve in a config file, it means one of them quietly stops renewing.
 """
 import json
 import os
+from glob import glob as _glob
 import secrets
 import shutil
 import subprocess
@@ -48,12 +49,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.17.1'
+ATLAS_TAG = 'v1.19.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '39c2ab8fdcdf6d01af9bc26eb0f4a2d649ac822a'
+ATLAS_SHA = 'de8827e69e042b810a163651a3c1684ece6dcae2'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -618,6 +619,32 @@ def sync_device_ca_for_caddy():
             break
     else:
         return None
+
+    # ⚠️ Root **plus every intermediate**, not just `ca.crt` (ATLAS W172).
+    #
+    # Once the root is taken offline, devices are issued by an intermediate and
+    # present a certificate Caddy cannot verify from the root alone. Caddy's
+    # `trust_pool file` reads a bundle, so they concatenate — and retired
+    # intermediates stay in it, because the certificates they signed are valid
+    # until they expire and those devices chain through them.
+    #
+    # Only certificates. The private halves never leave the install directory:
+    # verification takes the public half, and a key readable by a web server is a
+    # fleet's identity one file-read away.
+    pki_dir = os.path.join(base_dir, 'pki')
+    bundle_parts = []
+    for candidate in ([os.path.join(pki_dir, 'ca.crt'),
+                       os.path.join(pki_dir, 'issuing.crt')] +
+                      sorted(_glob(os.path.join(pki_dir, 'retired', '*.crt')))):
+        try:
+            with open(candidate, 'r') as fh:
+                text = fh.read().strip()
+            if text and text not in bundle_parts:
+                bundle_parts.append(text)
+        except OSError:
+            continue
+    if not bundle_parts:
+        return None
     try:
         try:
             caddy_pw = pwd.getpwnam('caddy')
@@ -628,7 +655,8 @@ def sync_device_ca_for_caddy():
         dest_dir = os.path.join(base, KEY)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'device-ca.crt')
-        shutil.copyfile(src, dest)
+        with open(dest, 'w') as fh:
+            fh.write('\n'.join(bundle_parts) + '\n')
         os.chmod(dest, 0o644)
         if caddy_pw:
             os.chown(dest_dir, caddy_pw.pw_uid, caddy_pw.pw_gid)
