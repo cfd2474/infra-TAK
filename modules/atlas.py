@@ -48,12 +48,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.16.0'
+ATLAS_TAG = 'v1.17.1'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'fb99422d0ed2f8f25fbd3e217c89624c19bfc653'
+ATLAS_SHA = '39c2ab8fdcdf6d01af9bc26eb0f4a2d649ac822a'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -148,6 +148,68 @@ def _ensure_trusted_proxies(dirpath, plog):
     plog('✓ Restricted the admin interface to %s' % value)
 
 
+#: Settings keys recording whether Authentik still restricts the ATLAS app.
+ACCESS_KEY = KEY + '_access_restricted'
+ACCESS_CHECKED_KEY = KEY + '_access_checked_at'
+
+
+def _record_access_state(ctx, restricted, plog=None):
+    """Remember whether the ATLAS application is bound to an access policy.
+
+    ⚠️ **Stored rather than probed on demand.** `detect()` runs on every dashboard
+    poll, from several threads, and must answer in under a second — an Authentik
+    API call there would make the whole console's tile refresh depend on
+    Authentik's latency, and a slow identity provider would read as ATLAS being
+    down. So the expensive check happens where there is already a job and a log:
+    deploy and update.
+    """
+    import time as _time
+    try:
+        s = ctx['load_settings']()
+        s[ACCESS_KEY] = bool(restricted)
+        s[ACCESS_CHECKED_KEY] = int(_time.time())
+        ctx['save_settings'](s)
+    except Exception as exc:
+        if plog:
+            plog('  ⚠ Could not record the access-control state: %s' % str(exc)[:80])
+        return restricted
+
+    if plog:
+        if restricted:
+            plog('  ✓ Verified: the ATLAS application is restricted to Authentik admins')
+        else:
+            plog('  ✗ ATLAS IS NOT ACCESS-RESTRICTED. Every authenticated Authentik')
+            plog('    user can reach the console — remote wipe, factory reset, policy')
+            plog('    push. Fix: Authentik → Reconfigure, then redeploy ATLAS.')
+    return restricted
+
+
+def _verify_access_control(ctx, plog=None):
+    """Re-run the binding check outside a deploy. Returns True/False/None.
+
+    None means the question could not be asked — no Authentik, no token, no
+    network. ⚠️ That is deliberately not the same as False: reporting "not
+    restricted" because Authentik was briefly unreachable would train an operator
+    to ignore the one message that matters.
+    """
+    try:
+        s = ctx['load_settings']()
+        fqdn = ctx['_get_authentik_env_value'](s, 'AUTHENTIK_FQDN') or ''
+        token = (ctx['_get_authentik_env_value'](s, 'AUTHENTIK_TOKEN') or
+                 s.get('authentik_api_token') or '')
+        if not fqdn or not token:
+            return None
+        ak_url = ctx['_get_authentik_api_url'](s)
+        headers = {'Authorization': 'Bearer %s' % token,
+                   'Content-Type': 'application/json'}
+        return _record_access_state(
+            ctx, _restrict_to_admins(ak_url, headers, plog=plog), plog=plog)
+    except Exception as exc:
+        if plog:
+            plog('  ⚠ Could not verify access control: %s' % str(exc)[:80])
+        return None
+
+
 def _plog(msg):
     job_log(KEY, msg)
 
@@ -221,8 +283,19 @@ def detect(ctx):
 
     # The version comes from the checkout, so the tile cannot disagree with the
     # footer of the console it is describing.
+    # ⚠️ Read from settings, never probed here. This function runs on every
+    # dashboard poll from several threads and must answer in under a second; an
+    # Authentik round-trip would make ATLAS's tile report Authentik's health.
+    # False is only ever written by a check that actually ran (H-1).
+    restricted = s.get(ACCESS_KEY)
+
     return {'installed': enabled, 'running': running,
-            'version': _installed_version(ctx) if enabled else None}
+            'version': _installed_version(ctx) if enabled else None,
+            'access_restricted': restricted,
+            'warning': (None if restricted is not False else
+                        'Not access-restricted: every Authentik user can reach '
+                        'this console. Re-run Authentik → Reconfigure, then '
+                        'redeploy ATLAS.')}
 
 
 # --------------------------------------------------------------------------- #
@@ -741,7 +814,13 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
 
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
             ctx['_authentik_application_open_in_new_tab'](_ak_url, _ak_headers, 'atlas', plog=log)
-            _restrict_to_admins(_ak_url, _ak_headers, plog=log)
+            # ⚠️ The answer is recorded, not discarded (SEC_AUDIT.md H-1). ATLAS
+            # runs with an empty admin group — it trusts Authentik to decide who is
+            # an administrator — so this binding *is* the access control. It was
+            # once found absent on a live box, and nothing noticed. Now the result
+            # is stored where the tile and the next update can see it.
+            _record_access_state(
+                ctx, _restrict_to_admins(_ak_url, _ak_headers, plog=log), plog=log)
         else:
             log("  ⚠ Could not create or find the ATLAS proxy provider")
     except Exception as e:
@@ -965,6 +1044,12 @@ def _run_update(ctx):
         plog('✓ Containers rebuilt — database and device CA untouched')
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
+
+        # ⚠️ Re-asked on every update, because the binding can disappear long
+        # after the deploy that made it — an Authentik restore, or somebody
+        # unbinding the policy. A check that only runs at install answers a
+        # question about the past (H-1).
+        _verify_access_control(ctx, plog=plog)
 
         plog('━━━ Step 3/3: Recording ━━━')
         s = ctx['load_settings']()
@@ -1257,6 +1342,7 @@ def register(ctx):
         'ports': [f'{DEVICE_PORT}/tcp'],
         'service_units': [],
         'settings_keys': [
+            ACCESS_KEY, ACCESS_CHECKED_KEY,
             f'{KEY}_enabled', f'{KEY}_pg_password', f'{KEY}_commit_sha',
             f'{KEY}_version', f'{KEY}_domain',
         ],
