@@ -41500,7 +41500,10 @@ def nodered_uninstall():
         steps = []
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             remote = deploy_cfg.get('remote', {})
-            ok, out = _ssh_probe(remote, 'cd ~/node-red && docker compose down -v 2>&1; rm -rf ~/node-red 2>/dev/null; true', timeout=90)
+            # 300 s, not 90 — same reason as the local branch below: `down -v` has to
+            # stop the container and drop the named volume, and the old budget expired
+            # mid-teardown on a real box.
+            ok, out = _ssh_probe(remote, 'cd ~/node-red && docker compose down -v 2>&1; rm -rf ~/node-red 2>/dev/null; true', timeout=300)
             if not ok:
                 return jsonify({'error': f'Remote uninstall failed: {(out or "unknown error")[:200]}'}), 500
             steps.append('Stopped and removed Node-RED on remote host')
@@ -41511,9 +41514,33 @@ def nodered_uninstall():
             nr_dir = os.path.expanduser('~/node-red')
             compose = os.path.join(nr_dir, 'docker-compose.yml')
             if os.path.exists(compose):
-                subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'down', '-v']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
+                # `down -v` stops the container, removes it and drops the named volume.
+                # On a non-root box it routes through the broker, and the old 60 s budget
+                # expired mid-teardown — measured on nuc, 2026-09-13. The TimeoutExpired
+                # then escaped into this function's outer `except Exception` and the UI
+                # reported "Uninstall failed" on an uninstall that HAD removed both the
+                # container and the volume, while the rm -rf below never ran. The stale
+                # directory it left behind keeps _is_module_deployed() reporting Node-RED
+                # as installed, so the console disagreed with the box.
+                try:
+                    subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'down', '-v']),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300, cwd=nr_dir)
+                except subprocess.TimeoutExpired:
+                    steps.append('Teardown ran long — verified actual state instead of assuming failure')
+                # Never trust the exit path here: killing the compose CLI does not stop
+                # dockerd, so what matters is what is actually gone. Only refuse if the
+                # container survived — removing the compose file out from under a live
+                # container is what would strand it.
+                if _nodered_container_running():
+                    return jsonify({'error': 'Node-RED is still running after teardown — nothing was '
+                                             'removed. Retry the uninstall; if it persists, the Docker '
+                                             'daemon is not responding.'}), 500
             if os.path.exists(nr_dir):
-                subprocess.run(f'rm -rf "{nr_dir}"', shell=True, capture_output=True, timeout=10)
+                # List argv, not shell=True: same broker routing via _sudo_wrap (the shim
+                # PATH intercepted the bare `rm` before), minus a shell interpolating a
+                # path into an `rm -rf`. Not attacker-controlled here, but it is not a
+                # construction worth leaving in the tree.
+                subprocess.run(_sudo_wrap(['rm', '-rf', nr_dir]), capture_output=True, timeout=30)
             steps.append('Node-RED container and data removed')
             deploy_cfg['deployed'] = False
             settings['nodered_deployment'] = _normalize_module_deployment_config(deploy_cfg)
