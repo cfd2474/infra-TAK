@@ -48,12 +48,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.15.1'
+ATLAS_TAG = 'v1.16.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'c34eff8f4d7d1bce770fbc93aef80d9934dc525f'
+ATLAS_SHA = 'fb99422d0ed2f8f25fbd3e217c89624c19bfc653'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -93,6 +93,59 @@ APP_GID = 1000
 # to ATLAS's own proxy service, which this module never starts — Caddy fronts
 # the deployment instead.
 WRITABLE_DIRS = ('pki', 'artifacts', 'cache')
+
+
+def _bridge_gateway():
+    """The address Caddy appears as from inside the container.
+
+    Caddy runs on the host and reaches the application through Docker's bridge,
+    so the peer the application sees is the network's gateway — 172.24.0.1 on the
+    reference box, but the subnet is assigned by Docker and differs per host.
+
+    ⚠️ **Falls back to the whole RFC1918 space rather than to nothing.** A wrong
+    guess here locks an operator out of their own console; a broad value still
+    refuses a request arriving from a public address, which is the case worth
+    closing. The narrow value is an optimisation, not the control.
+
+    ⚠️ Asked of the *network*, not of a running container: on a first install
+    the network exists before the application does, and on a redeploy the
+    container may be down.
+    """
+    try:
+        r = subprocess.run(
+            ['docker', 'network', 'inspect', '-f',
+             '{{range .IPAM.Config}}{{.Subnet}}{{end}}', 'takmdm_default'],
+            capture_output=True, text=True, timeout=30,
+        )
+        subnet = (r.stdout or '').strip()
+        if r.returncode == 0 and '/' in subnet:
+            return subnet
+    except Exception:
+        pass
+    return '172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.0/8'
+
+
+def _ensure_trusted_proxies(dirpath, plog):
+    """Add the setting to an existing .env that predates it.
+
+    ⚠️ **The update path does not rewrite `.env`** — only deploy does — so a box
+    installed before this existed would never acquire the setting and would keep
+    accepting an identity header from anywhere. Appending is safe: an operator who
+    has set it by hand is left alone.
+    """
+    env_path = os.path.join(dirpath, '.env')
+    try:
+        with open(env_path, 'r') as f:
+            body = f.read()
+    except OSError:
+        return
+    if 'TAKMDM_TRUSTED_PROXIES' in body:
+        return
+    value = _bridge_gateway()
+    with open(env_path, 'a') as f:
+        f.write('\n# Added by the ATLAS module (SEC_AUDIT.md S-1).\n')
+        f.write('TAKMDM_TRUSTED_PROXIES=%s\n' % value)
+    plog('✓ Restricted the admin interface to %s' % value)
 
 
 def _plog(msg):
@@ -352,6 +405,7 @@ def deploy(ctx, job, params):
         console_url = f'https://{fqdn}' if fqdn else ''
         apk_url = f'http://{fqdn}/api/v1/provisioning/agent.apk' if fqdn else ''
         ctx['_write_priv'](os.path.join(dirpath, '.env'), _ENV_TEMPLATE.format(
+            trusted_proxies=_bridge_gateway(),
             pg_password=pg_password,
             device_url=device_url,
             apk_url=apk_url,
@@ -898,6 +952,10 @@ def _run_update(ctx):
         _write_build_file(dirpath, plog)
         plog('✓ Source now at ' + tag)
 
+        # ⚠️ Before the rebuild, or the new image starts without the setting and
+        # spends a release accepting identity headers from anywhere.
+        _ensure_trusted_proxies(dirpath, plog)
+
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
         # device CA with it, and every enrolled tablet would need a factory reset.
@@ -1073,6 +1131,27 @@ TAKMDM_ADMIN_AUTH_MODE=forward_auth
 # not on the user-visible allowlist. So the console is admin-only, enforced at
 # the identity provider, and blank here means "whoever Authentik let through".
 TAKMDM_ADMIN_GROUP=
+
+# Where the administrative interface may be reached from (SEC_AUDIT.md S-1).
+#
+# ATLAS reads the administrator's identity out of the headers Caddy sets after
+# forward_auth. Nothing in those headers proves they came from Caddy, so anything
+# able to open a socket to this application's port is an administrator by sending
+# two headers. This bounds who that can be.
+#
+# The value is the Docker bridge gateway: Caddy runs on the host and reaches the
+# container through it, so that is the address the application actually observes.
+#
+# ⚠️ **This cannot tell Caddy from anything else on this host** — every host
+# process arrives from the same gateway. It closes the case where the port is
+# republished on 0.0.0.0 and reached from somewhere else. Host-local forgery needs
+# the proxy to prove it is the proxy, which is what infra-TAK's own
+# X-Infratak-Proxy-Auth secret does for the console and does not yet offer to
+# module vhosts.
+#
+# Set it to `any` to switch the check off. ATLAS logs the address it refused and
+# the ranges it allows, so a wrong value here is one log line from a fix.
+TAKMDM_TRUSTED_PROXIES={trusted_proxies}
 """
 
 _COMPOSE_OVERRIDE = """# Written by the infra-TAK ATLAS module.
