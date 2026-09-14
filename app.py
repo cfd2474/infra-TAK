@@ -44192,6 +44192,109 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         return False
 
 
+def _nodered_container_running():
+    """True if the nodered container is up. Used to keep a slow `up -d` from being
+    reported as a deploy failure when the container actually started."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}']),
+            capture_output=True, text=True, timeout=20)
+        return (r.stdout or '').strip().lower().startswith('up')
+    except Exception:
+        return False
+
+
+def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image'):
+    """`docker compose pull` as its own step, with streamed progress and a
+    generous timeout. Returns True on success, False on failure (never raises).
+
+    Why the pull is split out of `up -d` (field report, Richard/AUS-NSW,
+    2026-09-13 — Node-RED deploy failed at "Step 2/3" with
+    "timed out after 120 seconds"):
+
+      * `docker compose up -d` pulls implicitly, so on a cold box the whole
+        download had to fit inside that one subprocess timeout.
+        nodered/node-red:4.0 is a 197 MB download over 17 layers, so 120 s
+        needs ~13 Mbit/s sustained from Docker Hub with nothing left over for
+        extraction (867 MB on disk) or container start. Below that the timeout
+        kills compose mid-pull and the deploy reports a failure on a box where
+        the only thing wrong is the link.
+      * Retrying was not a reliable way out. Docker keeps completed layers but
+        does NOT resume a partial one, and 120 MB of that image is a *single*
+        layer — 61% of the download in one blob. Under ~8 Mbit/s that layer
+        cannot finish inside a 120 s window, so every retry restarted it from
+        zero and the deploy could never converge, however many times the
+        operator clicked Deploy.
+      * The old path printed nothing at all for its whole 120 s, which made a
+        slow link and a blackholed/throttled registry produce byte-identical
+        logs. Streaming the pull is what makes those two distinguishable
+        without SSH.
+
+    Pulling via `docker compose -f <file> pull` rather than `docker pull <image>`
+    on purpose: the image tag then comes from the compose file we just wrote, so
+    the pulled image and the started image cannot drift apart.
+    """
+    try:
+        proc = subprocess.Popen(
+            _sudo_wrap(['docker', 'compose', '-f', compose_yml, 'pull']),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            # stdin MUST be closed, not inherited. On a non-root box _sudo_wrap routes
+            # this through brokerctl, whose exec path does `if not sys.stdin.isatty():
+            # sys.stdin.buffer.read()` — an inherited, still-open stdin makes it block
+            # there forever and the pull never starts. Caught on nuc: identical code
+            # returned in 2 s as root and hung indefinitely through the broker.
+            stdin=subprocess.DEVNULL,
+            cwd=cwd, bufsize=1,
+            # Non-root boxes route this through the broker, which enforces its own
+            # exec cap (600 s default) — without this the broker kills the pull long
+            # before our own budget expires. Clamped daemon-side to MAX_TIMEOUT.
+            env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(timeout)},
+        )
+    except Exception as e:
+        plog(f"✗ Could not start the {label} pull: {str(e)[:150]}")
+        return False
+
+    tail = deque(maxlen=40)
+    last_emit = [0.0]
+
+    def _read_pull():
+        for line in iter(proc.stdout.readline, ''):
+            line = line.strip()
+            if not line:
+                continue
+            tail.append(line)
+            now = time.time()
+            # Always surface terminal/diagnostic states; heartbeat everything else
+            # so a 200 MB pull reports progress without flooding the deploy log
+            # with a per-layer progress tick every few hundred milliseconds.
+            if re.search(r'(Pulled|Error|error|denied|not found|rate limit|toomanyrequests)', line):
+                plog(f"  {line}")
+                last_emit[0] = now
+            elif now - last_emit[0] >= 10:
+                plog(f"  {line}")
+                last_emit[0] = now
+
+    reader = threading.Thread(target=_read_pull, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        _budget = f"{timeout // 60} minutes" if timeout >= 120 else f"{timeout} seconds"
+        plog(f"✗ Pulling the {label} exceeded {_budget} and was stopped.")
+        plog("  Layers that finished are cached — running Deploy again resumes from there")
+        plog("  rather than starting over, so a second run usually gets further.")
+        return False
+    reader.join(timeout=5)
+    if proc.returncode != 0:
+        plog(f"✗ Pulling the {label} failed (exit {proc.returncode}):")
+        for line in list(tail)[-8:]:
+            plog(f"    {line}")
+        return False
+    return True
+
+
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
     remote = deploy_cfg.get('remote', {})
@@ -44328,8 +44431,20 @@ volumes:
     plog("━━━ Docker log limits (remote) ━━━")
     _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
 
+    # Pull first, on its own generous budget. Same reason as the local path: the
+    # image is a ~200 MB download and folding it into `up -d`'s 120 s killed the
+    # deploy mid-pull on a slow link (see _docker_compose_pull).
+    plog("  Pulling the Node-RED image on remote (~200 MB — the long part on a slow link)...")
+    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose pull 2>&1', timeout=1800, log_fn=plog)
+    if not ok:
+        plog(f"✗ docker compose pull failed on remote: {(out or '')[:300]}")
+        plog("  Layers that finished are cached — running Deploy again resumes from there.")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("✓ Image present on remote")
+
     plog("  Starting Node-RED on remote...")
-    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=180, log_fn=plog)
     if not ok:
         plog(f"✗ docker compose up failed: {(out or '')[:300]}")
         nodered_deploy_status.update({'running': False, 'error': True})
@@ -44393,7 +44508,7 @@ def run_nodered_deploy():
         nr_dir = os.path.expanduser('~/node-red')
         os.makedirs(nr_dir, exist_ok=True)
         plog("")
-        plog("━━━ Step 1/3: Creating Docker Compose ━━━")
+        plog("━━━ Step 1/4: Creating Docker Compose ━━━")
         compose_yml = os.path.join(nr_dir, 'docker-compose.yml')
         settings_js = os.path.join(nr_dir, 'settings.js')
         env_file = os.path.join(nr_dir, '.env')
@@ -44513,15 +44628,37 @@ volumes:
 """)
         plog("✓ docker-compose.yml written (image pinned, hardening flags, scoped certs, host.docker.internal for CoT)")
         plog("")
-        plog("━━━ Step 2/3: Starting Node-RED ━━━")
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, cwd=nr_dir)
-        if r.returncode != 0:
-            plog(f"✗ docker compose up failed: {r.stderr or r.stdout or 'unknown'}")
+        plog("━━━ Step 2/4: Pulling the Node-RED image ━━━")
+        plog("  ~200 MB from Docker Hub. On a slow link this is the long part of the")
+        plog("  deploy — progress is reported below, so a stalled pull looks different")
+        plog("  from a slow one.")
+        if not _docker_compose_pull(compose_yml, nr_dir, plog, timeout=1800, label='Node-RED image'):
             nodered_deploy_status.update({'running': False, 'error': True})
             return
+        plog("✓ Image present locally")
+        plog("")
+        plog("━━━ Step 3/4: Starting Node-RED ━━━")
+        # The image is local by now, so this is create+start only. The timeout is
+        # still caught rather than left to escape into the outer handler: a bare
+        # TimeoutExpired here reports "✗ Error: Command ... timed out" on a box
+        # where the container may be running perfectly well, and skips every step
+        # after it — the exact failure v10.1.50 fixed one step further down.
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
+            _up_rc, _up_out = r.returncode, (r.stdout or '')
+        except subprocess.TimeoutExpired:
+            _up_rc, _up_out = None, ''
+            plog("  ⚠ `docker compose up -d` did not return within 3 minutes — checking whether")
+            plog("    the container came up anyway before calling this a failure.")
+        if _up_rc != 0:
+            if not _nodered_container_running():
+                plog(f"✗ docker compose up failed: {(_up_out or 'timed out').strip()[:300]}")
+                nodered_deploy_status.update({'running': False, 'error': True})
+                return
+            plog("  ✓ Container is running — continuing.")
         plog("✓ Node-RED container started")
         plog("")
-        plog("━━━ Step 2b: Merge infra-TAK flows + TLS (same as post-update) ━━━")
+        plog("━━━ Step 3b: Merge infra-TAK flows + TLS (same as post-update) ━━━")
         _deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
         if os.path.isfile(_deploy_sh):
             try:
@@ -44556,7 +44693,7 @@ volumes:
         else:
             plog("  (no nodered/deploy.sh in repo — skip)")
         plog("")
-        plog("━━━ Step 3/3: Updating Caddy ━━━")
+        plog("━━━ Step 4/4: Updating Caddy ━━━")
         # v10.1.50: Node-RED is ALREADY RUNNING by the time we get here. Everything below
         # is edge/SSO wiring, and none of it may be allowed to report the deploy as failed
         # or — worse — to skip the step after it.
