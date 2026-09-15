@@ -49,12 +49,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.27.0'
+ATLAS_TAG = 'v1.28.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '6007afb7168e718b5bce8bf35cfc78590186cb07'
+ATLAS_SHA = '848475f9b7e4ae181ab2bb24de8b4be337c91a2c'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -1195,6 +1195,23 @@ def _run_update(ctx):
         # unbinding the policy. A check that only runs at install answers a
         # question about the past (H-1).
         _verify_access_control(ctx, plog=plog)
+
+        # ⚠️ Re-emit the vhost. `deploy` does this and `update` did not, so a
+        # change to what ATLAS's Caddy block contains reached the box and then
+        # sat there: the operator updates, nothing regenerates, and the new
+        # directive only appears if somebody happens to redeploy. That is how
+        # the upload body limit (SEC_AUDIT M-1) would have shipped inert.
+        #
+        # Regenerating is what deploy already does and is idempotent — the file
+        # is built from current settings either way.
+        try:
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload'](plog)
+            plog('✓ Caddy vhost re-emitted')
+        except Exception as exc:
+            # Not fatal. The containers are already rebuilt and serving; a stale
+            # vhost is worse reported than turned into a failed update.
+            plog('⚠ Could not re-emit the Caddy vhost: ' + str(exc))
 
         plog('━━━ Step 3/3: Recording ━━━')
         s = ctx['load_settings']()

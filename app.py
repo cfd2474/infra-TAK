@@ -29218,6 +29218,15 @@ def generate_caddyfile(settings=None):
         lines.append(f"# ATLAS MDM — administration console (443). Device channel is :8449 only.")
         lines.append(f"{at_host} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        # SEC_AUDIT M-1. ATLAS caps uploads itself, during the read, so this is
+        # the backstop rather than the limit — deliberately ABOVE the
+        # application's 2 GiB default so an over-size upload is refused by ATLAS
+        # with a message naming the limit, not by Caddy with a bare 413. An
+        # operator who raises TAKMDM_MAX_UPLOAD_BYTES past this will hit Caddy
+        # first; that is the one case worth knowing about.
+        lines.append(f"    request_body {{")
+        lines.append(f"        max_size 2304MiB")
+        lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
             # ⚠️ The strip runs FIRST, before forward_auth re-adds the authentic
