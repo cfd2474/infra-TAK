@@ -54,6 +54,81 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
   </div>
 
+  <!--
+    The walkthrough, on the card an operator is looking at *before* they install.
+
+    ⚠️ It stops at "you have one device enrolled". Everything past that is covered
+    properly by the guides inside ATLAS, and a second copy here would be a second
+    copy to keep true — which is how documentation starts lying.
+  -->
+  <div class="card">
+    <div class="card-title">Getting started</div>
+
+    <p class="note"><strong>Before you deploy</strong></p>
+    <ul class="note" style="margin:6px 0 0 18px;line-height:1.8">
+      <li><strong>Caddy</strong> and <strong>Authentik</strong> must already be
+        deployed. ATLAS publishes its console as a Caddy vhost behind Authentik
+        sign-in, and registers itself as an Authentik application.
+        ⚠️ Without Authentik the deploy still succeeds but the console vhost is
+        <em>not published</em>, and the log says so.</li>
+      <li>A domain pointed at this box. The console lands on
+        <span class="mono">atlas.&lt;your-domain&gt;</span>.</li>
+      <li>One Android tablet you can <strong>factory reset</strong>. Device Owner
+        can only be established during the out-of-box wizard — there is no way to
+        convert a set-up device.</li>
+    </ul>
+
+    <p class="note" style="margin-top:14px"><strong>1. Deploy</strong></p>
+    <p class="note" style="margin-left:18px">
+      Press <strong>Deploy ATLAS</strong>. It clones the pinned release, builds the
+      image, generates a device certificate authority, opens
+      <span class="mono">:8449</span> for devices, registers the Authentik
+      application and restricts it to administrators. Seven steps, 5–10 minutes on
+      the first run.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>2. Open the console</strong></p>
+    <p class="note" style="margin-left:18px">
+      <span class="mono">https://atlas.&lt;your-domain&gt;</span>, signing in through
+      Authentik. The Android agent and launcher are already loaded — they ship with
+      the release and are installed into the app library on first start, so there
+      is nothing to upload.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>3. Enrol one device</strong></p>
+    <ul class="note" style="margin:6px 0 0 18px;line-height:1.8">
+      <li>On the <strong>Enroll</strong> page, create an enrollment token.</li>
+      <li>Fill in the Wi-Fi the tablet should use while provisioning, then
+        <strong>Generate enrollment QR</strong>.</li>
+      <li>On the factory-reset tablet, tap the first setup screen
+        <strong>six times in the same spot</strong> to open the QR scanner, and
+        scan it.</li>
+      <li>The tablet joins Wi-Fi, installs the agent as Device Owner, and appears
+        on <strong>Manage</strong> within a few seconds.</li>
+    </ul>
+    <p class="note" style="margin-left:18px;margin-top:6px">
+      ⚠️ The QR expires after <strong>15 minutes</strong> by default — it is a live
+      credential, and a photograph of it is too. There is a permanent option for a
+      provisioning bench, with the trade explained on the page.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>4. Then use the guides inside ATLAS</strong></p>
+    <p class="note" style="margin-left:18px">
+      The <strong>Guides</strong> section of the console covers policies, app
+      deployment, kiosk mode, content and device identification. They live with the
+      release, so they describe the version you are actually running.
+    </p>
+
+    <p class="note" style="margin-top:14px;color:var(--yellow)">
+      ⚠️ <strong>One security step afterwards.</strong> A new install keeps the
+      certificate authority's root key on this server, where anyone who reaches the
+      box can take it and mint a device identity for ever. Once ATLAS is running,
+      the <strong>Certificate authority</strong> card on this page walks through
+      moving it somewhere safer. Devices are unaffected and nothing needs to be
+      touched on any tablet.
+    </p>
+  </div>
+
   <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
     <div class="card-title">Deploy log</div>
     <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
