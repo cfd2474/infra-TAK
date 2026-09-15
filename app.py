@@ -41596,6 +41596,27 @@ def nodered_uninstall():
                     return jsonify({'error': 'Node-RED is still running after teardown — nothing was '
                                              'removed. Retry the uninstall; if it persists, the Docker '
                                              'daemon is not responding.'}), 500
+            # F2b/F2c (v10.1.72): everything above is gated on the compose file existing. With no
+            # compose file the teardown was skipped ENTIRELY, the directory was deleted, and the
+            # route still returned {"success": true, "steps": ["Node-RED container and data
+            # removed"]} — while the container kept running. Proven on dev-4, 2026-09-14.
+            #
+            # And the running-only guard above cannot close it: container names are unique across
+            # every state, so an EXITED `nodered` container still owns the name and still blocks
+            # the next `compose up -d` with a name conflict, while `docker ps` shows nothing.
+            # That is how a box ends up in a loop where uninstall claims success and deploy keeps
+            # failing — which is exactly the loop a user hit in the field.
+            #
+            # So: regardless of the compose file, if the name is still taken, remove it by name.
+            if _nodered_container_exists():
+                _rm = subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                                     capture_output=True, text=True, timeout=60)
+                if _nodered_container_exists():
+                    return jsonify({'error': 'A container named "nodered" could not be removed '
+                                             f'({(_rm.stderr or _rm.stdout or "").strip()[-200:]}). '
+                                             'Nothing was deleted. Retry; if it persists, the '
+                                             'Docker daemon is not responding.'}), 500
+                steps.append('Removed a leftover "nodered" container that was holding the name')
             if os.path.exists(nr_dir):
                 # List argv, not shell=True: same broker routing via _sudo_wrap (the shim
                 # PATH intercepted the bare `rm` before), minus a shell interpolating a
@@ -44280,6 +44301,61 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         return False
 
 
+def _nodered_container_exists():
+    """True if a container named `nodered` exists in ANY state (running, exited, created).
+
+    Deliberately distinct from _nodered_container_running(), and the distinction IS the bug
+    (field report, Richard/AUS-NSW, 2026-09-14). Docker container names are unique across every
+    state, so an **exited** `nodered` container still owns the name and still makes
+    `docker compose up -d` fail with `Conflict. The container name "/nodered" is already in
+    use`. A running-only check sees nothing there, so the uninstall reported "Node-RED container
+    and data removed" while a dead container quietly held the name and blocked every later
+    deploy. Both halves reproduced on dev-4.
+
+    Use _nodered_container_running() for "is it live" (don't strand a working container);
+    use THIS for "is the name free" / "did the teardown actually remove it".
+    """
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=nodered', '--format', '{{.Names}}']),
+            capture_output=True, text=True, timeout=20)
+        return any(n.strip() == 'nodered' for n in (r.stdout or '').splitlines())
+    except Exception:
+        return False
+
+
+_COMPOSE_PROGRESS_RE = re.compile(
+    r'^\s*(?:Network|Volume|Container|Image|Service)?\s*\S*\s*'
+    r'(?:Creating|Created|Starting|Started|Running|Waiting|Pulling|Pulled|Removing|Removed'
+    r'|Stopping|Stopped|Recreate|Recreating|Recreated)\s*$'
+)
+
+
+def _compose_error_tail(out, limit=700):
+    """Return the ACTIONABLE part of a `docker compose` failure, not the progress ledger.
+
+    compose writes its progress ledger FIRST and the error LAST, and without a TTY it
+    re-renders each progress line — so the ledger is about twice as long as expected. Slicing
+    the HEAD of that (`[:300]`) shows nothing but "Network … Creating / Created" and cuts the
+    error off mid-sentence.
+
+    Not hypothetical: that is what v10.1.71 shipped at the Node-RED deploy's Step 3/4, and it
+    cost a full round trip with a user in Australia who had already waited seven minutes for a
+    pull — his log carried eight lines of network/volume progress and not one character of the
+    reason. `app.py:39997` had the right idiom (`[-300:]`) all along.
+
+    Drop the pure-progress lines, then return the TAIL of what is left. Falls back to the raw
+    tail when filtering leaves nothing, because showing something beats showing nothing.
+    """
+    text = (out or '').strip()
+    if not text:
+        return 'no output'
+    meaningful = [ln for ln in text.splitlines()
+                  if ln.strip() and not _COMPOSE_PROGRESS_RE.match(ln)]
+    body = '\n'.join(meaningful).strip() or text
+    return body[-limit:].strip()
+
+
 def _nodered_container_running():
     """True if the nodered container is up. Used to keep a slow `up -d` from being
     reported as a deploy failure when the container actually started."""
@@ -44775,9 +44851,34 @@ volumes:
             _up_rc, _up_out = None, ''
             plog("  ⚠ `docker compose up -d` did not return within 3 minutes — checking whether")
             plog("    the container came up anyway before calling this a failure.")
+        # F2a (v10.1.72): a leftover container holding the fixed `container_name: nodered`
+        # makes compose fail instantly with a name conflict — and because container names are
+        # unique across EVERY state, an *exited* leftover does it just as effectively as a
+        # running one. This is a self-heal on the failure path only: the normal deploy is
+        # untouched, so a working box cannot regress through this branch.
+        if _up_rc != 0 and 'already in use' in (_up_out or '') and _nodered_container_exists():
+            plog("  A leftover 'nodered' container is holding the name and blocking the start.")
+            plog("  Removing it and retrying — the named volume is NOT touched, so Configurator")
+            plog("  configs survive (they live in node_red_data, not in the container).")
+            try:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                               capture_output=True, text=True, timeout=60)
+                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    timeout=180, cwd=nr_dir)
+                _up_rc, _up_out = r2.returncode, (r2.stdout or '')
+                if _up_rc == 0:
+                    plog("  ✓ Leftover cleared — container started.")
+            except subprocess.TimeoutExpired:
+                plog("  ⚠ Retry after clearing the leftover did not return within 3 minutes.")
+            except Exception as _e_retry:
+                plog(f"  ⚠ Could not clear the leftover: {str(_e_retry)[:150]}")
         if _up_rc != 0:
             if not _nodered_container_running():
-                plog(f"✗ docker compose up failed: {(_up_out or 'timed out').strip()[:300]}")
+                # F1 (v10.1.72): the TAIL, filtered. `[:300]` showed the operator 300 characters
+                # of "Network … Creating / Created" and cut the actual error off mid-sentence —
+                # see _compose_error_tail().
+                plog(f"✗ docker compose up failed: {_compose_error_tail(_up_out or 'timed out')}")
                 nodered_deploy_status.update({'running': False, 'error': True})
                 return
             plog("  ✓ Container is running — continuing.")
