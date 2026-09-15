@@ -49,12 +49,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.35.0'
+ATLAS_TAG = 'v1.36.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '567a152719b8136641e3b1e0f680d7e371e7a62c'
+ATLAS_SHA = 'b8ba36f571b8104f22854d1318c4cd423350e836'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -134,6 +134,107 @@ def _bridge_gateway():
     except Exception:
         pass
     return _TRUSTED_FALLBACK
+
+
+#: The group Authentik creates for itself, and the one the module binds the
+#: ATLAS application to. ⚠️ Deliberately not an invented name: the documented
+#: objection to ATLAS checking a group at all was that a required group is "a
+#: bootstrap nobody could complete". That is true of `takmdm-admins`, which no
+#: Authentik has, and false of this one — Authentik creates it and whoever
+#: installed ATLAS is necessarily in it.
+ADMIN_GROUP = 'authentik Admins'
+
+
+def _arm_admin_gates(ctx, dirpath, plog):
+    """Turn on ATLAS's own two admin checks, once it is safe to.
+
+    Both are fail-open in ATLAS while unset, so writing them is what arms them.
+
+    ⚠️ **The proxy-auth secret is written only after confirming the generated
+    Caddyfile actually injects the header.** Version skew — this module newer
+    than the fork's app.py, or a Caddyfile not regenerated — would otherwise
+    hand ATLAS a secret nothing sends, and ATLAS would refuse every admin
+    request. The console is the thing an operator would use to fix that, so the
+    failure locks them out of its own remedy. Core does the same verification
+    for its own gate (`caddy_proxy_auth_gate_v1`); this is that pattern, reused.
+    """
+    env_path = os.path.join(dirpath, '.env')
+    try:
+        with open(env_path, 'r') as f:
+            body = f.read()
+    except OSError:
+        return False
+
+    changed = False
+
+    # --- H-1: ATLAS checks the group itself, not only Authentik's binding ---
+    if 'TAKMDM_ADMIN_GROUP=' + ADMIN_GROUP not in body:
+        lines = [l for l in body.splitlines()
+                 if not l.startswith('TAKMDM_ADMIN_GROUP=')]
+        lines.append('')
+        lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
+        lines.append('# first gate; this makes ATLAS check as well, so the binding being')
+        lines.append('# removed is a lockout rather than a silent promotion of everyone.')
+        lines.append('TAKMDM_ADMIN_GROUP=' + ADMIN_GROUP)
+        body = '\n'.join(lines) + '\n'
+        changed = True
+        plog('✓ ATLAS will require membership of "%s"' % ADMIN_GROUP)
+
+    # --- S-1: prove the identity headers came through Caddy -----------------
+    if 'TAKMDM_PROXY_AUTH_SECRET=' not in body:
+        secret = _proxy_auth_secret()
+        injects = _caddyfile_injects_proxy_auth()
+        if secret and injects:
+            body = body.rstrip('\n') + '\n\n'
+            body += '# SEC_AUDIT (ATLAS) S-1. Caddy attaches this only after forward_auth\n'
+            body += '# passes, so a forged X-Authentik-Username from any process on this\n'
+            body += '# host is refused. The peer check cannot do this: Caddy reaches the\n'
+            body += '# container through the same bridge gateway everything else does.\n'
+            body += 'TAKMDM_PROXY_AUTH_SECRET=' + secret + '\n'
+            changed = True
+            plog('✓ Admin requests must now carry the proxy-auth header')
+        elif not injects:
+            # ⚠️ Reported, never armed. Arming here is the lockout.
+            plog('⚠ The Caddy vhost does not inject X-Infratak-Proxy-Auth, so the')
+            plog('  header check stays off. ATLAS is no worse off than before; it')
+            plog('  simply cannot tell a forged identity header from a real one.')
+
+    if changed:
+        with open(env_path, 'w') as f:
+            f.write(body)
+    return changed
+
+
+def _proxy_auth_secret():
+    """The shared secret core generates, or '' if this fork has none."""
+    for candidate in ('/root/infra-TAK/.config/proxy_auth.json',
+                      os.path.expanduser('~/infra-TAK/.config/proxy_auth.json')):
+        try:
+            with open(candidate) as f:
+                return (json.load(f).get('secret') or '').strip()
+        except Exception:
+            continue
+    return ''
+
+
+def _caddyfile_injects_proxy_auth():
+    """Does the generated vhost actually attach the header to ATLAS traffic?
+
+    ⚠️ Checked against the **ATLAS** block, not the file as a whole. The
+    console's own injection has been there for releases; matching on that would
+    report success for a fork whose ATLAS vhost has no such line, which is
+    exactly the version skew this exists to catch.
+    """
+    try:
+        with open('/etc/caddy/Caddyfile') as f:
+            body = f.read()
+    except OSError:
+        return False
+    marker = 'request_header X-Infratak-Proxy-Auth'
+    for block in body.split('# ATLAS MDM'):
+        if 'reverse_proxy 127.0.0.1:%d' % APP_PORT in block and marker in block:
+            return True
+    return False
 
 
 def _set_trusted_proxies(dirpath, plog):
@@ -687,6 +788,11 @@ def deploy(ctx, job, params):
         ctx['generate_caddyfile'](s)
         if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
+
+        # ⚠️ After generate_caddyfile above, because arming the header check
+        # depends on reading the vhost it just wrote.
+        if _arm_admin_gates(ctx, dirpath, plog):
+            _compose(ctx, 'up -d api', timeout=300)
 
         # ── The certificate authority is split before anyone can use it ──────
         #
@@ -1264,6 +1370,10 @@ def _run_update(ctx):
             ctx['generate_caddyfile'](ctx['load_settings']())
             ctx['_caddy_reload'](plog)
             plog('✓ Caddy vhost re-emitted')
+            # ⚠️ Only now, with the freshly generated vhost on disk to check.
+            # An install that predates these gates picks them up here.
+            if _arm_admin_gates(ctx, atlas_dir(ctx), plog):
+                _compose(ctx, 'up -d api', timeout=300)
         except Exception as exc:
             # Not fatal. The containers are already rebuilt and serving; a stale
             # vhost is worse reported than turned into a failed update.

@@ -29246,6 +29246,22 @@ def generate_caddyfile(settings=None):
             lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
+            # SEC_AUDIT (ATLAS) S-1 — the same mechanism the console already uses
+            # for itself, extended to this module's vhost.
+            #
+            # ⚠️ AFTER forward_auth, so it is attached only to requests that
+            # passed it. Inside a `route` the directives run in written order and
+            # forward_auth short-circuits on failure, so a 302'd request never
+            # reaches this line.
+            #
+            # Why it matters: ATLAS reads the administrator from
+            # X-Authentik-Username, and nothing in that header proves Caddy set
+            # it. Its own peer check cannot help — Caddy runs on this host and
+            # reaches the container through the bridge gateway, and so does every
+            # other process here. This secret is what separates them.
+            _at_pa = (_proxy_auth_state(create=True).get('secret') or '').strip()
+            if _at_pa:
+                lines.append(f"        request_header X-Infratak-Proxy-Auth {_at_pa}")
             lines.append(f"        reverse_proxy {at_up}")
             lines.append(f"    }}")
         else:
