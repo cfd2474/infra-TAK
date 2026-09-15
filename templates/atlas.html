@@ -77,6 +77,15 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     </div>
   </div>
 
+  <div class="card" id="caCard" hidden>
+    <div class="card-title">Certificate authority</div>
+    <div id="caBody" class="mono" style="font-size:13px;line-height:1.7"></div>
+    <div id="caWarn" class="banner-bad" hidden style="margin-top:10px"></div>
+    <div style="margin-top:14px">
+      <button class="btn btn-secondary" id="caRenewBtn" onclick="openRenew()">Renew issuing certificate</button>
+    </div>
+  </div>
+
   <div class="card" id="updateCard" hidden>
     <div class="card-title">Update log</div>
     <div class="log-box" id="updateLog"></div>
@@ -88,6 +97,62 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
   {% endif %}
 
+</div>
+
+
+<!--
+  The ceremony, guided.
+
+  The value here is not that pasting a key is nicer than SSH \u2014 it is that the
+  cleanup is guaranteed. The step an operator forgets is deleting ca.key
+  afterwards, and forgetting it means the whole exercise bought nothing.
+-->
+<div class="modal-overlay" id="renewModal">
+  <div class="modal">
+    <h3>Renew the issuing certificate</h3>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6">
+      ATLAS signs device certificates with an <strong>issuing certificate</strong>.
+      When it expires, every device stops authenticating. Renewing it needs the
+      <strong>root key</strong>, which is deliberately not kept on this server.
+    </p>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6">
+      Devices roll onto the new certificate by themselves &mdash; nothing needs to
+      be done to any tablet.
+    </p>
+
+    <div id="renewForm">
+      <label style="font-size:13px">Root private key (PEM)</label>
+      <textarea id="renewKey" rows="6" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
+                style="width:100%;font-family:monospace;font-size:12px"></textarea>
+      <p style="color:var(--muted);font-size:12px;margin-top:4px">
+        Leave empty if the root key is still on this server. It is written for the
+        length of one command and removed immediately afterwards, whether the
+        command succeeds or fails.
+      </p>
+
+      <label style="font-size:13px;margin-top:10px;display:block">Valid for (days)</label>
+      <input type="number" id="renewDays" value="1825" min="1" max="7300" style="width:120px">
+
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="renewPw" placeholder="Console password">
+
+      <div class="banner-bad" id="renewError" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px" id="renewButtons">
+        <button class="btn btn-secondary" onclick="closeRenew()">Cancel</button>
+        <button class="btn btn-primary" onclick="doRenew()">Renew</button>
+      </div>
+      <div id="renewBusy" hidden style="margin-top:14px;color:var(--muted)">
+        Issuing, staging the trust bundle and restarting ATLAS&hellip;
+      </div>
+    </div>
+
+    <div id="renewDone" hidden>
+      <div class="log-box" id="renewSteps" style="margin-top:12px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="location.reload()">Done</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="uninstallModal">
@@ -292,5 +357,110 @@ function pollUpdate(){
 {% if installed %}loadLogs(); loadVersion();{% endif %}
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
 {% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
+
+// ---- Certificate authority -------------------------------------------------
+//
+// \u26a0\ufe0f Polled on load only. The expiry moves once a day; refreshing it on a timer
+// would run a `docker exec` against ATLAS for a number that cannot have changed.
+async function loadCa(){
+  try {
+    const r = await fetch('/api/atlas/ca', {credentials:'same-origin'});
+    const d = await r.json();
+    const card = document.getElementById('caCard');
+    const body = document.getElementById('caBody');
+    const warn = document.getElementById('caWarn');
+    if (!d || !d.ok) {
+      // Not running, or mid-ceremony. Say so rather than showing nothing \u2014 the
+      // broken state is exactly when someone opens this page.
+      card.hidden = false;
+      body.textContent = (d && d.error) ? d.error : 'Certificate authority unavailable';
+      return;
+    }
+    card.hidden = false;
+    const rootLine = d.root_key_on_server
+      ? '\\u26a0 Root key is ON this server \\u2014 see docs/CA-OFFLINE-ROOT.md'
+      : 'Root key is not on this server';
+    body.innerHTML =
+      'Signing with <strong>' + escapeHtml(d.issuing_subject || '?') + '</strong><br>' +
+      'Expires ' + escapeHtml(d.issuing_expires || '?') +
+      ' (' + d.issuing_days_left + ' days)<br>' +
+      'Device certificates ' + d.device_cert_validity_days + ' days, renewed automatically ' +
+      d.renew_within_days + ' days before expiry<br>' +
+      escapeHtml(rootLine);
+    if (d.needs_attention) {
+      warn.hidden = false;
+      warn.textContent = 'The issuing certificate expires in ' + d.issuing_days_left +
+        ' days. When it does, every device stops authenticating. Renew it before then.';
+    }
+  } catch (e) { /* the card simply stays hidden */ }
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function openRenew(){ document.getElementById('renewModal').classList.add('open'); }
+function closeRenew(){ document.getElementById('renewModal').classList.remove('open'); }
+
+async function doRenew(){
+  const err = document.getElementById('renewError');
+  const buttons = document.getElementById('renewButtons');
+  const busy = document.getElementById('renewBusy');
+
+  err.style.display = 'none';
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    const r = await fetch('/api/atlas/ca/renew', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        password: document.getElementById('renewPw').value,
+        root_key: document.getElementById('renewKey').value,
+        days: parseInt(document.getElementById('renewDays').value, 10) || 1825,
+      }),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      // \u26a0\ufe0f Back to a usable dialog. A wrong password or a bad key must be
+      // retryable without losing what was typed \u2014 except the key itself, which is
+      // cleared below on success only.
+      err.textContent = d.error || 'Renewal failed';
+      err.style.display = 'block';
+      busy.hidden = true;
+      buttons.hidden = false;
+      if (d.steps) { showRenewSteps(d.steps); }
+      return;
+    }
+    // \u26a0\ufe0f Clear the key out of the DOM the moment it is no longer needed. It is
+    // still in memory somewhere, but leaving it in a textarea on a page that may
+    // sit open for hours is gratuitous.
+    document.getElementById('renewKey').value = '';
+    document.getElementById('renewPw').value = '';
+    document.getElementById('renewForm').hidden = true;
+    document.getElementById('renewDone').hidden = false;
+    showRenewSteps(d.steps || []);
+  } catch (e) {
+    err.textContent = 'Renewal failed: ' + e;
+    err.style.display = 'block';
+    busy.hidden = true;
+    buttons.hidden = false;
+  }
+}
+
+function showRenewSteps(steps){
+  const box = document.getElementById('renewSteps');
+  box.textContent = steps.join('\\n');
+  document.getElementById('renewDone').hidden = false;
+}
+
+// ⚠️ Guarded like loadLogs/loadVersion above. On a box where ATLAS is not
+// installed this would docker-exec a container that does not exist and paint an
+// error card onto a page whose whole message is "not installed yet".
+{% if installed %}loadCa();{% endif %}
 </script>
 {% endblock %}

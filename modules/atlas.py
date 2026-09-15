@@ -49,12 +49,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.23.0'
+ATLAS_TAG = 'v1.24.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = '53fe2fb01e2dc080088b1fc373f81f4b06ce9937'
+ATLAS_SHA = 'e1ecd5896d28d8907c773ed328d24286370efa38'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -209,6 +209,80 @@ def _verify_access_control(ctx, plog=None):
         if plog:
             plog('  ⚠ Could not verify access control: %s' % str(exc)[:80])
         return None
+
+
+def _pki_dir():
+    """Where this install keeps its PKI, or None if it is not here."""
+    for base in ('/root/atlas', os.path.expanduser('~/atlas')):
+        candidate = os.path.join(base, 'pki')
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _write_root_key(path, pem):
+    """Put the root key on disk for the length of one command.
+
+    ⚠️ Created 0600 by `os.open`, not written and chmod'd after — the same
+    reasoning as ATLAS's own key writer. A world-readable window on *this* key is
+    the worst one in the system.
+
+    Owned by the container's uid, or the application cannot read what it was
+    given and the ceremony fails with a permission error nobody expects.
+    """
+    body = pem if pem.endswith('\n') else pem + '\n'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, body.encode())
+    finally:
+        os.close(fd)
+    try:
+        os.chown(path, APP_UID, APP_GID)
+    except Exception:
+        pass
+
+
+def _shred(path):
+    """Remove the root key, overwriting it first. Returns True when it is gone.
+
+    ⚠️ **Overwriting is not secure erasure** and is not claimed to be: on a
+    journaling or copy-on-write filesystem the original blocks may survive. It is
+    done because it costs nothing and raises the bar slightly. The honest position
+    is that the root key touched this machine, which is a moment of exposure the
+    ceremony cannot avoid — only shorten.
+    """
+    try:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            with open(path, 'r+b') as fh:
+                fh.write(b'\0' * size)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.unlink(path)
+        return not os.path.exists(path)
+    except Exception as exc:
+        print('[' + KEY + '] could not remove the root key: ' + str(exc), flush=True)
+        return False
+
+
+def _compose_exec(ctx, argv, timeout=60):
+    """Run a command inside the API container. Returns its output, or None."""
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', API_CONTAINER] + list(argv),
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0 and not (r.stdout or '').strip():
+        return None
+    return (r.stdout or '') + (r.stderr or '')
+
+
+# ⚠️ Imported rather than re-implemented. `modules/__init__.py` calls this "the
+# 12-copy pattern, one copy" — adding a thirteenth is how a security check drifts.
+# It is the module package this file lives in, not `app.py`, so rule 10 holds.
+from modules import _check_admin_password  # noqa: E402
 
 
 def _plog(msg):
@@ -1290,7 +1364,7 @@ services:
 
 
 def register(ctx):
-    from flask import jsonify
+    from flask import jsonify, request
 
     def logs_view():
         try:
@@ -1300,6 +1374,109 @@ def register(ctx):
         except Exception as exc:
             lines = [f'could not read logs: {exc}']
         return jsonify({'lines': lines[-200:]})
+
+    def ca_view():
+        """What the certificate authority looks like, for the page to render."""
+        r = _compose_exec(ctx, ['python', '-m', 'app.cli', 'ca-status'])
+        if r is None:
+            return jsonify({'ok': False, 'error': 'ATLAS is not running'}), 200
+        try:
+            return jsonify(json.loads(r))
+        except Exception:
+            return jsonify({'ok': False, 'error': 'could not read the CA status'}), 200
+
+    def ca_renew_view():
+        """Run the intermediate ceremony: take the root key, use it, destroy it.
+
+        ⚠️ **This handles the most dangerous secret in the system.** The root key
+        arrives in a request body, is written to disk for the length of one
+        command, and is removed in a `finally`. That is a real moment of exposure
+        and it is inherent to the ceremony — the alternative is an operator doing
+        the same thing by hand over SSH, which exposes it just as much and has no
+        guarantee the cleanup happens at all.
+        """
+        data = request.get_json(silent=True) or {}
+        err = _check_admin_password(ctx, data)
+        if err:
+            return jsonify({'success': False, 'error': err}), 403
+
+        key_pem = (data.get('root_key') or '').strip()
+        days = data.get('days') or 1825
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'days must be a number'}), 400
+        if days < 1 or days > 7300:
+            return jsonify({'success': False, 'error': 'days must be 1-7300'}), 400
+
+        pki = _pki_dir()
+        if pki is None:
+            return jsonify({'success': False, 'error': 'ATLAS is not installed here'}), 404
+        key_path = os.path.join(pki, 'ca.key')
+
+        # ⚠️ A root key already present is the legacy state, not an error — the
+        # ceremony is exactly how it stops being present. But it must not be
+        # silently replaced by whatever was pasted: that would be a way to swap the
+        # CA of a running fleet through a web form.
+        supplied = False
+        if key_pem:
+            if os.path.exists(key_path):
+                return jsonify({
+                    'success': False,
+                    'error': 'a root key is already on the server; leave the field '
+                             'empty to use it, or remove it first',
+                }), 409
+            if 'PRIVATE KEY' not in key_pem:
+                return jsonify({'success': False, 'error': 'that is not a PEM private key'}), 400
+            try:
+                _write_root_key(key_path, key_pem)
+                supplied = True
+            except Exception as exc:
+                return jsonify({'success': False, 'error': 'could not stage the key: %s' % exc}), 500
+        elif not os.path.exists(key_path):
+            return jsonify({
+                'success': False,
+                'error': 'no root key on the server and none supplied',
+            }), 400
+
+        steps = []
+        try:
+            out = _compose_exec(
+                ctx,
+                ['python', '-m', 'app.cli', 'ca-issue-intermediate', '--days', str(days)],
+                timeout=120,
+            )
+            if out is None:
+                return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
+            # ⚠️ Never echo the command's whole output back without looking: it is
+            # written for a terminal and names file paths, which is fine, but the
+            # key must never appear. It does not — the CLI prints paths, not
+            # contents — and this is the line that has to stay true.
+            steps.append(out.strip())
+            issued = 'issuing CA' in out
+        finally:
+            # ⚠️ Always, on every path, including the failure ones. An operator who
+            # supplied a root key and got an error must not be left with it sitting
+            # on the server — that is precisely the state the whole exercise exists
+            # to avoid, reached by trying to fix it.
+            if supplied:
+                removed = _shred(key_path)
+                steps.append('Root key removed from the server' if removed
+                             else '⚠ COULD NOT REMOVE %s — delete it by hand NOW' % key_path)
+
+        if not issued:
+            return jsonify({'success': False, 'error': 'the command did not issue a '
+                                                       'certificate', 'steps': steps}), 500
+
+        # The new trust bundle has to reach Caddy or devices fail at the edge.
+        staged = sync_device_ca_for_caddy()
+        steps.append('Trust bundle staged for Caddy' if staged
+                     else '⚠ Could not stage the trust bundle for Caddy')
+        ctx['_caddy_reload']()
+
+        r = _compose(ctx, 'restart api', timeout=180)
+        steps.append('ATLAS restarted' if r.returncode == 0 else '⚠ Restart failed')
+        return jsonify({'success': True, 'steps': steps})
 
     def version_view():
         """What is installed, what is available, and whether that is a newer one.
@@ -1363,6 +1540,10 @@ def register(ctx):
              'endpoint': f'{KEY}_update', 'view': update_view},
             {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],
              'endpoint': f'{KEY}_update_status', 'view': update_status_view},
+            {'url': f'/api/{KEY}/ca', 'methods': ['GET'],
+             'endpoint': f'{KEY}_ca', 'view': ca_view},
+            {'url': f'/api/{KEY}/ca/renew', 'methods': ['POST'],
+             'endpoint': f'{KEY}_ca_renew', 'view': ca_renew_view},
         ],
         # One public port. The console is Caddy-only on 443, the agent package is
         # a Caddy path route on the well-known port, and the database never
