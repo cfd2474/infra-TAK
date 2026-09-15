@@ -204,6 +204,77 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div class="card-title">Logs</div>
     <div class="log-box" id="logBox">Loading…</div>
   </div>
+
+  <!--
+    Break glass.
+
+    ⚠️ **Instructions, not buttons, and that is the point.** Every item here
+    disables one of ATLAS's admin checks. A button on a web console that turns
+    off an authentication gate is not a recovery tool, it is the bypass those
+    gates exist to prevent — reachable by whoever reaches this page. Requiring a
+    shell on the box is the control.
+
+    ⚠️ This card lives on the **InfraTAK** page on purpose. An ATLAS lockout is
+    caused by `TAKMDM_*` settings, which do not affect this console — so this
+    page is readable precisely when the ATLAS one is not. If Authentik itself is
+    down, both are gone and the recovery is `reset-console-password.sh`, which
+    is core InfraTAK's own break-glass and needs an on-box shell too.
+  -->
+  <div class="card">
+    <div class="card-title">If you are locked out of ATLAS</div>
+
+    <p class="note">
+      Each of these turns off one admin check. They need an SSH shell on this
+      server — deliberately: a button here that disabled an authentication gate
+      would be the bypass the gate exists to prevent.
+    </p>
+
+    <p class="note" style="margin-top:12px"><strong>1. "must be reached through the authenticating proxy"</strong></p>
+    <p class="note" style="margin-left:18px">
+      ATLAS is demanding the header Caddy attaches after sign-in, and is not
+      getting it — usually a Caddyfile that has not been regenerated.
+    </p>
+    <div class="log-box" style="margin:6px 0 0 18px">sed -i '/^TAKMDM_PROXY_AUTH_SECRET=/d' /root/atlas/.env
+cd /root/atlas &amp;&amp; docker compose up -d api</div>
+
+    <p class="note" style="margin-top:14px"><strong>2. "administrator access requires membership of …"</strong></p>
+    <p class="note" style="margin-left:18px">
+      You signed in, but not as a member of the group ATLAS requires. Either add
+      yourself to that group in Authentik, or stop requiring one:
+    </p>
+    <div class="log-box" style="margin:6px 0 0 18px">sed -i 's/^TAKMDM_ADMIN_GROUP=.*/TAKMDM_ADMIN_GROUP=/' /root/atlas/.env
+cd /root/atlas &amp;&amp; docker compose up -d api</div>
+
+    <p class="note" style="margin-top:14px"><strong>3. "not within TAKMDM_TRUSTED_PROXIES"</strong></p>
+    <p class="note" style="margin-left:18px">
+      The request reached ATLAS from an address it does not serve the console to.
+      The log line names both what arrived and what was allowed.
+    </p>
+    <div class="log-box" style="margin:6px 0 0 18px">sed -i 's|^TAKMDM_TRUSTED_PROXIES=.*|TAKMDM_TRUSTED_PROXIES=any|' /root/atlas/.env
+cd /root/atlas &amp;&amp; docker compose up -d api</div>
+
+    <p class="note" style="margin-top:14px"><strong>4. ATLAS will not start: "root key missing"</strong></p>
+    <p class="note" style="margin-left:18px">
+      The certificate authority's root key was removed with nothing left to sign
+      with. ⚠️ <strong>Do not redeploy</strong> — a fresh install mints a new CA
+      and every enrolled device stops authenticating for good. Restore the
+      recovery file you saved, then use <em>Renew issuing certificate</em> above.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>Seeing why, before changing anything</strong></p>
+    <div class="log-box" style="margin:6px 0 0 18px">docker logs --tail 50 takmdm-api-1</div>
+    <p class="note" style="margin-left:18px;margin-top:6px">
+      Every refusal above logs the reason and the setting responsible. ⚠️ Read it
+      first: turning off the wrong gate leaves the real fault in place and
+      removes a control for nothing.
+    </p>
+
+    <p class="note" style="margin-top:14px;color:var(--muted)">
+      Put back whatever you cleared once the cause is fixed. An ATLAS running
+      without these is an MDM console — remote wipe, factory reset, policy push —
+      trusting a header anything on this host can send.
+    </p>
+  </div>
   {% endif %}
 
 </div>
