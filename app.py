@@ -55492,6 +55492,15 @@ def _takportal_admin_guardrail(plog_fn=None):
 LDAP_SA_HEAL_BACKOFF_AFTER = 3
 LDAP_SA_HEAL_BACKOFF_SECS = 3600
 
+# How long a just-applied ldap-authentication-flow policy repair suppresses the
+# "heal INCOMPLETE" alarm. Authentik caches flow plans and policy results for
+# 600s (cache.timeout_flows / cache.timeout_policies — confirmed with
+# `ak dump_config` on test6, 2026-09-15), so the bind does NOT recover the moment
+# the binding is corrected: measured 2.7 min and 6.1 min on two runs. Without
+# this grace the watchdog reports a hard failure, and burns backoff strikes, on a
+# repair that is working — and could back off to hourly right as it recovers.
+LDAP_SA_POLICY_REPAIR_GRACE_SECS = 900
+
 
 def _record_ldap_sa_heal_failure(msg):
     """v10.1.75: persist a FAILED heal.
@@ -55613,6 +55622,7 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                                 _s2['authentik_ldap_sa_heal_failures'] = 0
                                 _s2['authentik_ldap_sa_heal_next_attempt'] = 0
                                 _s2['authentik_ldap_sa_heal_last_error'] = ''
+                                _s2['authentik_ldap_sa_policy_repair_at'] = 0
                                 save_settings(_s2)
                             except Exception:
                                 pass
@@ -55625,8 +55635,17 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                             except Exception:
                                 pass
                         else:
-                            print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
-                            _record_ldap_sa_heal_failure(_msg)
+                            # Re-read settings: the repair marker is written by the heal
+                            # we just called, so the tick-start copy is stale.
+                            try:
+                                _pr_at = float(load_settings().get('authentik_ldap_sa_policy_repair_at') or 0)
+                            except Exception:
+                                _pr_at = 0
+                            if _wt.time() - _pr_at < LDAP_SA_POLICY_REPAIR_GRACE_SECS:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice recovery PENDING: {_msg}", flush=True)
+                            else:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
+                                _record_ldap_sa_heal_failure(_msg)
                     except Exception as _se:
                         print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
                         _record_ldap_sa_heal_failure(f'heal error: {str(_se)[:160]}')
@@ -59895,12 +59914,25 @@ def _ensure_authentik_ldap_service_account():
                     if _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass) == 'ok':
                         return True, ('LDAP bind verified after repairing the '
                                       f'ldap-authentication-flow policy binding (attempt {_ra + 1})')
-            # Still failing, or the denial comes from a policy the drift migration
-            # does not own. Name the live bindings so the next field report does not
-            # depend on the customer reading docker logs for us.
+            # Name the live bindings either way, so the next field report does not
+            # depend on the customer reading docker logs on our behalf.
             _report = _authentik_ldap_flow_policy_report()
-            return False, ('LDAP bind confirmed failing after API password set and '
-                           'policy-binding repair'
+            if _rep_fixed:
+                # The repair landed; the bind just hasn't caught up (600s policy/flow
+                # cache — see LDAP_SA_POLICY_REPAIR_GRACE_SECS). Mark it so the
+                # watchdog reports "recovery pending" rather than a hard failure.
+                try:
+                    _sp = load_settings()
+                    _sp['authentik_ldap_sa_policy_repair_at'] = time.time()
+                    save_settings(_sp)
+                except Exception:
+                    pass
+                return False, ('ldap-authentication-flow policy binding REPAIRED; bind not back '
+                               'yet — Authentik caches policy/flow results for 600s, so recovery '
+                               'lags the fix by minutes. Re-verifying next tick'
+                               + (f' — {_report}' if _report else ''))
+            return False, ('LDAP bind confirmed failing after API password set, and no repairable '
+                           'policy-binding drift was found'
                            + (f' — {_report}' if _report else ''))
         # Inconclusive across all attempts. _ensure_ldapsearch() ran above, so this
         # is usually NOT a missing client — it's the outpost being mid-recreate/spiral
