@@ -297,18 +297,48 @@ def _shred(path):
         return False
 
 
-def _compose_exec(ctx, argv, timeout=60):
-    """Run a command inside the API container. Returns its output, or None."""
+def _compose_exec(ctx, argv, timeout=60, stdin=None):
+    """Run a command inside the API container. Returns its output, or None.
+
+    ⚠️ `stdin` exists so the recovery file can be checked **without ever being
+    written to this host's disk**. `docker exec -i` pipes it straight into the
+    process; the alternative — a temp file plus a shred afterwards — puts the
+    root key on the filesystem for the length of a command, which is the exposure
+    this whole feature exists to remove.
+    """
+    argv = list(argv)
+    flags = ['-i'] if stdin is not None else []
     try:
         r = subprocess.run(
-            ['docker', 'exec', API_CONTAINER] + list(argv),
+            ['docker', 'exec'] + flags + [API_CONTAINER] + argv,
             capture_output=True, text=True, timeout=timeout,
+            input=stdin if stdin is not None else None,
         )
     except Exception:
         return None
     if r.returncode != 0 and not (r.stdout or '').strip():
         return None
     return (r.stdout or '') + (r.stderr or '')
+
+
+def _compose_exec_rc(ctx, argv, timeout=60, stdin=None):
+    """Same, but the caller needs the exit status rather than the text.
+
+    `_compose_exec` collapses failure into None, which suits a status read and
+    not a yes/no question: `ca-verify-root` answers by exit code, and "did not
+    run" must not look like "the key does not match".
+    """
+    argv = list(argv)
+    flags = ['-i'] if stdin is not None else []
+    try:
+        r = subprocess.run(
+            ['docker', 'exec'] + flags + [API_CONTAINER] + argv,
+            capture_output=True, text=True, timeout=timeout,
+            input=stdin if stdin is not None else None,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    return r.returncode, ((r.stdout or '') + (r.stderr or '')).strip()
 
 
 # ⚠️ Imported rather than re-implemented. `modules/__init__.py` calls this "the
@@ -657,6 +687,32 @@ def deploy(ctx, job, params):
         ctx['generate_caddyfile'](s)
         if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
+
+        # ── The certificate authority is split before anyone can use it ──────
+        #
+        # ⚠️ Automatic, because a manual ceremony is not a control. The previous
+        # design asked the operator to run five commands over SSH; SEC_AUDIT S-2
+        # stayed Severe for months because nobody did, and W185 found the console
+        # telling the ones who half-finished that they were done.
+        #
+        # This leaves the root key **on the box** — the card is what gets it off.
+        # Issuing here is what makes that possible: once an intermediate signs,
+        # removing the root costs nothing and breaks nothing.
+        plog('')
+        plog('━━━ Securing the certificate authority ━━━')
+        out = _compose_exec(
+            ctx, ['python', '-m', 'app.cli', 'ca-issue-intermediate'], timeout=120,
+        )
+        if out and 'issuing CA' in out:
+            plog('✓ Issuing certificate created — the root key is now only needed')
+            plog('  to renew it, about twice a decade.')
+            plog('⚠ The root key is still on this server. Open the ATLAS module')
+            plog('  page and save your recovery file — it takes one click.')
+        else:
+            # Not fatal. A deployment with an unsplit CA works exactly as it
+            # always did; it is simply still carrying the risk.
+            plog('⚠ Could not create the issuing certificate. ATLAS works, but the')
+            plog('  root key cannot be moved off this server until it exists.')
 
         # ── 7/7 Authentik ─────────────────────────────────────────────────────
         plog('')
@@ -1538,6 +1594,87 @@ def register(ctx):
         steps.append('ATLAS restarted' if r.returncode == 0 else '⚠ Restart failed')
         return jsonify({'success': True, 'steps': steps})
 
+    def ca_recovery_view():
+        """Hand the root key to the operator, once, to save.
+
+        ⚠️ **POST with the console password, not a GET.** `login_required`
+        already gates it, but the most dangerous secret in the system should not
+        be one URL away from an open tab — and a GET would land in browser
+        history, in the access log, and in anything that prefetches links. The
+        key goes in a JSON body the page turns into a download client-side.
+        """
+        data = request.get_json(silent=True) or {}
+        err = _check_admin_password(ctx, data)
+        if err:
+            return jsonify({'success': False, 'error': err}), 403
+
+        rc, out = _compose_exec_rc(ctx, ['python', '-m', 'app.cli', 'ca-export-root'])
+        if rc is None:
+            return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
+        if rc != 0:
+            return jsonify({'success': False, 'error': out or 'no root key on this server'}), 409
+        if 'PRIVATE KEY' not in out:
+            return jsonify({'success': False, 'error': 'that did not look like a key'}), 500
+
+        return jsonify({
+            'success': True,
+            'key_pem': out,
+            'filename': 'atlas-recovery-%s.key' % (ctx['load_settings']().get('fqdn') or 'server'),
+        })
+
+    def ca_recovery_confirm_view():
+        """Check the operator really has the file, then remove it from the box.
+
+        ⚠️ **Verify and delete are one call on purpose.** Two endpoints would
+        allow a verified-but-not-deleted state, which is exactly the half-finished
+        ceremony W185 found the console misreporting. Either the customer proves
+        they hold the recovery file and the root goes, or nothing changes.
+        """
+        data = request.get_json(silent=True) or {}
+        err = _check_admin_password(ctx, data)
+        if err:
+            return jsonify({'success': False, 'error': err}), 403
+
+        key_pem = (data.get('root_key') or '').strip()
+        if not key_pem:
+            return jsonify({'success': False, 'error': 'upload your recovery file first'}), 400
+
+        steps = []
+        rc, out = _compose_exec_rc(
+            ctx, ['python', '-m', 'app.cli', 'ca-verify-root'],
+            stdin=key_pem if key_pem.endswith('\n') else key_pem + '\n',
+        )
+        if rc is None:
+            return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
+        if rc != 0:
+            # ⚠️ The root is untouched on this path, and that is the point. A
+            # customer who uploads the wrong file must end up exactly where they
+            # started, with a message that says which mistake they made.
+            return jsonify({'success': False, 'error': out or 'that file does not match'}), 400
+        steps.append('✓ Recovery file checked against this server\'s certificate authority')
+
+        # "Check my recovery file", years later, when the root is long gone.
+        # ⚠️ Stops here deliberately. Running the delete would be a no-op and
+        # would report a removal that did not happen in this call.
+        if data.get('verify_only'):
+            steps.append('This file can still renew your certificate authority.')
+            steps.append('Nothing was changed.')
+            return jsonify({'success': True, 'steps': steps})
+
+        rc, out = _compose_exec_rc(
+            ctx, ['python', '-m', 'app.cli', 'ca-delete-root'], timeout=60,
+        )
+        if rc is None:
+            return jsonify({'success': False, 'error': 'ATLAS stopped responding',
+                            'steps': steps}), 409
+        if rc != 0:
+            return jsonify({'success': False, 'error': out or 'could not remove the key',
+                            'steps': steps}), 500
+        steps.append('✓ Root key removed from this server')
+        steps.append('Nothing on any device changes. Keep the file somewhere safe —')
+        steps.append('you will need it to renew, in about five years.')
+        return jsonify({'success': True, 'steps': steps})
+
     def version_view():
         """What is installed, what is available, and whether that is a newer one.
 
@@ -1604,6 +1741,12 @@ def register(ctx):
              'endpoint': f'{KEY}_ca', 'view': ca_view},
             {'url': f'/api/{KEY}/ca/renew', 'methods': ['POST'],
              'endpoint': f'{KEY}_ca_renew', 'view': ca_renew_view},
+            # ⚠️ POST, both of them. See ca_recovery_view for why the download
+            # is not a GET.
+            {'url': f'/api/{KEY}/ca/recovery', 'methods': ['POST'],
+             'endpoint': f'{KEY}_ca_recovery', 'view': ca_recovery_view},
+            {'url': f'/api/{KEY}/ca/recovery/confirm', 'methods': ['POST'],
+             'endpoint': f'{KEY}_ca_recovery_confirm', 'view': ca_recovery_confirm_view},
         ],
         # One public port. The console is Caddy-only on 443, the agent package is
         # a Caddy path route on the well-known port, and the database never

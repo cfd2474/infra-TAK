@@ -156,6 +156,40 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div class="card-title">Certificate authority</div>
     <div id="caBody" class="mono" style="font-size:13px;line-height:1.7"></div>
     <div id="caWarn" class="banner-bad" hidden style="margin-top:10px"></div>
+
+    <!--
+      The one job a customer has. Shown while the root key is still on the box
+      and nowhere else — which, after a fresh deploy, is always.
+
+      ⚠️ Driven by `root_key_on_server`, read from the key file, never from
+      whether an intermediate exists. Those two come apart in exactly the state
+      this banner is for (SEC_AUDIT S-2 / W185).
+    -->
+    <div id="caRecovery" hidden class="banner-bad" style="margin-top:12px">
+      <strong>Save your recovery file</strong>
+      <p style="margin:6px 0 0;font-size:13px;line-height:1.6">
+        Your certificate authority's master key is still on this server. Anyone
+        who reaches this machine can use it to impersonate any of your devices,
+        and the only fix would be setting up every tablet again.
+      </p>
+      <p style="margin:6px 0 0;font-size:13px;line-height:1.6">
+        Download it, keep it somewhere safe, and we will remove it from here.
+        <strong>Nothing on any device changes.</strong> You will need the file
+        again in about five years.
+      </p>
+      <div style="margin-top:10px">
+        <button class="btn btn-primary" id="caRecoveryBtn" onclick="openRecovery()">
+          Save recovery file
+        </button>
+      </div>
+    </div>
+
+    <div id="caSafe" hidden class="note" style="margin-top:12px;font-size:13px">
+      ✓ The master key is not on this server. Keep your recovery file safe —
+      renewing needs it.
+      <a href="#" onclick="openRecoveryCheck();return false">Check my recovery file</a>
+    </div>
+
     <div style="margin-top:14px">
       <button class="btn btn-secondary" id="caRenewBtn" onclick="openRenew()">Renew issuing certificate</button>
     </div>
@@ -182,6 +216,71 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   cleanup is guaranteed. The step an operator forgets is deleting ca.key
   afterwards, and forgetting it means the whole exercise bought nothing.
 -->
+
+<!--
+  Save-the-recovery-file, in two steps that cannot be half-finished.
+
+  ⚠️ Step 2 verifies and deletes in **one** server call. Splitting them would
+  allow "verified but still on the server", which is precisely the half-finished
+  state this feature exists to eliminate — and the state the console used to
+  misreport as done.
+-->
+<div class="modal-overlay" id="recoveryModal">
+  <div class="modal">
+    <h3 id="recoveryTitle">Save your recovery file</h3>
+
+    <div id="recoveryStep1">
+      <p style="color:var(--muted);font-size:13px;line-height:1.6">
+        This file is the master key for your devices. Treat it like the spare key
+        to a building: somewhere safe, not on this server, and not the only copy.
+      </p>
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="recoveryPw" placeholder="Console password">
+      <div class="banner-bad" id="recoveryError" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-secondary" onclick="closeRecovery()">Cancel</button>
+        <button class="btn btn-primary" id="recoveryDownloadBtn" onclick="doRecoveryDownload()">
+          Download the file
+        </button>
+      </div>
+    </div>
+
+    <div id="recoveryStep2" hidden>
+      <p style="color:var(--muted);font-size:13px;line-height:1.6">
+        <strong>Now prove you have it.</strong> Upload the file you just saved.
+        ⚠️ We ask because a file you cannot find later is the same as no file at
+        all — and you would not discover that for years.
+      </p>
+      <input type="file" id="recoveryFile" accept=".key,.pem,text/plain">
+      <!--
+        ⚠️ Its own field, because "Check my recovery file" enters at step 2 and
+        never sees step 1. Reading step 1's input there gave an empty password
+        and an "Invalid admin password" error on a button that had asked for
+        nothing.
+      -->
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="recoveryPw2" placeholder="Console password">
+      <div class="banner-bad" id="recoveryError2" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px" id="recoveryConfirmButtons">
+        <button class="btn btn-secondary" onclick="closeRecovery()">Finish later</button>
+        <button class="btn btn-primary" onclick="doRecoveryConfirm()">
+          Confirm and remove from server
+        </button>
+      </div>
+      <div id="recoveryBusy" hidden style="margin-top:14px;color:var(--muted)">
+        Checking the file and removing the key&hellip;
+      </div>
+    </div>
+
+    <div id="recoveryDone" hidden>
+      <div class="log-box" id="recoverySteps" style="margin-top:12px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="location.reload()">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="renewModal">
   <div class="modal">
     <h3>Renew the issuing certificate</h3>
@@ -452,20 +551,25 @@ async function loadCa(){
       return;
     }
     card.hidden = false;
-    const rootLine = d.root_key_on_server
-      ? '\\u26a0 Root key is ON this server \\u2014 see docs/CA-OFFLINE-ROOT.md'
-      : 'Root key is not on this server';
     body.innerHTML =
       'Signing with <strong>' + escapeHtml(d.issuing_subject || '?') + '</strong><br>' +
       'Expires ' + escapeHtml(d.issuing_expires || '?') +
       ' (' + d.issuing_days_left + ' days)<br>' +
       'Device certificates ' + d.device_cert_validity_days + ' days, renewed automatically ' +
-      d.renew_within_days + ' days before expiry<br>' +
-      escapeHtml(rootLine);
+      d.renew_within_days + ' days before expiry';
+
+    // ⚠️ One of these two is always shown, and which one is decided by the key
+    // file. `is_split` answers a different question and used to be used for this.
+    document.getElementById('caRecovery').hidden = !d.root_key_on_server;
+    document.getElementById('caSafe').hidden = !!d.root_key_on_server;
     if (d.needs_attention) {
       warn.hidden = false;
+      // ⚠️ Names the recovery file, because that is what renewing needs and
+      // the moment someone reads this is the moment to discover it is missing —
+      // not on the day the certificate expires.
       warn.textContent = 'The issuing certificate expires in ' + d.issuing_days_left +
-        ' days. When it does, every device stops authenticating. Renew it before then.';
+        ' days. When it does, every device stops authenticating. Renewing needs ' +
+        'your recovery file \u2014 find it now, then use Renew below.';
     }
   } catch (e) { /* the card simply stays hidden */ }
 }
@@ -537,5 +641,126 @@ function showRenewSteps(steps){
 // installed this would docker-exec a container that does not exist and paint an
 // error card onto a page whose whole message is "not installed yet".
 {% if installed %}loadCa();{% endif %}
+
+// ---- The recovery file (W187) ----------------------------------------------
+//
+// Two steps, and the second is the one that matters: it proves the customer can
+// produce the file before the server stops being able to.
+
+let recoveryCheckOnly = false;
+
+function openRecovery(){
+  recoveryCheckOnly = false;
+  document.getElementById('recoveryTitle').textContent = 'Save your recovery file';
+  document.getElementById('recoveryStep1').hidden = false;
+  document.getElementById('recoveryStep2').hidden = true;
+  document.getElementById('recoveryDone').hidden = true;
+  document.getElementById('recoveryError').style.display = 'none';
+  document.getElementById('recoveryError2').style.display = 'none';
+  document.getElementById('recoveryModal').classList.add('open');
+}
+
+// The same modal, for "is the file I saved years ago still the right one?".
+// ⚠️ This works *because* verification compares against the CA certificate
+// rather than the key — the key is long gone by the time anyone asks.
+function openRecoveryCheck(){
+  openRecovery();
+  recoveryCheckOnly = true;
+  document.getElementById('recoveryTitle').textContent = 'Check your recovery file';
+  document.getElementById('recoveryStep1').hidden = true;
+  document.getElementById('recoveryStep2').hidden = false;
+}
+
+function closeRecovery(){
+  document.getElementById('recoveryModal').classList.remove('open');
+}
+
+async function doRecoveryDownload(){
+  const err = document.getElementById('recoveryError');
+  err.style.display = 'none';
+  try {
+    const r = await fetch('/api/atlas/ca/recovery', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({password: document.getElementById('recoveryPw').value}),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      err.textContent = d.error || 'Could not read the key';
+      err.style.display = 'block';
+      return;
+    }
+    // Built client-side so the key is never a URL the browser remembers.
+    const blob = new Blob([d.key_pem], {type: 'application/octet-stream'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = d.filename || 'atlas-recovery.key';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+
+    document.getElementById('recoveryStep1').hidden = true;
+    document.getElementById('recoveryStep2').hidden = false;
+  } catch (e) {
+    err.textContent = 'Could not read the key: ' + e;
+    err.style.display = 'block';
+  }
+}
+
+async function doRecoveryConfirm(){
+  const err = document.getElementById('recoveryError2');
+  const buttons = document.getElementById('recoveryConfirmButtons');
+  const busy = document.getElementById('recoveryBusy');
+  const input = document.getElementById('recoveryFile');
+  err.style.display = 'none';
+
+  if (!input.files || !input.files[0]) {
+    err.textContent = 'Choose the file you saved.';
+    err.style.display = 'block';
+    return;
+  }
+
+  const text = await input.files[0].text();
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    // ⚠️ `verify_only` is a real difference, not decoration. Without it the
+    // check path would run the delete too — harmless, since the key is already
+    // gone, but it would report "Root key removed from this server" to somebody
+    // who asked a completely different question. A reassuring message on the
+    // wrong screen is how the console came to claim the root was gone when it
+    // was not (W185).
+    const r = await fetch('/api/atlas/ca/recovery/confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        password: document.getElementById('recoveryPw2').value
+                  || document.getElementById('recoveryPw').value,
+        root_key: text,
+        verify_only: recoveryCheckOnly,
+      }),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      err.textContent = d.error || 'That file did not match';
+      err.style.display = 'block';
+      busy.hidden = true;
+      buttons.hidden = false;
+      return;
+    }
+    document.getElementById('recoveryStep2').hidden = true;
+    document.getElementById('recoveryDone').hidden = false;
+    document.getElementById('recoverySteps').textContent = (d.steps || []).join('\n');
+  } catch (e) {
+    err.textContent = 'Could not complete: ' + e;
+    err.style.display = 'block';
+    busy.hidden = true;
+    buttons.hidden = false;
+  }
+}
 </script>
 {% endblock %}
