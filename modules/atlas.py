@@ -96,6 +96,16 @@ APP_GID = 1000
 WRITABLE_DIRS = ('pki', 'artifacts', 'cache')
 
 
+#: What we fall back to when the Docker network does not exist yet.
+#:
+#: ⚠️ On a **fresh install** it always does not exist: `.env` is written before
+#: `docker compose up` creates the network, so detection cannot work at that
+#: point. This value keeps the install safe — it still refuses a request arriving
+#: from a public address — and `_set_trusted_proxies` narrows it to the real subnet
+#: once the network is there.
+_TRUSTED_FALLBACK = '172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.0/8'
+
+
 def _bridge_gateway():
     """The address Caddy appears as from inside the container.
 
@@ -123,30 +133,52 @@ def _bridge_gateway():
             return subnet
     except Exception:
         pass
-    return '172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.0/8'
+    return _TRUSTED_FALLBACK
 
 
-def _ensure_trusted_proxies(dirpath, plog):
-    """Add the setting to an existing .env that predates it.
+def _set_trusted_proxies(dirpath, plog):
+    """Make `.env` name the addresses the admin interface answers. Returns True
+    when it changed, so the caller knows the container needs recreating.
 
-    ⚠️ **The update path does not rewrite `.env`** — only deploy does — so a box
-    installed before this existed would never acquire the setting and would keep
-    accepting an identity header from anywhere. Appending is safe: an operator who
-    has set it by hand is left alone.
+    Handles three states, and the third is the one a fresh install lands in:
+
+    * **Absent** — a box installed before this existed. Appended. ⚠️ The update
+      path does not rewrite `.env`, so without this such a box would keep
+      accepting an identity header from anywhere for ever.
+    * **The fallback** — written at install time, when the Docker network did not
+      exist yet and the subnet could not be read. Narrowed to the real one now
+      that it can.
+    * **Anything else** — left alone. That is either an operator's own value or a
+      subnet we already detected, and neither is ours to overwrite.
     """
     env_path = os.path.join(dirpath, '.env')
     try:
         with open(env_path, 'r') as f:
             body = f.read()
     except OSError:
-        return
-    if 'TAKMDM_TRUSTED_PROXIES' in body:
-        return
-    value = _bridge_gateway()
-    with open(env_path, 'a') as f:
-        f.write('\n# Added by the ATLAS module (SEC_AUDIT.md S-1).\n')
-        f.write('TAKMDM_TRUSTED_PROXIES=%s\n' % value)
-    plog('✓ Restricted the admin interface to %s' % value)
+        return False
+
+    detected = _bridge_gateway()
+
+    if 'TAKMDM_TRUSTED_PROXIES' not in body:
+        with open(env_path, 'a') as f:
+            f.write('\n# Added by the ATLAS module (SEC_AUDIT.md S-1).\n')
+            f.write('TAKMDM_TRUSTED_PROXIES=%s\n' % detected)
+        plog('✓ Restricted the admin interface to %s' % detected)
+        return True
+
+    # ⚠️ Only ever the exact fallback string is replaced. Matching loosely — on
+    # the key alone, say — would overwrite a value an operator had narrowed or
+    # widened deliberately, through a deploy they ran for an unrelated reason.
+    stale = 'TAKMDM_TRUSTED_PROXIES=%s' % _TRUSTED_FALLBACK
+    if stale in body and detected != _TRUSTED_FALLBACK:
+        body = body.replace(stale, 'TAKMDM_TRUSTED_PROXIES=%s' % detected, 1)
+        with open(env_path, 'w') as f:
+            f.write(body)
+        plog('✓ Narrowed the admin interface to %s' % detected)
+        return True
+
+    return False
 
 
 #: Settings keys recording whether Authentik still restricts the ATLAS app.
@@ -590,6 +622,17 @@ def deploy(ctx, job, params):
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed:\n{(r.stderr or "")[-500:]}')
         plog('✓ Containers built and started')
+
+        # ⚠️ Only now can the bridge subnet be read — `docker compose up` is what
+        # creates the network, and `.env` was written before it existed. So a fresh
+        # install starts on the broad fallback and is narrowed here, on the same
+        # deploy, rather than staying wide until somebody happens to update
+        # (SEC_AUDIT.md S-1).
+        if _set_trusted_proxies(dirpath, plog):
+            r2 = _compose(ctx, 'up -d api', timeout=600)
+            if r2.returncode != 0:
+                plog('  ⚠ Could not restart with the narrowed range; it applies on '
+                     'the next update')
 
         # ── 5/7 Firewall ──────────────────────────────────────────────────────
         plog('')
@@ -1135,7 +1178,7 @@ def _run_update(ctx):
 
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
-        _ensure_trusted_proxies(dirpath, plog)
+        _set_trusted_proxies(dirpath, plog)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
