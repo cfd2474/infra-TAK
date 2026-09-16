@@ -49,12 +49,12 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.40.1'
+ATLAS_TAG = 'v1.41.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'daeaf335e3fa69e05b88dc94dfbd5a0d17fe572a'
+ATLAS_SHA = '275dbfd9b21702dc2752b5f781c7486087bf21fd'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -143,6 +143,85 @@ def _bridge_gateway():
 #: Authentik has, and false of this one — Authentik creates it and whoever
 #: installed ATLAS is necessarily in it.
 ADMIN_GROUP = 'authentik Admins'
+
+
+#: What the container calls this host. Mapped to the bridge gateway by ATLAS's
+#: own docker-compose; named here because this is the end that writes it.
+MAIL_HOST_FROM_CONTAINER = 'host.docker.internal'
+
+#: Prefix on every comment line this writes, so the next run takes its own
+#: block out again before writing a fresh one.
+MAIL_MARKER = '# W194.'
+
+
+def _push_email_relay(ctx, dirpath, plog):
+    """Tell ATLAS where InfraTAK's Email Relay is, and who it sends as (W194).
+
+    ⚠️ **No credential crosses this line, and none ever should.** The relay
+    is Postfix on this host with `mynetworks` covering the Docker bridge, so a
+    container hands it a message and Postfix authenticates onward using the
+    provider password in `/etc/postfix/sasl_passwd`. Copying that password into
+    ATLAS's `.env` would put a live SMTP credential in plaintext on disk for no
+    gain at all — the relay does not want it — and would undo the ATLAS audit
+    finding (M-5) that sealed outbound credentials in the first place.
+
+    ⚠️ **Cleared when the relay is gone**, not merely left behind. A stale
+    from-address is what ATLAS uses to decide the relay looks configured, so
+    leaving it would make the console promise a relay that has been uninstalled.
+    """
+    env_path = os.path.join(dirpath, '.env')
+    try:
+        with open(env_path, 'r') as f:
+            body = f.read()
+    except OSError:
+        return False
+
+    relay = (ctx['load_settings']() or {}).get('email_relay') or {}
+    from_addr = (relay.get('from_addr') or '').strip()
+
+    wanted = {
+        'TAKMDM_INFRATAK_MAIL_HOST': MAIL_HOST_FROM_CONTAINER if from_addr else '',
+        'TAKMDM_INFRATAK_MAIL_PORT': '25' if from_addr else '',
+        'TAKMDM_INFRATAK_MAIL_FROM': from_addr,
+    }
+
+    # ⚠️ The comment lines carry the marker too, so they come out with the
+    # values. Without that they survived the filter and a fresh block was
+    # appended beside them on every deploy and every update — an .env growing
+    # four comment lines a release, and a function that never reported
+    # 'nothing changed' and so restarted the api container every time. Found
+    # by running it twice against a temporary file rather than by reading it.
+    lines = [l for l in body.splitlines()
+             if not any(l.startswith(k + '=') for k in wanted)
+             and not l.startswith(MAIL_MARKER)]
+    if from_addr:
+        # ⚠️ Trailing blanks trimmed before the separator goes back on.
+        # Filtering the block out leaves the blank line that preceded it, so
+        # each run added another one — the file never settled, the function
+        # reported a change every time, and the api container was restarted
+        # on every update for a value that had not moved.
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines.append('')
+        lines.append(MAIL_MARKER + ' InfraTAK\'s Email Relay, for ATLAS to inherit.')
+        lines.append(MAIL_MARKER + ' Postfix on this host accepts mail from the')
+        lines.append(MAIL_MARKER + ' Docker bridge unauthenticated, so there is')
+        lines.append(MAIL_MARKER + ' deliberately no username or password here:')
+        lines.append(MAIL_MARKER + ' the provider credential stays in')
+        lines.append(MAIL_MARKER + ' /etc/postfix/sasl_passwd where Postfix uses it.')
+        for key, value in wanted.items():
+            lines.append(key + '=' + value)
+
+    updated = '\n'.join(lines).rstrip('\n') + '\n'
+    if updated == body:
+        return False
+    with open(env_path, 'w') as f:
+        f.write(updated)
+    if from_addr:
+        plog('✓ ATLAS can inherit the Email Relay (sending as %s)' % from_addr)
+    else:
+        plog('ℹ No Email Relay configured, so ATLAS has nothing to inherit')
+    return True
 
 
 def _arm_admin_gates(ctx, dirpath, plog):
@@ -791,7 +870,9 @@ def deploy(ctx, job, params):
 
         # ⚠️ After generate_caddyfile above, because arming the header check
         # depends on reading the vhost it just wrote.
-        if _arm_admin_gates(ctx, dirpath, plog):
+        restart_api = _arm_admin_gates(ctx, dirpath, plog)
+        restart_api = _push_email_relay(ctx, dirpath, plog) or restart_api
+        if restart_api:
             _compose(ctx, 'up -d api', timeout=300)
 
         # ── The certificate authority is split before anyone can use it ──────
@@ -1372,7 +1453,9 @@ def _run_update(ctx):
             plog('✓ Caddy vhost re-emitted')
             # ⚠️ Only now, with the freshly generated vhost on disk to check.
             # An install that predates these gates picks them up here.
-            if _arm_admin_gates(ctx, atlas_dir(ctx), plog):
+            changed = _arm_admin_gates(ctx, atlas_dir(ctx), plog)
+            changed = _push_email_relay(ctx, atlas_dir(ctx), plog) or changed
+            if changed:
                 _compose(ctx, 'up -d api', timeout=300)
         except Exception as exc:
             # Not fatal. The containers are already rebuilt and serving; a stale
