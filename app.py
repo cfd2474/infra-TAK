@@ -965,7 +965,21 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.70-alpha"
+VERSION = "10.1.76-alpha"
+# ⚠️ **This fork's own repository, and it has to stay that way through every
+# upstream merge.** Two things read it, and both break if it points at upstream:
+#
+#   * `SOURCE_URL_DEFAULT` below - the AGPL section 13 source offer. The comment
+#     under it is explicit that a modified version served over a network must
+#     point at *its own* source. This console is exactly that, so taking
+#     upstream's value here would be a licence regression made silently, inside
+#     a merge conflict.
+#   * the console's own update check (tags, commits, releases). Aimed at
+#     upstream it would offer an "update" that replaces this console with one
+#     that has no ATLAS module in it at all.
+#
+# Upstream's `VERSION` above is taken as-is: this fork adds a module, it does not
+# version the console separately.
 GITHUB_REPO = "cfd2474/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -8512,6 +8526,47 @@ def takserver_external_db_test_connection():
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
 
 
+def _ensure_ssh_pubkey(key_path):
+    """Make <key_path>.pub exist whenever the PRIVATE key already does. Returns (ok, error).
+
+    An operator-supplied private key arrives WITHOUT its public half: the uploaded AWS/Azure
+    .pem path (`/upload-ssh-key`) only ever wrote the private key, and an operator can point
+    ssh_key_path at a key they made themselves. Every "Setup SSH key" button then fell through
+    to `ssh-keygen -t ed25519 -f <path that already exists>`, which asks "Overwrite (y/n)?" on
+    a stdin that is not a TTY under gunicorn -- it dies, and the operator has no way to answer
+    it. Worse, the next step ("Copy key to host") hard-fails on a missing .pub, so the wizard
+    dead-ends with no way forward. Field report: EC2 two-server DB migration, 2026-09-15.
+
+    Derive the public half with `ssh-keygen -y` instead of regenerating. Never regenerate over
+    an existing private key, and never overwrite an existing .pub. The derived key loses the
+    original -C comment; ssh-copy-id does not care.
+    """
+    key_path = os.path.expanduser((key_path or '').strip())
+    if not key_path or not os.path.exists(key_path):
+        return False, 'private key not found'
+    pub_path = key_path + '.pub'
+    if os.path.exists(pub_path):
+        return True, ''
+    try:
+        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path],
+                           capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, str(e)[:200]
+    if r.returncode != 0 or not (r.stdout or '').strip():
+        err = (r.stderr or r.stdout or 'ssh-keygen -y failed').strip()
+        if 'passphrase' in err.lower():
+            err = 'the private key is passphrase-protected - re-export it without a passphrase'
+        return False, err[:200]
+    try:
+        fd = os.open(pub_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, 'w') as f:
+            f.write((r.stdout or '').strip() + '\n')
+    except Exception as e:
+        return False, f'could not write {pub_path}: {str(e)[:160]}'
+    return True, ''
+
+
 @app.route('/api/takserver/two-server/ensure-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_ensure_ssh_key():
@@ -8525,7 +8580,18 @@ def takserver_two_server_ensure_ssh_key():
     key_path = (s1.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/id_rsa')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
-    if os.path.exists(key_path) and os.path.exists(pub_path):
+    if os.path.exists(key_path):
+        # The .pub may be absent even though the private key is here (uploaded .pem, or an
+        # operator-supplied ssh_key_path). Derive it -- do NOT fall through to ssh-keygen,
+        # which would prompt "Overwrite (y/n)?" on a non-TTY stdin and dead-end step 3.
+        derived = not os.path.exists(pub_path)
+        pub_ok, pub_err = _ensure_ssh_pubkey(key_path)
+        if not pub_ok:
+            return jsonify({
+                'success': False,
+                'error': f'A private key already exists at {key_path}, but its public half '
+                         f'could not be derived: {pub_err}',
+            }), 400
         try:
             r = subprocess.run(
                 ['ssh-keygen', '-l', '-f', pub_path],
@@ -8545,7 +8611,7 @@ def takserver_two_server_ensure_ssh_key():
             'key_path': key_path,
             'public_key_path': pub_path,
             'fingerprint': fingerprint,
-            'message': 'Key already exists',
+            'message': 'Public key derived from your existing private key' if derived else 'Key already exists',
         })
     key_dir = os.path.dirname(key_path)
     if key_dir and not os.path.isdir(key_dir):
@@ -8557,7 +8623,7 @@ def takserver_two_server_ensure_ssh_key():
         subprocess.run(
             ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path, '-C', 'infra-tak-server-one'],
             capture_output=True, text=True, timeout=30,
-            check=True,
+            stdin=subprocess.DEVNULL, check=True,
         )
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': (e.stderr or e.stdout or str(e))[:400]}), 400
@@ -8617,7 +8683,10 @@ def takserver_two_server_upload_ssh_key():
         return jsonify({'success': False, 'error': f'Could not write key: {str(e)[:160]}'}), 500
     # Validate it's a usable, passphrase-free private key by deriving its public half.
     try:
-        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path], capture_output=True, text=True, timeout=10)
+        # stdin=DEVNULL: without it a passphrase-protected key makes ssh-keygen PROMPT and
+        # hang until the timeout, so the passphrase hint below never fires. EOF = fail fast.
+        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path], capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
     except Exception as e:
         try: os.remove(key_path)
         except Exception: pass
@@ -8630,6 +8699,16 @@ def takserver_two_server_upload_ssh_key():
                 if 'passphrase' in _err or 'incorrect passphrase' in _err
                 else 'invalid or unsupported private key format')
         return jsonify({'success': False, 'error': f'Key rejected: {hint}.'}), 400
+    # Persist the PUBLIC half too. `ssh-keygen -y` above already produced it and we used to
+    # throw it away, so an uploaded .pem left <key>.pub absent -- which broke "Setup SSH key"
+    # and permanently blocked "Copy key to host". Non-fatal: the private key alone is enough
+    # for every deploy/migration path, the .pub only feeds ssh-copy-id.
+    try:
+        _pub_fd = os.open(key_path + '.pub', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(_pub_fd, 'w') as _pub_f:
+            _pub_f.write((r.stdout or '').strip() + '\n')
+    except Exception:
+        pass
     fingerprint = ''
     try:
         fr = subprocess.run(['ssh-keygen', '-l', '-f', key_path], capture_output=True, text=True, timeout=5)
@@ -8693,7 +8772,11 @@ def takserver_two_server_install_ssh_key():
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
     if not os.path.exists(pub_path):
-        return jsonify({'success': False, 'error': f'Public key not found at {pub_path}. Run "Setup SSH key" first.'}), 400
+        # Self-heal rather than send the operator back to a step that cannot help them:
+        # if the private key is here, derive its public half (uploaded .pem case).
+        _ok, _perr = _ensure_ssh_pubkey(key_path)
+        if not _ok:
+            return jsonify({'success': False, 'error': f'Public key not found at {pub_path} and could not be derived from {key_path}: {_perr}. Run "Setup SSH key" first.'}), 400
     if shutil.which('sshpass') is None:
         return jsonify({'success': False, 'error': 'sshpass not installed. Run: apt install sshpass (or use manual ssh-copy-id)'}), 400
     try:
@@ -11749,7 +11832,8 @@ def _conn_write_anchor_key(key_text):
         return False, 'Could not store key: %s' % str(e)[:160]
     try:
         r = subprocess.run(['ssh-keygen', '-y', '-f', _CONN_ANCHOR_KEY_PATH],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
     except Exception as e:
         try:
             os.remove(_CONN_ANCHOR_KEY_PATH)
@@ -25847,7 +25931,13 @@ def _register_module_remote_routes(module_name, settings_key, get_config_fn=None
             if kdir and not os.path.isdir(kdir):
                 os.makedirs(kdir, mode=0o700, exist_ok=True)
             subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', key_label],
-                           capture_output=True, text=True, timeout=30, check=True)
+                           capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, check=True)
+        else:
+            # Private key already here but possibly no .pub (operator-supplied key): derive it,
+            # otherwise this returns success with an empty public_key and install-ssh-key below
+            # refuses with "No public key found. Generate one first." -- an unescapable loop.
+            _ensure_ssh_pubkey(kp)
         fp = ''
         try:
             r = subprocess.run(['ssh-keygen', '-l', '-f', pub], capture_output=True, text=True, timeout=5)
@@ -32499,7 +32589,7 @@ def _takportal_setup_ssh(log_fn=None):
         if not os.path.exists(priv_key):
             r = subprocess.run(
                 ['ssh-keygen', '-t', 'ed25519', '-f', priv_key, '-N', '', '-C', 'tak-portal-auto'],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
             if r.returncode != 0 or not os.path.exists(pub_key):
                 if log_fn:
                     log_fn(f"  ✗ SSH keygen failed: {(r.stderr or '').strip()[:200]}")
@@ -35608,7 +35698,18 @@ def cloudtak_remote_ensure_ssh_key():
     key_path = (rcfg.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/infra-tak-cloudtak')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
-    if os.path.exists(key_path) and os.path.exists(pub_path):
+    if os.path.exists(key_path):
+        # Derive a missing .pub instead of falling through to ssh-keygen over an existing
+        # private key (interactive "Overwrite (y/n)?" on a non-TTY stdin). Same trap as the
+        # TAK two-server path -- see _ensure_ssh_pubkey.
+        _derived = not os.path.exists(pub_path)
+        _pub_ok, _pub_err = _ensure_ssh_pubkey(key_path)
+        if not _pub_ok:
+            return jsonify({
+                'success': False,
+                'error': f'A private key already exists at {key_path}, but its public half '
+                         f'could not be derived: {_pub_err}',
+            }), 400
         try:
             fr = subprocess.run(['ssh-keygen', '-l', '-f', pub_path], capture_output=True, text=True, timeout=5)
             fingerprint = (fr.stdout or '').strip() if fr.returncode == 0 else ''
@@ -35626,7 +35727,7 @@ def cloudtak_remote_ensure_ssh_key():
         save_settings(settings)
         return jsonify({
             'success': True,
-            'message': 'Key already exists',
+            'message': 'Public key derived from your existing private key' if _derived else 'Key already exists',
             'key_path': key_path,
             'public_key_path': pub_path,
             'public_key': public_key,
@@ -35642,7 +35743,7 @@ def cloudtak_remote_ensure_ssh_key():
     try:
         subprocess.run(
             ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path, '-C', 'infra-tak-cloudtak-remote'],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, check=True,
         )
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': (e.stderr or e.stdout or str(e))[:400]}), 400
@@ -35696,7 +35797,9 @@ def cloudtak_remote_install_ssh_key():
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
     if not os.path.exists(pub_path):
-        return jsonify({'success': False, 'error': f'Public key not found at {pub_path}. Click "Generate SSH key" first.'}), 400
+        _ok, _perr = _ensure_ssh_pubkey(key_path)
+        if not _ok:
+            return jsonify({'success': False, 'error': f'Public key not found at {pub_path} and could not be derived from {key_path}: {_perr}. Click "Generate SSH key" first.'}), 400
     if shutil.which('sshpass') is None:
         return jsonify({'success': False, 'error': 'sshpass is not installed on infra-TAK host. Install it first (apt install sshpass).'}), 400
     try:
@@ -37661,6 +37764,60 @@ def _compose_cmd(remote_cfg=None):
     return None
 
 
+def _patch_cloudtak_minio_registry(cloudtak_dir=None):
+    """Repoint CloudTAK's minio image at quay.io. Returns True if a file changed.
+
+    **Why this exists (found by the v10.1.72 T&E, 2026-09-15).** `minio/minio` is no longer
+    anonymously pullable from Docker Hub:
+
+        pull access denied for minio/minio, repository does not exist or may require
+        'docker login'
+
+    — on CloudTAK's pinned tag AND on `:latest`, confirmed from two boxes on different networks.
+    CloudTAK's own `docker-compose.yml` pins that image for `cloudtak-store` (its S3-compatible
+    object store), so **a fresh CloudTAK deploy cannot obtain it**. Existing boxes are unaffected
+    because the image is already in their local cache, which is exactly why this stayed invisible:
+    it breaks only NEW installs. Same shape as the `postgres:15.1` bullseye break in GH #69.
+
+    **Why a registry swap is safe rather than a version change.** The quay.io copy at the SAME
+    tag is byte-identical to the Docker Hub image — verified by comparing image IDs, not by
+    trusting the tag:
+
+        quay.io    sha256:6f23072e3e222e64fe6f86b31a7f7aca971e5129e55cbccef649b109b8e651a1
+        docker.io  sha256:6f23072e3e222e64fe6f86b31a7f7aca971e5129e55cbccef649b109b8e651a1
+
+    Same Id, same Created timestamp, and quay publishes both linux/amd64 and linux/arm64 for it,
+    so the ARM path is covered too.
+
+    The pin lives in CloudTAK's file, not ours, so this is patch-the-upstream-file work — the
+    same treatment `_patch_cloudtak_compose_ports()` and the TAK bundle Dockerfile already get.
+    The TAG is deliberately preserved, so a future CloudTAK version bump still works and we are
+    not silently freezing anyone on an old minio.
+    """
+    import re as _re
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    changed = False
+    # Idempotent: an image already qualified with a registry host (quay.io/..., ghcr.io/...)
+    # is left alone — only the bare `minio/minio` and the explicit `docker.io/` form match.
+    _pat = _re.compile(r'(^[ 	]*image:[ 	]*)(?:docker\.io/)?minio/minio:', _re.MULTILINE)
+    for _fname in ('compose.yaml', 'docker-compose.yml'):
+        _path = os.path.join(cloudtak_dir, _fname)
+        if not os.path.exists(_path):
+            continue
+        try:
+            with open(_path) as f:
+                _ct = f.read()
+            _new = _pat.sub(r'\g<1>quay.io/minio/minio:', _ct)
+            if _new != _ct:
+                with open(_path, 'w') as f:
+                    f.write(_new)
+                changed = True
+        except Exception:
+            continue
+    return changed
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -38450,6 +38607,9 @@ def run_cloudtak_deploy(cfg=None):
         # are no-ops. Previously only ran on console startup/update, not deploy — a box deployed long
         # after the last console restart (CORAZ) stayed broken until hand-fixed.
         try:
+            # minio/minio is no longer anonymously pullable from Docker Hub and the pin is in
+            # CloudTAK's own compose — repoint it before anything tries to pull.
+            _patch_cloudtak_minio_registry(cloudtak_dir)
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -38614,6 +38774,67 @@ def run_cloudtak_deploy(cfg=None):
         # Step 5: Start containers including media on remapped ports
         plog("")
         plog("━━━ Step 5/7: Starting Containers ━━━")
+        # v10.1.72 W1: pull the registry images as their own step before `up -d`.
+        # The pull runs BEFORE the stale-container sweep below, not after it. The
+        # sweep removes every cloudtak-* container, so on a redeploy the stack is
+        # down from that point until `up -d` returns — putting a download in that
+        # window would add its whole duration to the outage. Pull first, then tear
+        # down and start back-to-back exactly as before.
+        # This was the last deploy path without a pre-pull. `up -d` below is capped
+        # at 600 s, and on a cold box that budget had to cover the postgis + minio +
+        # media downloads AND container start; when it doesn't, compose is killed
+        # mid-pull and the deploy reports a failure on a box whose only problem is
+        # the link (same class as the Node-RED report fixed in v10.1.71). Splitting
+        # it out also streams progress, so a slow link and a stalled registry stop
+        # producing byte-identical logs.
+        #
+        # compose_yml=None on purpose: a bare `docker compose pull` in cloudtak_dir
+        # loads docker-compose.yml AND docker-compose.override.yml, exactly like the
+        # `up -d` below. The override re-pins media-infra (v9.7.0 on amd64) over the
+        # base file's v9.10.0, so an explicit `-f docker-compose.yml` would download
+        # a tag that never starts and skip the one that does.
+        #
+        # api/tiles/events/retention are built locally in Step 4 and carry no
+        # `image:` key, so compose skips them by itself ("Skipped - No image to be
+        # pulled") — verified on compose v5.5.0. They cost nothing here.
+        _pull_services = None  # None = the whole project
+        if _host_arch() == 'arm64':
+            # media-infra is built FROM SOURCE and tagged as the pinned ref a few
+            # steps above (_cloudtak_build_arm64_media) because dfpc-coe publishes
+            # no arm64 image. `up -d` leaves that local tag alone — compose's default
+            # pull_policy is 'missing' — but `compose pull` ALWAYS contacts the
+            # registry, and v9.1.1/v9.7.0 are single-arch amd64 manifests rather than
+            # multi-arch indexes, so the pull would succeed and overwrite the arm64
+            # build with an amd64 image. media would then crash-loop on "exec format
+            # error" — the exact failure that local build exists to prevent. Name the
+            # registry-only services instead of pulling the project.
+            _pull_services = ['postgis', 'store']
+        # ignore_failures: compose aborts every remaining pull on the first failure,
+        # so ONE unreachable image makes this step cache nothing and hand the whole
+        # download back to `up -d` — exactly the situation W1 exists to prevent. This
+        # is not hypothetical on CloudTAK's project: minio/minio is no longer
+        # anonymously pullable from Docker Hub (401 on the pinned tag AND on :latest,
+        # confirmed from two networks, so it is a gated repo rather than a rate limit),
+        # and a plain pull exits 1 with "postgis ... Interrupted" — postgis and
+        # media-infra both cache fine once failures are tolerated.
+        plog("  Pulling images CloudTAK does not build locally...")
+        plog("  On a cold box this is the long part of the deploy — progress is")
+        plog("  reported below, so a stalled pull looks different from a slow one.")
+        if _docker_compose_pull(None, cloudtak_dir, plog, timeout=1800,
+                                label='CloudTAK images', services=_pull_services,
+                                ignore_failures=True):
+            # Deliberately NOT "all images pulled". --ignore-pull-failures makes the
+            # exit code mean "the step ran", not "every image arrived"; any image that
+            # failed printed an Error line above. Claiming success here would be the
+            # same false-reassurance bug as a probe that never fires.
+            plog("  ✓ Pull step complete — any image that errored above is retried by `up -d`")
+        else:
+            # NON-FATAL by design. Every module's pre-pull is advisory: `up -d` pulls
+            # anything still missing on its own, so a pull that warns must not abort a
+            # deploy that would otherwise complete. This path already worked before the
+            # pre-pull existed and must keep working when the pull fails.
+            plog("  ⚠ Pull did not complete — continuing; `up -d` will fetch what is missing.")
+        plog("")
         # v10.1.13: unconditional pre-up sweep (field report pwtak/Josh — 4 consecutive
         # deploys failed at this step on "container name /cloudtak-media-1 already in
         # use"). A container left by a prior failed run doesn't carry the labels this
@@ -39313,6 +39534,7 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
         else:
             try:
+                _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
@@ -41681,7 +41903,10 @@ def nodered_uninstall():
         steps = []
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             remote = deploy_cfg.get('remote', {})
-            ok, out = _ssh_probe(remote, 'cd ~/node-red && docker compose down -v 2>&1; rm -rf ~/node-red 2>/dev/null; true', timeout=90)
+            # 300 s, not 90 — same reason as the local branch below: `down -v` has to
+            # stop the container and drop the named volume, and the old budget expired
+            # mid-teardown on a real box.
+            ok, out = _ssh_probe(remote, 'cd ~/node-red && docker compose down -v 2>&1; rm -rf ~/node-red 2>/dev/null; true', timeout=300)
             if not ok:
                 return jsonify({'error': f'Remote uninstall failed: {(out or "unknown error")[:200]}'}), 500
             steps.append('Stopped and removed Node-RED on remote host')
@@ -41692,9 +41917,54 @@ def nodered_uninstall():
             nr_dir = os.path.expanduser('~/node-red')
             compose = os.path.join(nr_dir, 'docker-compose.yml')
             if os.path.exists(compose):
-                subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'down', '-v']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
+                # `down -v` stops the container, removes it and drops the named volume.
+                # On a non-root box it routes through the broker, and the old 60 s budget
+                # expired mid-teardown — measured on nuc, 2026-09-13. The TimeoutExpired
+                # then escaped into this function's outer `except Exception` and the UI
+                # reported "Uninstall failed" on an uninstall that HAD removed both the
+                # container and the volume, while the rm -rf below never ran. The stale
+                # directory it left behind keeps _is_module_deployed() reporting Node-RED
+                # as installed, so the console disagreed with the box.
+                try:
+                    subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'down', '-v']),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300, cwd=nr_dir)
+                except subprocess.TimeoutExpired:
+                    steps.append('Teardown ran long — verified actual state instead of assuming failure')
+                # Never trust the exit path here: killing the compose CLI does not stop
+                # dockerd, so what matters is what is actually gone. Only refuse if the
+                # container survived — removing the compose file out from under a live
+                # container is what would strand it.
+                if _nodered_container_running():
+                    return jsonify({'error': 'Node-RED is still running after teardown — nothing was '
+                                             'removed. Retry the uninstall; if it persists, the Docker '
+                                             'daemon is not responding.'}), 500
+            # F2b/F2c (v10.1.72): everything above is gated on the compose file existing. With no
+            # compose file the teardown was skipped ENTIRELY, the directory was deleted, and the
+            # route still returned {"success": true, "steps": ["Node-RED container and data
+            # removed"]} — while the container kept running. Proven on dev-4, 2026-09-14.
+            #
+            # And the running-only guard above cannot close it: container names are unique across
+            # every state, so an EXITED `nodered` container still owns the name and still blocks
+            # the next `compose up -d` with a name conflict, while `docker ps` shows nothing.
+            # That is how a box ends up in a loop where uninstall claims success and deploy keeps
+            # failing — which is exactly the loop a user hit in the field.
+            #
+            # So: regardless of the compose file, if the name is still taken, remove it by name.
+            if _nodered_container_exists():
+                _rm = subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                                     capture_output=True, text=True, timeout=60)
+                if _nodered_container_exists():
+                    return jsonify({'error': 'A container named "nodered" could not be removed '
+                                             f'({(_rm.stderr or _rm.stdout or "").strip()[-200:]}). '
+                                             'Nothing was deleted. Retry; if it persists, the '
+                                             'Docker daemon is not responding.'}), 500
+                steps.append('Removed a leftover "nodered" container that was holding the name')
             if os.path.exists(nr_dir):
-                subprocess.run(f'rm -rf "{nr_dir}"', shell=True, capture_output=True, timeout=10)
+                # List argv, not shell=True: same broker routing via _sudo_wrap (the shim
+                # PATH intercepted the bare `rm` before), minus a shell interpolating a
+                # path into an `rm -rf`. Not attacker-controlled here, but it is not a
+                # construction worth leaving in the tree.
+                subprocess.run(_sudo_wrap(['rm', '-rf', nr_dir]), capture_output=True, timeout=30)
             steps.append('Node-RED container and data removed')
             deploy_cfg['deployed'] = False
             settings['nodered_deployment'] = _normalize_module_deployment_config(deploy_cfg)
@@ -44373,6 +44643,201 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         return False
 
 
+def _nodered_container_exists():
+    """True if a container named `nodered` exists in ANY state (running, exited, created).
+
+    Deliberately distinct from _nodered_container_running(), and the distinction IS the bug
+    (field report, Richard/AUS-NSW, 2026-09-14). Docker container names are unique across every
+    state, so an **exited** `nodered` container still owns the name and still makes
+    `docker compose up -d` fail with `Conflict. The container name "/nodered" is already in
+    use`. A running-only check sees nothing there, so the uninstall reported "Node-RED container
+    and data removed" while a dead container quietly held the name and blocked every later
+    deploy. Both halves reproduced on dev-4.
+
+    Use _nodered_container_running() for "is it live" (don't strand a working container);
+    use THIS for "is the name free" / "did the teardown actually remove it".
+    """
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=nodered', '--format', '{{.Names}}']),
+            capture_output=True, text=True, timeout=20)
+        return any(n.strip() == 'nodered' for n in (r.stdout or '').splitlines())
+    except Exception:
+        return False
+
+
+_COMPOSE_PROGRESS_RE = re.compile(
+    r'^\s*(?:Network|Volume|Container|Image|Service)?\s*\S*\s*'
+    r'(?:Creating|Created|Starting|Started|Running|Waiting|Pulling|Pulled|Removing|Removed'
+    r'|Stopping|Stopped|Recreate|Recreating|Recreated)\s*$'
+)
+
+
+def _compose_error_tail(out, limit=700):
+    """Return the ACTIONABLE part of a `docker compose` failure, not the progress ledger.
+
+    compose writes its progress ledger FIRST and the error LAST, and without a TTY it
+    re-renders each progress line — so the ledger is about twice as long as expected. Slicing
+    the HEAD of that (`[:300]`) shows nothing but "Network … Creating / Created" and cuts the
+    error off mid-sentence.
+
+    Not hypothetical: that is what v10.1.71 shipped at the Node-RED deploy's Step 3/4, and it
+    cost a full round trip with a user in Australia who had already waited seven minutes for a
+    pull — his log carried eight lines of network/volume progress and not one character of the
+    reason. `app.py:39997` had the right idiom (`[-300:]`) all along.
+
+    Drop the pure-progress lines, then return the TAIL of what is left. Falls back to the raw
+    tail when filtering leaves nothing, because showing something beats showing nothing.
+    """
+    text = (out or '').strip()
+    if not text:
+        return 'no output'
+    meaningful = [ln for ln in text.splitlines()
+                  if ln.strip() and not _COMPOSE_PROGRESS_RE.match(ln)]
+    body = '\n'.join(meaningful).strip() or text
+    return body[-limit:].strip()
+
+
+def _nodered_container_running():
+    """True if the nodered container is up. Used to keep a slow `up -d` from being
+    reported as a deploy failure when the container actually started."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}']),
+            capture_output=True, text=True, timeout=20)
+        return (r.stdout or '').strip().lower().startswith('up')
+    except Exception:
+        return False
+
+
+def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
+                         ignore_failures=False):
+    """`docker compose pull` as its own step, with streamed progress and a
+    generous timeout. Returns True on success, False on failure (never raises).
+
+    `compose_yml=None` means "let compose discover its own files in `cwd`", i.e.
+    exactly what a bare `docker compose up -d` in that directory would load —
+    base file PLUS `docker-compose.override.yml`. Pass None wherever the caller's
+    `up` is itself overrideless, or the pull and the start disagree about which
+    image is meant: CloudTAK's override re-pins media-infra (v9.7.0/v9.1.1) over
+    the base file's v9.10.0, so pulling with an explicit `-f docker-compose.yml`
+    would fetch a tag that never gets started and skip the one that does.
+
+    `services` restricts the pull to named services. Build-only services are
+    already skipped by compose itself ("Skipped - No image to be pulled"), so
+    this is not needed to avoid them; it is for services whose image is present
+    locally ON PURPOSE and must not be re-fetched from a registry.
+
+    `ignore_failures=True` adds `--ignore-pull-failures`. Compose pulls images
+    concurrently but aborts the whole run on the first failure — the others
+    report "Interrupted" and cache nothing. For a pre-pull whose only job is to
+    warm the cache that is the worst outcome: one unreachable image and the step
+    delivers zero benefit, leaving the entire download to `up -d` again. Measured
+    on a live box against CloudTAK's project: plain `pull` exits 1 with
+    `postgis ... Interrupted`, while `--ignore-pull-failures` exits 0 having
+    actually pulled postgis and media-infra. NOTE the cost — the exit code stops
+    distinguishing "all good" from "some failed", so a caller that passes this
+    must NOT report unqualified success. The per-image `Error` lines are streamed
+    either way (they match the terminal-state regex below), so the operator still
+    sees exactly which image failed. Default off: callers that treat a False
+    return as fatal (Node-RED) or report it verbatim (Authentik) depend on the
+    strict exit code.
+
+    Why the pull is split out of `up -d` (field report, Richard/AUS-NSW,
+    2026-09-13 — Node-RED deploy failed at "Step 2/3" with
+    "timed out after 120 seconds"):
+
+      * `docker compose up -d` pulls implicitly, so on a cold box the whole
+        download had to fit inside that one subprocess timeout.
+        nodered/node-red:4.0 is a 197 MB download over 17 layers, so 120 s
+        needs ~13 Mbit/s sustained from Docker Hub with nothing left over for
+        extraction (867 MB on disk) or container start. Below that the timeout
+        kills compose mid-pull and the deploy reports a failure on a box where
+        the only thing wrong is the link.
+      * Retrying was not a reliable way out. Docker keeps completed layers but
+        does NOT resume a partial one, and 120 MB of that image is a *single*
+        layer — 61% of the download in one blob. Under ~8 Mbit/s that layer
+        cannot finish inside a 120 s window, so every retry restarted it from
+        zero and the deploy could never converge, however many times the
+        operator clicked Deploy.
+      * The old path printed nothing at all for its whole 120 s, which made a
+        slow link and a blackholed/throttled registry produce byte-identical
+        logs. Streaming the pull is what makes those two distinguishable
+        without SSH.
+
+    Pulling via `docker compose ... pull` rather than `docker pull <image>`
+    on purpose: the image tag then comes from the compose file we just wrote, so
+    the pulled image and the started image cannot drift apart.
+    """
+    try:
+        _argv = ['docker', 'compose']
+        if compose_yml:
+            _argv += ['-f', compose_yml]
+        _argv.append('pull')
+        if ignore_failures:
+            _argv.append('--ignore-pull-failures')
+        if services:
+            _argv += list(services)
+        proc = subprocess.Popen(
+            _sudo_wrap(_argv),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            # stdin MUST be closed, not inherited. On a non-root box _sudo_wrap routes
+            # this through brokerctl, whose exec path does `if not sys.stdin.isatty():
+            # sys.stdin.buffer.read()` — an inherited, still-open stdin makes it block
+            # there forever and the pull never starts. Caught on nuc: identical code
+            # returned in 2 s as root and hung indefinitely through the broker.
+            stdin=subprocess.DEVNULL,
+            cwd=cwd, bufsize=1,
+            # Non-root boxes route this through the broker, which enforces its own
+            # exec cap (600 s default) — without this the broker kills the pull long
+            # before our own budget expires. Clamped daemon-side to MAX_TIMEOUT.
+            env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(timeout)},
+        )
+    except Exception as e:
+        plog(f"✗ Could not start the {label} pull: {str(e)[:150]}")
+        return False
+
+    tail = deque(maxlen=40)
+    last_emit = [0.0]
+
+    def _read_pull():
+        for line in iter(proc.stdout.readline, ''):
+            line = line.strip()
+            if not line:
+                continue
+            tail.append(line)
+            now = time.time()
+            # Always surface terminal/diagnostic states; heartbeat everything else
+            # so a 200 MB pull reports progress without flooding the deploy log
+            # with a per-layer progress tick every few hundred milliseconds.
+            if re.search(r'(Pulled|Error|error|denied|not found|rate limit|toomanyrequests)', line):
+                plog(f"  {line}")
+                last_emit[0] = now
+            elif now - last_emit[0] >= 10:
+                plog(f"  {line}")
+                last_emit[0] = now
+
+    reader = threading.Thread(target=_read_pull, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        _budget = f"{timeout // 60} minutes" if timeout >= 120 else f"{timeout} seconds"
+        plog(f"✗ Pulling the {label} exceeded {_budget} and was stopped.")
+        plog("  Layers that finished are cached — running Deploy again resumes from there")
+        plog("  rather than starting over, so a second run usually gets further.")
+        return False
+    reader.join(timeout=5)
+    if proc.returncode != 0:
+        plog(f"✗ Pulling the {label} failed (exit {proc.returncode}):")
+        for line in list(tail)[-8:]:
+            plog(f"    {line}")
+        return False
+    return True
+
+
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
     remote = deploy_cfg.get('remote', {})
@@ -44509,8 +44974,20 @@ volumes:
     plog("━━━ Docker log limits (remote) ━━━")
     _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
 
+    # Pull first, on its own generous budget. Same reason as the local path: the
+    # image is a ~200 MB download and folding it into `up -d`'s 120 s killed the
+    # deploy mid-pull on a slow link (see _docker_compose_pull).
+    plog("  Pulling the Node-RED image on remote (~200 MB — the long part on a slow link)...")
+    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose pull 2>&1', timeout=1800, log_fn=plog)
+    if not ok:
+        plog(f"✗ docker compose pull failed on remote: {(out or '')[:300]}")
+        plog("  Layers that finished are cached — running Deploy again resumes from there.")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("✓ Image present on remote")
+
     plog("  Starting Node-RED on remote...")
-    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=180, log_fn=plog)
     if not ok:
         plog(f"✗ docker compose up failed: {(out or '')[:300]}")
         nodered_deploy_status.update({'running': False, 'error': True})
@@ -44574,7 +45051,7 @@ def run_nodered_deploy():
         nr_dir = os.path.expanduser('~/node-red')
         os.makedirs(nr_dir, exist_ok=True)
         plog("")
-        plog("━━━ Step 1/3: Creating Docker Compose ━━━")
+        plog("━━━ Step 1/4: Creating Docker Compose ━━━")
         compose_yml = os.path.join(nr_dir, 'docker-compose.yml')
         settings_js = os.path.join(nr_dir, 'settings.js')
         env_file = os.path.join(nr_dir, '.env')
@@ -44694,15 +45171,62 @@ volumes:
 """)
         plog("✓ docker-compose.yml written (image pinned, hardening flags, scoped certs, host.docker.internal for CoT)")
         plog("")
-        plog("━━━ Step 2/3: Starting Node-RED ━━━")
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, cwd=nr_dir)
-        if r.returncode != 0:
-            plog(f"✗ docker compose up failed: {r.stderr or r.stdout or 'unknown'}")
+        plog("━━━ Step 2/4: Pulling the Node-RED image ━━━")
+        plog("  ~200 MB from Docker Hub. On a slow link this is the long part of the")
+        plog("  deploy — progress is reported below, so a stalled pull looks different")
+        plog("  from a slow one.")
+        if not _docker_compose_pull(compose_yml, nr_dir, plog, timeout=1800, label='Node-RED image'):
             nodered_deploy_status.update({'running': False, 'error': True})
             return
+        plog("✓ Image present locally")
+        plog("")
+        plog("━━━ Step 3/4: Starting Node-RED ━━━")
+        # The image is local by now, so this is create+start only. The timeout is
+        # still caught rather than left to escape into the outer handler: a bare
+        # TimeoutExpired here reports "✗ Error: Command ... timed out" on a box
+        # where the container may be running perfectly well, and skips every step
+        # after it — the exact failure v10.1.50 fixed one step further down.
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
+            _up_rc, _up_out = r.returncode, (r.stdout or '')
+        except subprocess.TimeoutExpired:
+            _up_rc, _up_out = None, ''
+            plog("  ⚠ `docker compose up -d` did not return within 3 minutes — checking whether")
+            plog("    the container came up anyway before calling this a failure.")
+        # F2a (v10.1.72): a leftover container holding the fixed `container_name: nodered`
+        # makes compose fail instantly with a name conflict — and because container names are
+        # unique across EVERY state, an *exited* leftover does it just as effectively as a
+        # running one. This is a self-heal on the failure path only: the normal deploy is
+        # untouched, so a working box cannot regress through this branch.
+        if _up_rc != 0 and 'already in use' in (_up_out or '') and _nodered_container_exists():
+            plog("  A leftover 'nodered' container is holding the name and blocking the start.")
+            plog("  Removing it and retrying — the named volume is NOT touched, so Configurator")
+            plog("  configs survive (they live in node_red_data, not in the container).")
+            try:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                               capture_output=True, text=True, timeout=60)
+                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    timeout=180, cwd=nr_dir)
+                _up_rc, _up_out = r2.returncode, (r2.stdout or '')
+                if _up_rc == 0:
+                    plog("  ✓ Leftover cleared — container started.")
+            except subprocess.TimeoutExpired:
+                plog("  ⚠ Retry after clearing the leftover did not return within 3 minutes.")
+            except Exception as _e_retry:
+                plog(f"  ⚠ Could not clear the leftover: {str(_e_retry)[:150]}")
+        if _up_rc != 0:
+            if not _nodered_container_running():
+                # F1 (v10.1.72): the TAIL, filtered. `[:300]` showed the operator 300 characters
+                # of "Network … Creating / Created" and cut the actual error off mid-sentence —
+                # see _compose_error_tail().
+                plog(f"✗ docker compose up failed: {_compose_error_tail(_up_out or 'timed out')}")
+                nodered_deploy_status.update({'running': False, 'error': True})
+                return
+            plog("  ✓ Container is running — continuing.")
         plog("✓ Node-RED container started")
         plog("")
-        plog("━━━ Step 2b: Merge infra-TAK flows + TLS (same as post-update) ━━━")
+        plog("━━━ Step 3b: Merge infra-TAK flows + TLS (same as post-update) ━━━")
         _deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
         if os.path.isfile(_deploy_sh):
             try:
@@ -44737,7 +45261,7 @@ volumes:
         else:
             plog("  (no nodered/deploy.sh in repo — skip)")
         plog("")
-        plog("━━━ Step 3/3: Updating Caddy ━━━")
+        plog("━━━ Step 4/4: Updating Caddy ━━━")
         # v10.1.50: Node-RED is ALREADY RUNNING by the time we get here. Everything below
         # is edge/SSO wiring, and none of it may be allowed to report the deploy as failed
         # or — worse — to skip the step after it.
@@ -46159,8 +46683,12 @@ import re as _re
 safe = key.replace("'", "''")
 if "AUTHENTIK_TOKEN: placeholder" in content:
     content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
-elif _re.search(r"AUTHENTIK_TOKEN: '.*'", content):
-    content = _re.sub(r"AUTHENTIK_TOKEN: '.*'", "AUTHENTIK_TOKEN: '" + safe + "'", content)
+elif _re.search(r"(?m)^[ \t]+AUTHENTIK_TOKEN:[ \t]*.+$", content):
+    # v10.1.76: the old pattern matched only a QUOTED token, but the deploy path
+    # writes them UNQUOTED \u2014 so a stale unquoted token slipped through both
+    # branches and fell to the "no AUTHENTIK_TOKEN line" error below.
+    content = _re.sub(r"(?m)^([ \t]+)AUTHENTIK_TOKEN:[ \t]*.+$",
+                      lambda m: m.group(1) + "AUTHENTIK_TOKEN: '" + safe + "'", content)
 else:
     print("ERROR: docker-compose.yml has no AUTHENTIK_TOKEN line to patch", file=sys.stderr)
     sys.exit(6)
@@ -46200,59 +46728,15 @@ def authentik_fix_ldap_token():
             return jsonify({'success': True, 'message': 'LDAP token injected and container recreated. LDAP may take 30–60s to show healthy.'})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
-    # Local: same logic as deploy token injection
-    ak_dir = os.path.expanduser('~/authentik')
-    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if not os.path.isfile(compose_path):
-        return jsonify({'success': False, 'error': 'docker-compose.yml not found'}), 400
-    ak_url = 'http://127.0.0.1:9090'
-    try:
-        env_path = os.path.join(ak_dir, '.env')
-        bootstrap_token = None
-        if os.path.isfile(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                        bootstrap_token = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
-                        break
-                    if line.strip().startswith('AUTHENTIK_TOKEN=') and bootstrap_token is None:
-                        bootstrap_token = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
-        if not bootstrap_token:
-            return jsonify({'success': False, 'error': 'No AUTHENTIK_BOOTSTRAP_TOKEN in .env'}), 400
-        headers = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
-        req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP', headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            results = json.loads(resp.read().decode()).get('results', [])
-        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-        if not ldap_outpost:
-            return jsonify({'success': False, 'error': 'LDAP outpost not found'}), 400
-        outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-        if not outpost_token_id:
-            req2 = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=headers)
-            with urllib.request.urlopen(req2, timeout=10) as r2:
-                detail = json.loads(r2.read().decode())
-            outpost_token_id = detail.get('token_identifier') or detail.get('token')
-        if not outpost_token_id:
-            return jsonify({'success': False, 'error': 'No token_identifier on outpost'}), 400
-        req3 = urllib.request.Request(f'{ak_url}/api/v3/core/tokens/{outpost_token_id}/view_key/', headers=headers, method='GET')
-        with urllib.request.urlopen(req3, timeout=10) as r3:
-            ldap_token_key = json.loads(r3.read().decode()).get('key', '')
-        if not ldap_token_key:
-            return jsonify({'success': False, 'error': 'No key from view_key'}), 400
-        with open(compose_path, 'r') as f:
-            compose_text = f.read()
-        if 'AUTHENTIK_TOKEN: placeholder' not in compose_text:
-            return jsonify({'success': False, 'error': 'Compose already has token or no placeholder'}), 400
-        compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
-        with open(compose_path, 'w') as f:
-            f.write(compose_text)
-        subprocess.run('cd {} && docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap'.format(ak_dir), shell=True, capture_output=True, timeout=90)
-        return jsonify({'success': True, 'message': 'LDAP token injected and container recreated. LDAP may take 30–60s to show healthy.'})
-    except urllib.error.HTTPError as e:
-        return jsonify({'success': False, 'error': 'API {}: {}'.format(e.code, e.read().decode()[:200])}), 500
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]}), 500
-
+    # Local: v10.1.76 — goes through the SAME helper the watchdog uses, so the
+    # manual button and the automatic repair cannot drift apart. The old inline
+    # copy refused unless compose still held the literal string 'placeholder',
+    # so a STALE token (the actual field case) had no repair path at all.
+    ok, msg = _repair_ldap_outpost_token(plog_fn=lambda m: None)
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True,
+                    'message': msg + '. LDAP may take 30–60s to show healthy.'})
 
 @app.route('/api/authentik/compose-heal', methods=['POST'])
 @login_required
@@ -48324,8 +48808,12 @@ networks:
             plog("  ⚠ LDAP outpost not found after 5 min — token injection skipped")
     if ldap_token_key:
         try:
-            safe_key = ldap_token_key.replace("'", "''")
-            patched_compose = compose_content.replace('AUTHENTIK_TOKEN: placeholder', f"AUTHENTIK_TOKEN: '{safe_key}'")
+            # v10.1.76: replace whatever token is there, not only the literal
+            # 'placeholder' — see _set_ldap_outpost_token_in_compose.
+            patched_compose, _rtok_changed, _rtok_detail = \
+                _set_ldap_outpost_token_in_compose(compose_content, ldap_token_key)
+            if not _rtok_changed:
+                plog(f"  ℹ LDAP token unchanged on remote ({_rtok_detail})")
             with open('/tmp/authentik_remote_compose.yml', 'w') as f:
                 f.write(patched_compose)
             ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -55155,6 +55643,46 @@ def _takportal_admin_guardrail(plog_fn=None):
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
 
+# v10.1.75 fleet constants (CLAUDE.md fleet-uniform rule — no operator knob, no
+# per-customer tier): after this many consecutive FAILED heals the SA-bind
+# watchdog stops re-running the heal on every 5-minute tick and retries on this
+# interval instead. Each heal force-recreates authentik-ldap-1, so an unhealable
+# cause used to churn the LDAP outpost every 5 minutes indefinitely.
+LDAP_SA_HEAL_BACKOFF_AFTER = 3
+LDAP_SA_HEAL_BACKOFF_SECS = 3600
+
+# How long a just-applied ldap-authentication-flow policy repair suppresses the
+# "heal INCOMPLETE" alarm. Authentik caches flow plans and policy results for
+# 600s (cache.timeout_flows / cache.timeout_policies — confirmed with
+# `ak dump_config` on test6, 2026-09-15), so the bind does NOT recover the moment
+# the binding is corrected: measured 2.7 min and 6.1 min on two runs. Without
+# this grace the watchdog reports a hard failure, and burns backoff strikes, on a
+# repair that is working — and could back off to hourly right as it recovers.
+LDAP_SA_POLICY_REPAIR_GRACE_SECS = 900
+
+
+def _record_ldap_sa_heal_failure(msg):
+    """v10.1.75: persist a FAILED heal.
+
+    `authentik_ldap_sa_repair_count` only ever incremented on SUCCESS, so the
+    counter whose stated purpose was to let operators "grep for repeated-repair
+    patterns" was blind to the one case that actually matters: a heal that runs
+    every 5 minutes and never works. Also drives the watchdog's backoff.
+    """
+    try:
+        _s = load_settings()
+        _n = int(_s.get('authentik_ldap_sa_heal_failures') or 0) + 1
+        from datetime import datetime as _dt
+        _s['authentik_ldap_sa_heal_failures'] = _n
+        _s['authentik_ldap_sa_heal_last_error'] = (msg or '')[:400]
+        _s['authentik_ldap_sa_heal_last_failure'] = _dt.utcnow().isoformat() + 'Z'
+        if _n >= LDAP_SA_HEAL_BACKOFF_AFTER:
+            _s['authentik_ldap_sa_heal_next_attempt'] = time.time() + LDAP_SA_HEAL_BACKOFF_SECS
+        save_settings(_s)
+    except Exception:
+        pass
+
+
 def _authentik_ldap_sa_bind_watchdog_loop():
     """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
     LDAP SA bind verification + webadmin admin-role drift heal.
@@ -55223,36 +55751,108 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             _role_healed = False
 
             if _verdict == 'fail':
-                print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
-                try:
-                    _ok, _msg = _ensure_authentik_ldap_service_account()
-                    if _ok:
-                        print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
-                        _sa_healed = True
+                # v10.1.75 backoff. Every heal calls `docker compose up -d
+                # --force-recreate ldap`, so a cause the heal cannot repair used to
+                # destroy and rebuild authentik-ldap-1 every 5 minutes, forever — the
+                # same harm v10.1.35 removed the LDAP-49 auto-flush for (one recreate
+                # dropped a live EUD session on test8, 2026-08-14). The customer sees
+                # it as "authentik-ldap-1 is sometimes red" (mg1921, v10.1.74-alpha).
+                _heal_fails = int(_settings.get('authentik_ldap_sa_heal_failures') or 0)
+                _next_try = float(_settings.get('authentik_ldap_sa_heal_next_attempt') or 0)
+                if _heal_fails >= LDAP_SA_HEAL_BACKOFF_AFTER and _wt.time() < _next_try:
+                    print(f"[ldap-sa-watchdog] adm_ldapservice bind still failing — "
+                          f"{_heal_fails} consecutive failed heals, holding off "
+                          f"{int(_next_try - _wt.time())}s before the next attempt "
+                          f"(LDAP outpost left alone meanwhile). Last cause: "
+                          f"{(_settings.get('authentik_ldap_sa_heal_last_error') or 'unknown')[:200]}",
+                          flush=True)
+                elif _ldap_outpost_token_rejected():
+                    # v10.1.76: identify the CAUSE before picking a repair. A 403'd
+                    # outpost never loads its provider config, so every bind fails and
+                    # neither of the other repairs can possibly help — they reset a
+                    # password that was never wrong and rebuild the outpost onto the
+                    # same dead token, every 5 minutes, forever. That is exactly what
+                    # v10.1.75 did on mg1921's box while reporting the policy bindings
+                    # were fine (they were).
+                    print("[ldap-sa-watchdog] LDAP outpost REFUSED by the Authentik API "
+                          "(403 Token invalid/expired) — repairing the outpost token, "
+                          "not the service-account password", flush=True)
+                    try:
+                        _tok_ok, _tok_msg = _repair_ldap_outpost_token(
+                            plog_fn=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True))
+                    except Exception as _te:
+                        _tok_ok, _tok_msg = False, str(_te)[:160]
+                    if _tok_ok:
+                        print(f"[ldap-sa-watchdog] {_tok_msg} — re-verifying next tick", flush=True)
                         try:
-                            _s2 = load_settings()
-                            from datetime import datetime as _dt_now
-                            _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
-                            _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
-                            save_settings(_s2)
-                        except Exception:
-                            pass
-                        # Belt + braces — also resync CoreConfig credential while we
-                        # know the env_pass is authoritative.
-                        try:
-                            _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
-                            if _cc_changed:
-                                print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
+                            _s4 = load_settings()
+                            _s4['authentik_ldap_sa_heal_failures'] = 0
+                            _s4['authentik_ldap_sa_heal_next_attempt'] = 0
+                            save_settings(_s4)
                         except Exception:
                             pass
                     else:
-                        print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
-                except Exception as _se:
-                    print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+                        print(f"[ldap-sa-watchdog] LDAP outpost token repair FAILED: {_tok_msg}", flush=True)
+                        _record_ldap_sa_heal_failure(f'outpost token repair failed: {_tok_msg}')
+                else:
+                    print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
+                    try:
+                        _ok, _msg = _ensure_authentik_ldap_service_account()
+                        if _ok:
+                            print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
+                            _sa_healed = True
+                            try:
+                                _s2 = load_settings()
+                                from datetime import datetime as _dt_now
+                                _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                                _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
+                                _s2['authentik_ldap_sa_heal_failures'] = 0
+                                _s2['authentik_ldap_sa_heal_next_attempt'] = 0
+                                _s2['authentik_ldap_sa_heal_last_error'] = ''
+                                _s2['authentik_ldap_sa_policy_repair_at'] = 0
+                                save_settings(_s2)
+                            except Exception:
+                                pass
+                            # Belt + braces — also resync CoreConfig credential while we
+                            # know the env_pass is authoritative.
+                            try:
+                                _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
+                                if _cc_changed:
+                                    print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
+                            except Exception:
+                                pass
+                        else:
+                            # Re-read settings: the repair marker is written by the heal
+                            # we just called, so the tick-start copy is stale.
+                            try:
+                                _pr_at = float(load_settings().get('authentik_ldap_sa_policy_repair_at') or 0)
+                            except Exception:
+                                _pr_at = 0
+                            if _wt.time() - _pr_at < LDAP_SA_POLICY_REPAIR_GRACE_SECS:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice recovery PENDING: {_msg}", flush=True)
+                            else:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
+                                _record_ldap_sa_heal_failure(_msg)
+                    except Exception as _se:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+                        _record_ldap_sa_heal_failure(f'heal error: {str(_se)[:160]}')
             elif _verdict == 'inconclusive':
                 # Don't take action — could be transient (outpost restarting after
                 # operator-driven sync). The next tick will reassess.
                 pass
+
+            if _verdict == 'ok' and int(_settings.get('authentik_ldap_sa_heal_failures') or 0):
+                # Bind recovered — by our own heal, an operator Resync, or a console
+                # restart running _startup_fix_reputation_policy_drift. Clear the
+                # backoff so the next genuine drift gets an immediate heal again.
+                try:
+                    _s3 = load_settings()
+                    _s3['authentik_ldap_sa_heal_failures'] = 0
+                    _s3['authentik_ldap_sa_heal_next_attempt'] = 0
+                    save_settings(_s3)
+                    print("[ldap-sa-watchdog] SA bind recovered — heal backoff cleared", flush=True)
+                except Exception:
+                    pass
 
             try:
                 _role_healed = _authentik_webadmin_role_check_and_heal(
@@ -57315,12 +57915,21 @@ entries:
                     plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
         except Exception as e:
             plog(f"  \u26a0 Swap setup skipped: {e}")
+        # v10.1.72 W2a: same pull, but streamed. The Authentik stack is the largest
+        # download infra-TAK ships (server 309 MB + postgres 111 MB + ldap 65 MB +
+        # redis 36 MB + pgbouncer 7 MB on disk), and the old form printed this one
+        # line and then NOTHING for up to 600 s — so a slow link and a blackholed
+        # registry produced byte-identical logs, which is the wall that made the
+        # v10.1.71 Node-RED field report necessary. Budget is unchanged at 600 s.
+        # compose_yml=None keeps compose's own file discovery in ak_dir, exactly
+        # what the bare `docker compose pull` here did before.
         plog("  Pulling images (this may take a few minutes)...")
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'pull']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
-        if r.returncode != 0:
-            plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-        else:
+        if _docker_compose_pull(None, ak_dir, plog, timeout=600, label='Authentik images'):
             plog("  \u2713 Images pulled")
+        else:
+            # Still non-fatal, exactly as before: the deploy continues to `up -d`,
+            # which fetches anything the pull did not get.
+            plog("  \u26a0 Pull had issues \u2014 continuing; `up -d` will fetch what is missing.")
         plog("  Starting PostgreSQL...")
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         if r.returncode != 0:
@@ -57784,10 +58393,18 @@ entries:
                                         if ldap_token_key:
                                             with open(compose_path, 'r') as f:
                                                 compose_text = f.read()
-                                            compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
-                                            with open(compose_path, 'w') as f:
-                                                f.write(compose_text)
-                                            plog(f"  ✓ LDAP outpost token injected into docker-compose.yml")
+                                            compose_text, _tok_changed, _tok_detail = \
+                                                _set_ldap_outpost_token_in_compose(compose_text, ldap_token_key, quote=False)
+                                            # v10.1.76: report the TRUTH. This used to str.replace a literal
+                                            # 'placeholder' and log success unconditionally — a no-op on any box
+                                            # whose token had rotated, which then rebuilt the outpost onto the
+                                            # same dead token and reported it as done.
+                                            if _tok_changed:
+                                                with open(compose_path, 'w') as f:
+                                                    f.write(compose_text)
+                                                plog(f"  ✓ LDAP outpost token injected into docker-compose.yml ({_tok_detail})")
+                                            else:
+                                                plog(f"  ℹ LDAP outpost token unchanged ({_tok_detail})")
                                             plog(f"  Recreating LDAP container with new token...")
                                             _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
                                             plog(f"  ✓ LDAP container recreated with injected token")
@@ -59330,6 +59947,214 @@ def _ensure_ldap_flow_authentication_none():
     time.sleep(5)
     return True, None
 
+_LDAP_TOKEN_LINE_RE = re.compile(r'^(?P<indent>[ \t]+)AUTHENTIK_TOKEN:[ \t]*(?P<val>.*?)[ \t]*$')
+
+
+def _set_ldap_outpost_token_in_compose(compose_text, token, quote=True):
+    """v10.1.76: write the LDAP outpost's API token into docker-compose.yml,
+    replacing WHATEVER value is there now.
+
+    Every injection site used to do
+
+        compose_text.replace('AUTHENTIK_TOKEN: placeholder', ...)
+
+    which is a SILENT NO-OP the moment compose holds any real-looking value —
+    `str.replace` on a non-matching needle returns the original string. The
+    caller then logged "\u2713 LDAP outpost token injected" and recreated the
+    container with the same dead token. So a token that had been revoked or
+    rotated in Authentik (an outpost recreated by a blueprint reconcile, say)
+    could never be repaired by anything we ship: the outpost sits on
+    `403 Forbidden (Token invalid/expired)`, never loads its provider config,
+    and EVERY LDAP bind fails \u2014 while the console reports success.
+    Field report: mg1921, v10.1.75-alpha, 2026-09-16.
+
+    Scoped to the `ldap:` service block so it can never touch another service's
+    token. Returns (new_text, changed, detail) \u2014 `changed` is the truth the
+    callers must log, instead of asserting success unconditionally.
+    """
+    if not token:
+        return compose_text, False, 'no token supplied'
+    lines = compose_text.splitlines(keepends=True)
+    start = end = None
+    for i, ln in enumerate(lines):
+        if start is None:
+            if re.match(r'^  ldap:\s*$', ln):
+                start = i
+            continue
+        if re.match(r'^  \S', ln):
+            end = i
+            break
+    if start is None:
+        return compose_text, False, 'no ldap service block in compose'
+    if end is None:
+        end = len(lines)
+    new_val = ("'" + str(token).replace("'", "''") + "'") if quote else str(token)
+    for i in range(start, end):
+        _raw = lines[i].rstrip('\n').rstrip('\r')
+        m = _LDAP_TOKEN_LINE_RE.match(_raw)
+        if not m:
+            continue
+        old = (m.group('val') or '').strip()
+        if old.strip('\'"') == str(token):
+            return compose_text, False, 'token already current'
+        _nl = '\n' if lines[i].endswith('\n') else ''
+        lines[i] = f"{m.group('indent')}AUTHENTIK_TOKEN: {new_val}{_nl}"
+        _shown = old.strip('\'"')
+        _was = 'placeholder' if _shown == 'placeholder' else ((_shown[:8] + '\u2026') if _shown else '(empty)')
+        return ''.join(lines), True, f'replaced {_was}'
+    return compose_text, False, 'no AUTHENTIK_TOKEN line in the ldap service block'
+
+
+def _ldap_outpost_token_rejected(since='180s'):
+    """v10.1.76: is the LDAP outpost being REFUSED by the Authentik API?
+
+    Signature \u2014 field-confirmed on a customer box 2026-09-16 and reproduced on
+    test6 the same day:
+
+        {"error":"403 Forbidden  (Token invalid/expired)",
+         "event":"Failed to fetch outpost configuration, retrying in 3 seconds",
+         "logger":"authentik.outpost.ak-api-controller"}
+
+    An outpost in this state never loads its provider config, so every bind
+    fails no matter how correct the service-account password or the flow's
+    policy bindings are. The SA-bind watchdog used to see only "the bind
+    failed" and kept running two repairs that cannot possibly help \u2014 resetting a
+    password that was never wrong and rebuilding the outpost onto the same dead
+    token. Read-only; returns True ONLY on the explicit signature, never a guess.
+    """
+    try:
+        settings = load_settings()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+                                 f'docker logs authentik-ldap-1 --since {since} 2>&1', timeout=20)
+            log = (out or '') if ok else ''
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', since]),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+            log = r.stdout or ''
+    except Exception:
+        return False
+    low = log.lower()
+    return ('failed to fetch outpost configuration' in low
+            and ('token invalid' in low or '403 forbidden' in low))
+
+
+def _repair_ldap_outpost_token(plog_fn=None):
+    """v10.1.76: re-read the LDAP outpost's real token from Authentik, write it
+    into docker-compose.yml, and recreate the outpost container.
+
+    Shared by the operator's "Fix LDAP token" button and the SA-bind watchdog so
+    the manual and automatic paths cannot drift apart. Local installs only \u2014 a
+    remote Authentik is repaired by _AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT, and this
+    says so rather than pretending. Returns (ok, msg).
+    """
+    _log = plog_fn or (lambda m: None)
+    import urllib.request as _req
+    import urllib.error as _uerr
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+        return False, 'Authentik is remote \u2014 use the Fix LDAP token button (runs the remote repair script)'
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.isfile(compose_path):
+        return False, 'docker-compose.yml not found'
+    bootstrap = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not bootstrap:
+        return False, 'no AUTHENTIK_BOOTSTRAP_TOKEN in .env'
+    url = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {bootstrap}', 'Content-Type': 'application/json'}
+
+    def _get(path):
+        return json.loads(_req.urlopen(
+            _req.Request(f'{url}/api/v3/{path}', headers=headers), timeout=15).read().decode())
+
+    try:
+        results = _get('outposts/instances/?search=LDAP').get('results', [])
+        outpost = next((o for o in results
+                        if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+        if not outpost:
+            return False, 'LDAP outpost not found in Authentik'
+        tok_id = outpost.get('token_identifier') or outpost.get('token')
+        if not tok_id:
+            tok_id = (_get(f"outposts/instances/{outpost['pk']}/").get('token_identifier')
+                      or _get(f"outposts/instances/{outpost['pk']}/").get('token'))
+        if not tok_id:
+            return False, 'outpost has no token_identifier'
+        key = _get(f'core/tokens/{tok_id}/view_key/').get('key', '')
+        if not key:
+            return False, 'view_key returned no key'
+        with open(compose_path) as _f:
+            compose_text = _f.read()
+        new_text, changed, detail = _set_ldap_outpost_token_in_compose(compose_text, key)
+        if not changed:
+            return False, f'compose not updated ({detail})'
+        with open(compose_path, 'w') as _f:
+            _f.write(new_text)
+        _log(f'LDAP outpost token rewritten in compose ({detail})')
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']),
+                       cwd=ak_dir, capture_output=True, timeout=90)
+        return True, f'LDAP outpost token repaired ({detail}); container recreated'
+    except _uerr.HTTPError as e:
+        return False, f'Authentik API {e.code}'
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def _authentik_ldap_flow_policy_report():
+    """v10.1.75: name the policy bindings on ldap-authentication-flow.
+
+    When the SA bind is confirmed failing, the outpost logs
+    `"error":"Flow does not apply to current user."` and every bind returns LDAP
+    49 with the CORRECT password — some policy bound to that flow is denying it.
+    Until now the console only ever printed the category ("check
+    ldap-authentication-flow policy bindings") and left the operator, or the
+    customer, to go read `docker logs authentik-ldap-1` by hand. Worse: the
+    v0.9.12 drift migration only inspects bindings whose policy is
+    `infratak-brute-force`, so a denial from ANY other policy was invisible to us
+    by construction. Report every binding so the journal line names the culprit.
+
+    Returns a one-line summary, or '' when it can't be determined.
+    """
+    try:
+        import urllib.request as _req
+        settings = load_settings()
+        ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not ak_token:
+            return ''
+        url = _get_authentik_api_url(settings)
+        headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+        def _get(path):
+            return json.loads(_req.urlopen(
+                _req.Request(f'{url}/api/v3/{path}', headers=headers), timeout=10).read().decode())
+
+        flows = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
+        flow = next((f for f in flows if f.get('slug') == 'ldap-authentication-flow'), None)
+        if not flow:
+            return 'ldap-authentication-flow NOT FOUND'
+        # Authentik stores PolicyBinding.target as the flow's policybindingmodel_ptr_id,
+        # NOT the flow's own pk — querying by flow pk silently returns zero bindings.
+        # Same trap documented in _authentik_setup_reputation_policy.
+        target = flow.get('policybindingmodel_ptr_id') or flow.get('pk')
+        bindings = _get(f'policies/bindings/?target={target}').get('results', [])
+        if not bindings:
+            return 'ldap-authentication-flow has NO policy bindings (denial is not policy-bound)'
+        bits = []
+        for b in bindings:
+            _name = ((b.get('policy_obj') or {}).get('name')
+                     or (b.get('group_obj') or {}).get('name')
+                     or b.get('policy') or 'unknown')
+            bits.append(f"{_name}(negate={b.get('negate')}, enabled={b.get('enabled')}, "
+                        f"failure_result={b.get('failure_result')})")
+        return 'ldap-authentication-flow bindings: ' + '; '.join(bits)
+    except Exception as _e:
+        return f'policy-binding report unavailable ({str(_e)[:60]})'
+
+
 def _ensure_authentik_ldap_service_account():
     """Ensure adm_ldapservice exists, has password set, is in authentik Admins, and VERIFY the bind works.
     Runs before Connect TAK Server to LDAP so LDAP bind works regardless of deploy order."""
@@ -59414,14 +60239,60 @@ def _ensure_authentik_ldap_service_account():
                 return True, f'LDAP bind verified (attempt {attempt + 1})'
             last_verdict = v
         if last_verdict == 'fail':
-            # Confirmed failure after the API set_password — almost always means
-            # the reputation policy on ldap-authentication-flow is still denying
-            # the flow (FlowNonApplicableException). The v0.9.12 startup migration
-            # _startup_fix_reputation_policy_drift handles this; this call site
-            # may be running before that migration completed (e.g. during the
-            # console's first deploy on a fresh box). Operator next action:
-            # re-run deploy or trigger Update Now.
-            return False, 'LDAP bind confirmed failing after API password set — check ldap-authentication-flow policy bindings'
+            # Confirmed failure after the API set_password. The password is NOT the
+            # problem — we just wrote it and the outpost was recreated to pick it up.
+            # This is a policy denial on ldap-authentication-flow: the outpost logs
+            # "Flow does not apply to current user" (FlowNonApplicableException) and
+            # every bind returns 49. Reproduced on test6 2026-09-15 by flipping the
+            # reputation binding to negate=False; it walks this exact path.
+            #
+            # v10.1.75: REPAIR it instead of naming it. This used to return an error
+            # string telling the operator to "check ldap-authentication-flow policy
+            # bindings" while _startup_fix_reputation_policy_drift() — the function
+            # that fixes precisely that — sat in the same file and ran only at console
+            # boot. So the 5-minute watchdog rediscovered the same break every tick,
+            # force-recreated the LDAP outpost each time, and never once ran the
+            # repair. Field report: mg1921 on v10.1.74-alpha, LDAP dead all day
+            # between two 04:00 console restarts.
+            _rep_fixed = False
+            try:
+                _rep_fixed = bool(_startup_fix_reputation_policy_drift())
+            except Exception as _rep_e:
+                print(f"  LDAP SA: reputation-binding repair error: {str(_rep_e)[:120]}", flush=True)
+            if _rep_fixed:
+                for _ra in range(5):
+                    time.sleep(6)
+                    if _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass) == 'ok':
+                        return True, ('LDAP bind verified after repairing the '
+                                      f'ldap-authentication-flow policy binding (attempt {_ra + 1})')
+            # Name the live bindings either way, so the next field report does not
+            # depend on the customer reading docker logs on our behalf.
+            # v10.1.76: if the outpost cannot authenticate to the API at all, say so
+            # — the policy bindings are irrelevant in that state and reporting them
+            # sends the reader down the wrong path (it did, on 2026-09-16).
+            if _ldap_outpost_token_rejected():
+                return False, ('LDAP outpost is being REFUSED by the Authentik API '
+                               '(403 Token invalid/expired) — its token is stale, so it never '
+                               'loads its provider config and no bind can succeed. Fix LDAP token '
+                               'on the Authentik page repairs this; the watchdog also retries it.')
+            _report = _authentik_ldap_flow_policy_report()
+            if _rep_fixed:
+                # The repair landed; the bind just hasn't caught up (600s policy/flow
+                # cache — see LDAP_SA_POLICY_REPAIR_GRACE_SECS). Mark it so the
+                # watchdog reports "recovery pending" rather than a hard failure.
+                try:
+                    _sp = load_settings()
+                    _sp['authentik_ldap_sa_policy_repair_at'] = time.time()
+                    save_settings(_sp)
+                except Exception:
+                    pass
+                return False, ('ldap-authentication-flow policy binding REPAIRED; bind not back '
+                               'yet — Authentik caches policy/flow results for 600s, so recovery '
+                               'lags the fix by minutes. Re-verifying next tick'
+                               + (f' — {_report}' if _report else ''))
+            return False, ('LDAP bind confirmed failing after API password set, and no repairable '
+                           'policy-binding drift was found'
+                           + (f' — {_report}' if _report else ''))
         # Inconclusive across all attempts. _ensure_ldapsearch() ran above, so this
         # is usually NOT a missing client — it's the outpost being mid-recreate/spiral
         # while we probe (e.g. the webadmin-sync tail recreates the LDAP container right
@@ -73808,7 +74679,8 @@ def _startup_harden_cloudtak_ports():
                 os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
         except Exception:
             pass
-        _changed = _patch_cloudtak_compose_ports(_ct_dir)
+        _minio_repointed = _patch_cloudtak_minio_registry(_ct_dir)
+        _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
         _needs_recreate = _changed or _override_changed
@@ -78870,7 +79742,8 @@ def _post_update_auto_deploy():
                     # YAML tag to null, dropping ALL port bindings silently.
                     _base_patched = False
                     try:
-                        _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir)
+                        _minio_repointed = _patch_cloudtak_minio_registry(_cloudtak_dir)
+                        _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir) or _minio_repointed
                         if _base_patched:
                             print("  CloudTAK base compose: port bindings patched (loopback/removed)")
                     except Exception as _bpe:

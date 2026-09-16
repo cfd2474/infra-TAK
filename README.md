@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.70-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.70-alpha)**
+**Current release: [v10.1.76-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.76-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,96 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.76-alpha — 2026-09-16 — The console can finally repair a broken LDAP connection instead of reporting it fixed
+
+**Headline: if the credential the Authentik LDAP service uses to identify itself went stale, nothing in infra-TAK could replace it — while the console told you it had. Logins stayed broken with no way forward from the browser. This release makes that credential repairable, adds the button to fix it by hand, and lets the console fix it on its own.**
+
+**What was happening.** The component that answers TAK Server's user and group lookups holds its own credential for talking to Authentik. If that credential is replaced on the Authentik side, the copy infra-TAK keeps goes stale — and the component is then refused, never loads its settings, and every login fails no matter how correct anyone's password is.
+
+infra-TAK had code to write a fresh credential. It only ever worked the very first time, on a brand-new install: it looked for the specific word left in place before the first credential was written, and after that it silently matched nothing. It then reported **"token injected"** and rebuilt the component with the same dead credential. So the one operation meant to fix this always claimed success and never did anything.
+
+Two more gaps closed on top of it. The repair button existed, but only appeared if your Authentik ran on a separate machine — so the common setup, everything on one box, had no way to reach it. And nothing noticed the problem automatically: the health check that runs every five minutes saw only "logins are failing" and kept retrying two repairs that could not possibly help.
+
+**What changed.** The credential is now replaced whatever state it is in, and the console reports honestly when it changes nothing instead of claiming success. The **Fix LDAP token** button is available on every installation. And the five-minute health check now works out *which* fault it is looking at before choosing a repair — when it sees this one, it renews the credential itself. On our test machines a deliberately broken installation recovered on its own in **about twelve seconds**, with no one touching it.
+
+**Worth knowing:** if you are affected, updating is enough — the console repairs it without you doing anything. This is a different fault from the one fixed in v10.1.75, though it looked identical in the logs; if that release did not help you, this one should.
+
+### v10.1.75-alpha — 2026-09-15 — The console now fixes the LDAP fault it could only describe
+
+**Headline: if the login link between Authentik and TAK Server broke in one particular way, the console noticed every five minutes, tried to fix it by resetting a password that was never the problem, failed, and told you to go and check something it could have checked itself. It now repairs the real cause. If you have been watching the Authentik LDAP container flicker red every few minutes, that was this.**
+
+**What was happening.** Authentik decides whether to allow an LDAP login by running it through a set of rules. One of those rules can drift into a state where it quietly rejects *everyone* — including the service account TAK Server uses to look up users and groups. When that happens, every login is refused as "invalid credentials" even though the password is perfectly correct.
+
+The console has a watchdog that checks this connection every five minutes. It correctly spotted the breakage. But its only repair was to reset the service account's password, which was never what was wrong — so it failed, logged a message telling you to go and check the rules yourself, and tried the exact same thing again five minutes later. Forever.
+
+Two things made that worse. The repair rebuilt Authentik's LDAP container on every attempt, so on an affected machine that container was being torn down and recreated every five minutes — which is what you would see as it flickering red on the Authentik page, and which could interrupt connected devices. And the console *already contained* the code to fix the real cause; it just only ever ran when the console restarted. Since that happens once a day in the small hours, a fault that appeared just after it could leave logins broken for the best part of a day.
+
+**What changed.** The watchdog now performs the actual repair itself instead of describing it, and confirms with a real login attempt that it worked. If something it cannot repair is blocking the connection, it now names the specific rule responsible in the log rather than pointing you at a general area to search. And if it genuinely cannot fix something, it stops retrying every five minutes and backs off to hourly, leaving the LDAP container alone instead of rebuilding it endlessly.
+
+**Worth knowing:** recovery is not instant. Authentik remembers its access decisions for about ten minutes, so after the fault is repaired there is a short wait before logins start working again. The console understands this and will tell you it is waiting rather than reporting a failure. If you are affected right now, updating is enough — it repairs itself without you doing anything.
+
+### v10.1.74-alpha — 2026-09-15 — "Setup SSH key" no longer gets stuck on a question you cannot answer
+
+**Headline: if you gave infra-TAK your own SSH key — an AWS or Azure `.pem`, or a key you made yourself — the "Setup SSH key" button could stop with `Overwrite (y/n)?` and no way to answer it. The step after that then refused to run, leaving no way forward. Both are fixed.**
+
+**What was happening.** When you upload your own private key, infra-TAK checks it is valid by working out its matching public key — and then threw that public half away, saving only the private one. Later, "Setup SSH key" looked for both halves, found only one, and assumed it needed to make a new key from scratch. It then asked whether to overwrite the key you had just given it. That question is asked in a place nobody can see or reply to, so the step simply failed.
+
+It got worse from there: the next step, "Copy key to host", refuses to run without that missing public half — and tells you to go back and run "Setup SSH key" first. Which could not succeed. There was no way out of that loop from the browser.
+
+**What changed.** Uploading a key now keeps both halves, so the problem does not arise in the first place. And if you already have a key in this state, infra-TAK now works the missing public half out from the private key you gave it, instead of trying to replace your key — it will never overwrite a key you supplied. "Copy key to host" repairs the same thing on its own rather than sending you back a step. This applies everywhere the console sets up SSH keys: split-server TAK, CloudTAK, and the remote-host options for Node-RED, MediaMTX, Authentik, WebODM, TAK Portal and Federation Hub.
+
+**One related fix:** a password-protected private key used to make the upload sit for ten seconds and then report a timeout, instead of telling you the real problem. It now says straight away that the key has a passphrase and needs re-exporting without one.
+
+**Worth knowing:** the console still stores a single SSH key for a split-server database host. If you are moving your database to a new machine, launch it with the *same* key pair as the current one — support for a second, different key is on the roadmap. And the SSH user field is optional: it shows a greyed-out `root` as a placeholder, but any account with sudo works — on AWS, type `ubuntu`.
+
+### v10.1.73-alpha — 2026-09-15 — New CloudTAK installs work again
+
+**Headline: installing CloudTAK on a new machine had started failing, because one of the images it depends on was withdrawn from Docker Hub. Existing installs were never affected, which is exactly why this was hard to spot.**
+
+**What was happening.** CloudTAK uses MinIO for its internal file storage, and the image it asks for is no longer available from Docker Hub — it now refuses the download outright. Any machine that already had CloudTAK kept working perfectly, because the image was already stored locally and never needed fetching again. So the problem was invisible right up until someone built a new box, and then it failed every time.
+
+**This was not caused by an infra-TAK change**, and going back to an older version did not help — every version asks for the same image, and what changed was outside all of them. If you spent time rolling back, that is why it made no difference, and we are sorry for the detour.
+
+**What changed.** infra-TAK now points that image at a different registry that still carries it. It is the *same image* — we compared the underlying fingerprints rather than trusting the label, and they match exactly, on both Intel and ARM machines. The version is unchanged; only where it is fetched from is different. The correction is re-applied automatically after every install and update, so a future refresh cannot quietly undo it.
+
+Thanks to the people who reported this and diagnosed it independently — the fix is the one they identified.
+
+**Upgrade note.** Update from the console as usual. If a CloudTAK install has been failing for you, retry it after updating. Existing CloudTAK deployments need no action.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.73-alpha
+
+### v10.1.72-alpha — 2026-09-15 — An uninstall that says "done" has to actually be done
+
+**Headline: removing Node-RED could report success while leaving it in place — and the next install would then fail with an error message that hid its own cause. Both fixed, along with two improvements to how downloads are reported.**
+
+**The uninstall could claim success without removing anything.** If the compose file was already gone, the removal step was skipped entirely — yet the console still reported "Node-RED container and data removed" and deleted the folder. The container kept running. Nothing told you, because the console genuinely believed it had cleaned up.
+
+**A leftover then blocked the next install, invisibly.** Container names have to be unique, and a *stopped* container holds its name just as firmly as a running one. Our check only looked for running containers, so a stopped leftover was invisible to us while still blocking every new install. The deploy would fail instantly with a name conflict — and the error message showed the first part of the output, which is progress text, cutting the actual reason off mid-sentence. So the one line that explained the failure was the one line you could not see.
+
+Three changes. The uninstall now removes the container by name whether or not a compose file exists, and refuses to claim success if it cannot. The install clears a leftover by itself and retries, so a stuck box unsticks itself — your Configurator settings are never at risk, they live in a separate volume that none of this touches. And failure messages now show the *error* rather than the progress that preceded it.
+
+**Also: two deploys stop going quiet during downloads.** CloudTAK's install now downloads its images as a visible step rather than folding it into startup, and Authentik's download reports progress instead of printing one line and going silent for several minutes. Same reasoning as the v10.1.71 Node-RED fix: a slow connection and a stalled download should not look identical.
+
+**Upgrade note.** Update from the console as usual. If a Node-RED install has been failing after a removal, retry it — it should now clear the leftover on its own.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.72-alpha
+
+### v10.1.71-alpha — 2026-09-14 — A slow connection is not a broken install
+
+**Headline: deploying Node-RED could fail after exactly two minutes on a slower internet connection — and trying again could never fix it. Reported from Australia, and it would have affected anyone far from a fast link.**
+
+**Why it failed.** Deploying Node-RED downloads a ~200 MB program image. That download was given a two-minute budget shared with everything else the step had to do, which needs roughly 13 Mbit/s sustained just to break even. Under that, the download was cut off partway and the deploy reported an error — even though nothing was actually wrong with your server. The message said the command "timed out", which read like a fault on your machine rather than a limit we had set.
+
+**Why retrying did not help.** Downloads keep the pieces that finished, but a piece that was interrupted starts over from the beginning. Well over half of this image arrives as one single 120 MB piece. On a slower connection that piece cannot finish inside a two-minute window, so every retry threw it away and began again. The deploy could never succeed, no matter how many times you pressed the button.
+
+**What changed.** The download is now its own step with a thirty-minute budget, and it reports progress as it goes — so a slow connection looks like a slow connection instead of a silent two-minute wait ending in failure. If it does run out of time, the message now tells you that finished pieces are kept and that trying again picks up from there. Starting the program afterwards no longer reports failure when it actually worked.
+
+**Also fixed: uninstalling Node-RED could say it failed when it had succeeded.** The removal was given sixty seconds; when it took longer, you saw "Uninstall failed" even though the container and its data had been removed — and because the error stopped the process early, a leftover folder made the console keep listing Node-RED as installed. The console and your server disagreed, and anyone retrying found a half-removed install. Removal now gets the time it needs and reports based on what was actually removed, not on whether the command answered in time.
+
+**Upgrade note.** Update from the console as usual. If a Node-RED deploy has been failing for you, retry it after updating — and if you are on a slower link, expect the new download step to take a while and show progress while it does.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.71-alpha
 
 ### v10.1.70-alpha — 2026-09-13 — The safety nets stop hurting the operator
 
