@@ -273,12 +273,79 @@ def validate_store_size(requested_gb, free_bytes, in_use_bytes=0, already_reserv
     return requested, None
 
 
+#: How much of the image's apparent size must really be backed by blocks before
+#: the reservation counts as honoured. Measured on the box: a 2 GB image built
+#: correctly reports 2049 MiB of blocks against 2048 MiB apparent — slightly
+#: *over*, because of ext4's own structures — while a sparse one reported 66 MiB.
+#: The two cases are three orders of magnitude apart, so this only has to avoid
+#: tripping over rounding.
+STORE_RESERVED_FRACTION = 0.95
+
+
+def mkfs_argv(image, label='atlas-store'):
+    """The `mkfs.ext4` command for the store image.
+
+    ⚠️ **`-E nodiscard` is why this function exists (W213).** `mkfs` discards
+    its target by default, and on a regular file on ext4 a discard is
+    `FALLOC_FL_PUNCH_HOLE` — so it handed back every block the `fallocate`
+    above had just reserved and left the image sparse. The reservation reserved
+    nothing for its entire first release, while reporting that it had.
+
+    Measured on the box: 5 GB fallocated, then `mkfs.ext4` → 67 MiB of real
+    blocks; with `-E nodiscard` → 5121 MiB. Pure, so the flag can be asserted
+    without a disk — the absence of one is exactly why nothing caught this.
+
+    ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB store is
+    2 GB an operator asked for and cannot use. A dedicated data volume needs no
+    headroom to recover.
+    """
+    return ['mkfs.ext4', '-F', '-m', '0', '-E', 'nodiscard', '-L', label, image]
+
+
+def allocated_bytes(path):
+    """Bytes really backing `path`, or **None** when the platform cannot say.
+
+    ⚠️ None and 0 are different answers and callers must keep them apart: 0
+    means "measured, and nothing is allocated" — a sparse image — while None
+    means "no `st_blocks` here", which is Windows, where these tests run.
+    Treating None as 0 would make the repair below declare failure on a machine
+    that merely cannot see the answer.
+    """
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    blocks = getattr(st, 'st_blocks', None)
+    if blocks is None:
+        return None
+    return int(blocks) * 512
+
+
+def is_fully_reserved(apparent, allocated, fraction=STORE_RESERVED_FRACTION):
+    """Whether an image of `apparent` bytes really holds its blocks.
+
+    ⚠️ Unknown (`allocated is None`) is **not** reserved. A reservation that
+    cannot be demonstrated must not be reported as one — making that claim from
+    the apparent size is the bug this fixes.
+    """
+    if apparent <= 0 or allocated is None:
+        return False
+    return allocated >= apparent * fraction
+
+
 def store_facts(ctx=None):
     """What the console needs to draw the size field honestly.
 
     Every number here is measured, never estimated: `mkfs` overhead and ext4's
     root reserve both mean usable space is less than the image, and a predicted
     figure that is wrong is worse than a real one that arrives a moment later.
+
+    ⚠️ **`reserved_gb` used to be the apparent size, and that made this
+    docstring false (W213).** `st_size` on a sparse image is what it *claims*,
+    not what it holds, so the console reported "100 GB reserved" about a file
+    backed by roughly 2 GB — the one number on the page an operator cannot
+    check for themselves. `allocated_gb` is the measured truth and
+    `fully_reserved` says whether the two agree.
     """
     total, free = _disk_free(os.path.dirname(STORE_IMAGE))
     reserved = 0
@@ -287,6 +354,7 @@ def store_facts(ctx=None):
             reserved = os.stat(STORE_IMAGE).st_size
         except OSError:
             reserved = 0
+    allocated = allocated_bytes(STORE_IMAGE) if reserved else None
 
     usable = used = 0
     mount = _store_mount(ctx) if ctx is not None else None
@@ -302,6 +370,8 @@ def store_facts(ctx=None):
         'disk_total_gb': round(total / GIB, 1),
         'disk_free_gb': round(free / GIB, 1),
         'reserved_gb': round(reserved / GIB, 1) if reserved else 0,
+        'allocated_gb': round(allocated / GIB, 1) if allocated else 0,
+        'fully_reserved': is_fully_reserved(reserved, allocated),
         'usable_gb': round(usable / GIB, 1) if usable else 0,
         'used_gb': round(used / GIB, 1) if usable else 0,
         'max_gb': round(store_ceiling_bytes(free, reserved) / GIB, 1),
@@ -476,8 +546,7 @@ def ensure_store(ctx, size_bytes, plog):
         # store is 2 GB an operator asked for and cannot use. This is a
         # dedicated data volume, not a root filesystem that needs headroom to
         # recover, so the reserve buys nothing.
-        rc, out = _run_root(
-            ['mkfs.ext4', '-F', '-m', '0', '-L', 'atlas-store', image], timeout=900)
+        rc, out = _run_root(mkfs_argv(image), timeout=900)
         if rc != 0:
             return f'mkfs.ext4 failed: {out.strip()[:300]}'
         plog('  ✓ Filesystem created')
@@ -495,6 +564,15 @@ def ensure_store(ctx, size_bytes, plog):
         plog('  ✓ Filesystem grown')
     else:
         plog(f'  ✓ Store already reserved at {existing / GIB:.1f} GB')
+
+    # ⚠️ **Every store created before W213 is sparse**, because `mkfs` discarded
+    # the blocks `fallocate` had just reserved. So a present image of the right
+    # apparent size is not evidence of a reservation, and this runs on every
+    # deploy rather than only on creation — it is the repair path for existing
+    # boxes as much as a belt-and-braces check for new ones.
+    err = _reserve_blocks(size_bytes, plog)
+    if err:
+        return err
 
     if not os.path.ismount(mount):
         err = _write_mount_unit(image, mount, plog)
@@ -613,6 +691,45 @@ def remove_store(ctx, plog):
         pass
 
     return did, errs
+
+
+def _reserve_blocks(size_bytes, plog):
+    """Fill any holes in the image, so the reservation is one. Error, or None.
+
+    ⚠️ **Safe on a mounted store, and proven so before being written here.**
+    Measured on the box: a 2 GB sparse image holding a 64 MB random payload,
+    mounted; `fallocate` while mounted took it from 66 MiB of real blocks to
+    2049 MiB, the payload's md5 was unchanged, and `e2fsck -fn` came back clean.
+    Allocating a hole does not alter what the filesystem reads there — holes and
+    allocated-but-unwritten blocks both read as zeros — which is why this can
+    repair a live deployment instead of needing a maintenance window.
+
+    Idempotent: a store already holding its blocks is measured and left alone.
+    """
+    allocated = allocated_bytes(STORE_IMAGE)
+    if is_fully_reserved(size_bytes, allocated):
+        return None
+
+    if allocated is not None:
+        plog(f'  Reserving blocks: {allocated / GIB:.1f} of '
+             f'{size_bytes / GIB:.1f} GB are actually allocated...')
+    rc, out = _run_root(['fallocate', '-l', str(size_bytes), STORE_IMAGE],
+                        timeout=900)
+    if rc != 0:
+        return f'fallocate (reserving blocks) failed: {out.strip()[:300]}'
+
+    after = allocated_bytes(STORE_IMAGE)
+    if after is None:
+        # No `st_blocks` to check against. The fallocate succeeded, so say what
+        # is known rather than either failing or claiming success.
+        plog('  ✓ Blocks requested (this platform cannot measure allocation)')
+        return None
+    if not is_fully_reserved(size_bytes, after):
+        return (f'the store still holds only {after / GIB:.1f} GB of blocks '
+                f'after reserving {size_bytes / GIB:.1f} GB — the reservation '
+                f'would not actually hold the space')
+    plog(f'  ✓ {after / GIB:.1f} GB of blocks reserved')
+    return None
 
 
 def _bind_pg_volume(pgdir, plog):
