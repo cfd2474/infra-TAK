@@ -50,6 +50,35 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       ⏳ The first deploy clones the repository and builds images — allow 5–10 minutes.
     </p>
 
+    <!--
+      Reserved storage (W205).
+
+      ⚠️ The numbers are fetched, never rendered once. Free space changes as
+      other modules grow, and a ceiling baked into the page at load would offer
+      an operator space that has since gone — they would then be refused by a
+      validator quoting a different figure than the line above the box.
+    -->
+    <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
+      <label for="storeGb" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+        Reserved storage
+      </label>
+      <p class="note" id="storeHelp" style="margin:0 0 8px">Reading this box&hellip;</p>
+      <input type="number" id="storeGb" min="2" step="1" placeholder="e.g. 40"
+             style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+      <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
+      <p class="note" style="margin:10px 0 0">
+        ATLAS keeps its uploads, its caches and its database inside this space and
+        cannot exceed it. The space is claimed up front, so nothing else on the
+        box can take it.
+      </p>
+      <p class="note" style="margin:6px 0 0">
+        ⚠️ <strong>Free disk will drop by this much immediately</strong> — that
+        is the reservation working, not a leak. Leave it blank to reserve nothing
+        and share the disk as before.
+      </p>
+      <p class="note" id="storeState" style="margin:6px 0 0;display:none"></p>
+    </div>
+
     <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" style="margin-top:16px">Deploy ATLAS</button>
     <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
   </div>
@@ -440,13 +469,44 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
 <script>
 let polling = false;
 
+// Reserved storage (W205): the box's real numbers, read live.
+function loadStoreFacts(){
+  const help = document.getElementById('storeHelp');
+  const state = document.getElementById('storeState');
+  const field = document.getElementById('storeGb');
+  if (!help || !field) return;
+  fetch('/api/atlas/store', {credentials: 'same-origin'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { help.textContent = 'Could not read this box\u2019s disk.'; return; }
+      // \u26a0\ufe0f max is the 85% line, not the disk. The field refuses above it
+      // for the same reason the server does - and the server still checks,
+      // because a number typed past a browser control is not a validation.
+      field.max = d.max_gb;
+      field.min = d.min_gb;
+      help.textContent = d.disk_free_gb + ' GB free on this box \u00b7 at most '
+        + d.max_gb + ' GB may be reserved (85%).';
+      if (d.mounted) {
+        state.style.display = '';
+        state.innerHTML = '\u2713 Reserved: <strong>' + d.usable_gb + ' GB</strong> usable, '
+          + d.used_gb + ' GB in use.';
+        if (!field.value) field.value = d.reserved_gb;
+      }
+    })
+    .catch(() => { help.textContent = 'Could not read this box\u2019s disk.'; });
+}
+loadStoreFacts();
+
 function startDeploy(){
   const btn = document.getElementById('deployBtn');
+  const field = document.getElementById('storeGb');
+  const body = {};
+  if (field && field.value !== '') body.store_gb = field.value;
   btn.disabled = true;
   fetch('/api/atlas/deploy', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({}),
+    body: JSON.stringify(body),
     credentials: 'same-origin'
   }).then(r => r.json()).then(d => {
     if (d.error) { btn.disabled = false; alert(d.error); return; }

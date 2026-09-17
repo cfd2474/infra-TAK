@@ -106,6 +106,454 @@ WRITABLE_DIRS = ('pki', 'artifacts', 'cache')
 _TRUSTED_FALLBACK = '172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.0/8'
 
 
+# --------------------------------------------------------------------------- #
+# The ATLAS store: a reserved, capped filesystem for everything ATLAS keeps
+# (W205)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **Two requirements, and only one of them is a quota.** A storage limit
+# is a cap; "designate that space as belonging to atlas so other systems don't
+# take the space" is a *reservation*. A filesystem quota does the first and
+# nothing for the second — it stops ATLAS exceeding N and does nothing to stop
+# another module filling the disk first, after which ATLAS is under its quota
+# and still out of space.
+#
+# So: a loopback-backed ext4 image. `fallocate` claims the blocks immediately,
+# which is the reservation; the filesystem inside cannot grow past the image,
+# which is the cap. One mechanism, both halves, on any filesystem, with no
+# `tune2fs -O quota` and no remount of a live root.
+
+#: The image itself. Outside the ATLAS directory on purpose: that directory is
+#: a git checkout the updater rewrites, and a 40G file inside it would be one
+#: `git clean` away from deletion.
+STORE_IMAGE = '/var/lib/atlas/store.img'
+
+#: Where it is mounted. Inside the ATLAS directory, because the compose file's
+#: bind mounts are relative to it.
+STORE_DIRNAME = 'store'
+
+#: ⚠️ **The operator cannot reserve everything.** 85% of what is free, so a
+#: box cannot be configured into having no room for its own logs, its package
+#: cache, or the other modules sharing the disk.
+STORE_MAX_FRACTION = 0.85
+
+#: Below this there is no point: ATLAS ships ~570M of seed applications and
+#: indexes before an operator uploads anything.
+STORE_MIN_BYTES = 2 * 1024 ** 3
+
+GIB = float(1024 ** 3)
+
+
+def _disk_free(path):
+    """(total, free) bytes for the filesystem holding `path`, or (0, 0).
+
+    ⚠️ Walks up to the nearest existing directory. `statvfs` on a path that
+    does not exist yet raises, and the store image's parent is created by the
+    deploy that needs this number — so asking about `/var/lib/atlas` before it
+    exists is the normal case, not an error.
+    """
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not probe:
+        # An equivalent mutant lives here, and it is kept deliberately: removing
+        # this guard changes nothing observable, because `shutil.disk_usage('')`
+        # raises and the handler below returns the same (0, 0). Explicit beats
+        # relying on an exception to mean "nothing found", so it stays - but no
+        # test can tell the two apart, and pretending otherwise would be worse
+        # than saying so.
+        #
+        # ⚠️ The walk ran out of path without finding anything. Answering about
+        # `/` instead would report a filesystem nobody asked about, and the
+        # caller would size a reservation against the wrong disk. The real case
+        # — `/var/lib/atlas` not existing yet — always finds `/var/lib`.
+        return 0, 0
+    try:
+        usage = shutil.disk_usage(probe)
+    except (OSError, ValueError):
+        return 0, 0
+    # ⚠️ `shutil.disk_usage` rather than `os.statvfs`, for two reasons and the
+    # second is the one that matters. It reports `f_bavail` on POSIX — the blocks
+    # a *non-root* process may use, not `f_bfree`, which includes the
+    # filesystem's root reserve and must never be promised away. And it exists
+    # on every platform, so this arithmetic can be tested off the box instead of
+    # discovered on one: `os.statvfs` is POSIX-only and every test touching it
+    # failed on the development machine with an `AttributeError`.
+    return usage.total, usage.free
+
+
+def store_ceiling_bytes(free_bytes, already_reserved=0):
+    """The largest image this box may be asked for.
+
+    `already_reserved` is the size of an image that exists now. Without it, a
+    box that has already reserved 40G reports a ceiling computed from the free
+    space *left after* that reservation — so an operator could never keep, let
+    alone raise, the size they already have.
+    """
+    return int((max(0, free_bytes) + max(0, already_reserved)) * STORE_MAX_FRACTION)
+
+
+def validate_store_size(requested_gb, free_bytes, in_use_bytes=0, already_reserved=0):
+    """(bytes, error). `error` is a sentence for the operator, or None.
+
+    ⚠️ Refuses rather than clamps. Silently handing back a different number
+    than the one typed is how an operator ends up believing they reserved 200G
+    on a box that gave them 40.
+    """
+    try:
+        gb = float(requested_gb)
+    except (TypeError, ValueError):
+        return 0, 'Store size must be a number of gigabytes.'
+    if gb != gb or gb in (float('inf'), float('-inf')):
+        return 0, 'Store size must be a number of gigabytes.'
+
+    requested = int(gb * GIB)
+    if requested < STORE_MIN_BYTES:
+        return 0, (f'Store size must be at least {STORE_MIN_BYTES / GIB:.0f} GB — '
+                   f'ATLAS ships about 570 MB of applications and indexes before '
+                   f'anything is uploaded.')
+
+    # ⚠️ **Checked before anything else, including the short-circuit below.**
+    # Shrinking under what is already stored would mean deleting data to fit a
+    # number, which no setting should do quietly. The first version of this ran
+    # *after* the "keeping what you have" rule, so shrinking to 20 GB with 30 GB
+    # stored was allowed — the short-circuit skipped straight past it. Order is
+    # the whole fix.
+    if in_use_bytes and requested < in_use_bytes:
+        return 0, (f'ATLAS is already storing {in_use_bytes / GIB:.1f} GB. Reserve at '
+                   f'least that, or remove content first — this will not delete '
+                   f'anything to fit a smaller number.')
+
+    reserved = max(0, already_reserved)
+
+    # ⚠️ **Shrinking the image is not supported, so asking for less is
+    # refused rather than quietly ignored.** The store is a filesystem inside a
+    # file; growing it is `fallocate` plus `resize2fs` online, and shrinking it
+    # safely needs the stack down and `resize2fs` on an unmounted image. Until
+    # that exists, a request below the current size would have been accepted and
+    # then not acted on — the operator asks for 20 GB, keeps 40, and nothing
+    # says so. That is the "handed back a different number" failure this module
+    # refuses to commit.
+    if reserved and requested < reserved:
+        return 0, (f'The store is {reserved / GIB:.1f} GB and shrinking it is not '
+                   f'supported yet. Ask for {reserved / GIB:.1f} GB or more.')
+
+    # ⚠️ **Keeping exactly what is already reserved is always allowed**, and a
+    # test found this the hard way. The 85% rule governs *new* claims on the
+    # disk; space already reserved takes nothing further from the box. Without
+    # this, a reservation made when the disk was emptier becomes impossible to
+    # keep once other modules have grown — 85% of (free + reserved) falls below
+    # reserved, and every re-deploy is refused with nothing the operator can do
+    # about it.
+    if requested == reserved:
+        return requested, None
+
+    ceiling = store_ceiling_bytes(free_bytes, already_reserved)
+    if requested > ceiling:
+        return 0, (f'This box can offer at most {ceiling / GIB:.1f} GB — 85% of the '
+                   f'{(free_bytes + already_reserved) / GIB:.1f} GB available. '
+                   f'The rest stays free for the operating system and the other '
+                   f'modules on this disk.')
+
+    return requested, None
+
+
+def store_facts(ctx=None):
+    """What the console needs to draw the size field honestly.
+
+    Every number here is measured, never estimated: `mkfs` overhead and ext4's
+    root reserve both mean usable space is less than the image, and a predicted
+    figure that is wrong is worse than a real one that arrives a moment later.
+    """
+    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    reserved = 0
+    if os.path.exists(STORE_IMAGE):
+        try:
+            reserved = os.stat(STORE_IMAGE).st_size
+        except OSError:
+            reserved = 0
+
+    usable = used = 0
+    mount = _store_mount(ctx) if ctx is not None else None
+    if mount and os.path.ismount(mount):
+        try:
+            usage = shutil.disk_usage(mount)
+            usable = usage.total
+            used = usage.used
+        except (OSError, ValueError):
+            pass
+
+    return {
+        'disk_total_gb': round(total / GIB, 1),
+        'disk_free_gb': round(free / GIB, 1),
+        'reserved_gb': round(reserved / GIB, 1) if reserved else 0,
+        'usable_gb': round(usable / GIB, 1) if usable else 0,
+        'used_gb': round(used / GIB, 1) if usable else 0,
+        'max_gb': round(store_ceiling_bytes(free, reserved) / GIB, 1),
+        'min_gb': int(STORE_MIN_BYTES / GIB),
+        'mounted': bool(mount and os.path.ismount(mount)),
+    }
+
+
+def _store_mount(ctx):
+    return os.path.join(atlas_dir(ctx), STORE_DIRNAME)
+
+
+#: The Postgres image runs as uid/gid 70 and refuses to start unless its data
+#: directory is owned by that user with mode 0700. Measured on the box, not
+#: assumed: `postgres:16-alpine` → `70:70`, `drwx------`.
+STORE_PG_UID = 70
+STORE_PG_GID = 70
+
+#: What the compose project calls its Postgres volume. ⚠️ A Compose project
+#: name prefix: the directory is `atlas` on the box but the project is `takmdm`,
+#: because compose takes the name from the repository directory inside it.
+STORE_PG_VOLUME = 'takmdm_pgdata'
+
+
+def _run_root(argv, timeout=120):
+    """(rc, output). Runs as the console already does — root, no shell."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def _systemd_unit_name(path):
+    """`/root/atlas/store` → `root-atlas-store.mount`.
+
+    ⚠️ A mount unit's **filename must encode its mount point**, or systemd
+    refuses it with "Where= setting doesn't match unit name". `systemd-escape`
+    is the only thing that gets this right for every path, so it is asked rather
+    than imitated.
+    """
+    rc, out = _run_root(['systemd-escape', '--path', '--suffix=mount', path])
+    if rc == 0 and out.strip():
+        return out.strip()
+    return path.strip('/').replace('-', '\\x2d').replace('/', '-') + '.mount'
+
+
+def mount_unit_text(what, where, fstype, options, description,
+                    requires_mounts_for=None):
+    """The text of a systemd mount unit.
+
+    ⚠️ **`Before=docker.service` is the load-bearing line.** Docker starting
+    first would let it create the Postgres volume, and a container write into it,
+    against a directory that is not yet the reservation — so ATLAS would fill the
+    root disk while the reserved image sat empty. That is the exact failure this
+    feature exists to prevent, and boot order is the only thing standing between
+    it and a reboot.
+
+    Pure so the parts that matter can be checked without a systemd to load them.
+    """
+    lines = [
+        '# Managed by the InfraTAK ATLAS module (W205). Edits are overwritten.',
+        '[Unit]',
+        f'Description={description}',
+        'Before=docker.service',
+    ]
+    if requires_mounts_for:
+        # The bind cannot mount before the filesystem it is binding out of.
+        lines.append(f'RequiresMountsFor={requires_mounts_for}')
+    lines += [
+        '',
+        '[Mount]',
+        f'What={what}',
+        f'Where={where}',
+        f'Type={fstype}',
+        f'Options={options}',
+        '',
+        '[Install]',
+        'WantedBy=multi-user.target',
+        '',
+    ]
+    return '\n'.join(lines)
+
+
+def _write_mount_unit(what, where, plog, options='loop'):
+    """A systemd mount unit, enabled, so the store survives a reboot.
+
+    ⚠️ **A bare `mount` would be worse than nothing.** After a reboot the
+    image would be unmounted and `<atlas>/store` would be an ordinary empty
+    directory on the root filesystem — so ATLAS would start, write to the root
+    disk, and report a healthy store while the reservation sat unused in a file.
+    The failure this whole feature exists to prevent, arriving quietly.
+    """
+    name = _systemd_unit_name(where)
+    unit = mount_unit_text(what, where, 'ext4', options, 'ATLAS reserved store')
+    path = os.path.join('/etc/systemd/system', name)
+    try:
+        with open(path, 'w') as fh:
+            fh.write(unit)
+    except OSError as exc:
+        return f'could not write {path}: {exc}'
+    _run_root(['systemctl', 'daemon-reload'])
+    rc, out = _run_root(['systemctl', 'enable', '--now', name], timeout=90)
+    if rc != 0:
+        return f'systemctl enable --now {name} failed: {out.strip()[:300]}'
+    plog(f'  ✓ {where} mounted and enabled at boot ({name})')
+    return None
+
+
+def _bind_unit(source, target, plog):
+    """Bind one directory inside the store onto the path compose expects.
+
+    ⚠️ **This is what keeps `docker-compose.yml` untouched.** The compose
+    file bind-mounts `./artifacts` and `./cache`; binding the store's copies
+    onto those paths means ATLAS writes into the reservation without knowing the
+    reservation exists — and no ATLAS release is coupled to a module change,
+    which matters because the two repositories are released by different people.
+    """
+    name = _systemd_unit_name(target)
+    unit = mount_unit_text(source, target, 'none', 'bind', 'ATLAS store bind',
+                           requires_mounts_for=os.path.dirname(source))
+    path = os.path.join('/etc/systemd/system', name)
+    try:
+        with open(path, 'w') as fh:
+            fh.write(unit)
+    except OSError as exc:
+        return f'could not write {path}: {exc}'
+    _run_root(['systemctl', 'daemon-reload'])
+    rc, out = _run_root(['systemctl', 'enable', '--now', name], timeout=90)
+    if rc != 0:
+        return f'systemctl enable --now {name} failed: {out.strip()[:300]}'
+    plog(f'  ✓ {target} → {source}')
+    return None
+
+
+def ensure_store(ctx, size_bytes, plog):
+    """Create, grow or leave the reserved store. Returns an error, or None.
+
+    Idempotent: a deploy at the size already in place does nothing but report.
+
+    ⚠️ **Called before compose starts anything.** The mounts have to be in
+    place before Docker creates a volume or a container writes a byte, or ATLAS
+    populates the root filesystem and the reservation stays an empty file.
+    """
+    image = STORE_IMAGE
+    mount = _store_mount(ctx)
+    parent = os.path.dirname(image)
+
+    try:
+        os.makedirs(parent, exist_ok=True)
+        os.makedirs(mount, exist_ok=True)
+    except OSError as exc:
+        return f'could not create {parent} or {mount}: {exc}'
+
+    existing = os.stat(image).st_size if os.path.exists(image) else 0
+
+    if existing and size_bytes < existing:
+        # The validator refuses this, so reaching it means the two disagree.
+        return (f'the store is already {existing / GIB:.1f} GB and shrinking is not '
+                f'supported')
+
+    if not existing:
+        plog(f'  Reserving {size_bytes / GIB:.1f} GB at {image}...')
+        # ⚠️ `fallocate`, not `truncate`. A sparse file reserves **nothing**:
+        # the disk would still be handed to whatever asked for it next, and
+        # ATLAS would hit ENOSPC inside a store that claims to be half empty.
+        # Allocating the blocks up front is the entire reservation.
+        rc, out = _run_root(['fallocate', '-l', str(size_bytes), image], timeout=600)
+        if rc != 0:
+            return f'fallocate failed: {out.strip()[:300]}'
+        # ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB
+        # store is 2 GB an operator asked for and cannot use. This is a
+        # dedicated data volume, not a root filesystem that needs headroom to
+        # recover, so the reserve buys nothing.
+        rc, out = _run_root(
+            ['mkfs.ext4', '-F', '-m', '0', '-L', 'atlas-store', image], timeout=900)
+        if rc != 0:
+            return f'mkfs.ext4 failed: {out.strip()[:300]}'
+        plog('  ✓ Filesystem created')
+    elif size_bytes > existing:
+        plog(f'  Growing the store {existing / GIB:.1f} → {size_bytes / GIB:.1f} GB...')
+        rc, out = _run_root(['fallocate', '-l', str(size_bytes), image], timeout=600)
+        if rc != 0:
+            return f'fallocate failed: {out.strip()[:300]}'
+        # Online growth needs the filesystem mounted; e2fsck first if it is not.
+        if not os.path.ismount(mount):
+            _run_root(['e2fsck', '-fp', image], timeout=900)
+        rc, out = _run_root(['resize2fs', image], timeout=900)
+        if rc != 0:
+            return f'resize2fs failed: {out.strip()[:300]}'
+        plog('  ✓ Filesystem grown')
+    else:
+        plog(f'  ✓ Store already reserved at {existing / GIB:.1f} GB')
+
+    if not os.path.ismount(mount):
+        err = _write_mount_unit(image, mount, plog)
+        if err:
+            return err
+    else:
+        plog(f'  ✓ {mount} already mounted')
+
+    # The three directories ATLAS keeps things in, inside the reservation.
+    for sub in ('artifacts', 'cache', 'pgdata'):
+        try:
+            os.makedirs(os.path.join(mount, sub), exist_ok=True)
+        except OSError as exc:
+            return f'could not create {mount}/{sub}: {exc}'
+
+    pgdir = os.path.join(mount, 'pgdata')
+    try:
+        os.chown(pgdir, STORE_PG_UID, STORE_PG_GID)
+        os.chmod(pgdir, 0o700)
+    except OSError as exc:
+        return f'could not set ownership on {pgdir}: {exc}'
+
+    for sub in ('artifacts', 'cache'):
+        err = _bind_unit(os.path.join(mount, sub), os.path.join(atlas_dir(ctx), sub), plog)
+        if err:
+            return err
+
+    err = _bind_pg_volume(pgdir, plog)
+    if err:
+        return err
+    return None
+
+
+def _bind_pg_volume(pgdir, plog):
+    """Back the Postgres named volume with a bind into the store.
+
+    ⚠️ **Proven against a real Docker before it was written here.** Compose
+    warns — *"volume already exists but was not created by Docker Compose"* — and
+    then uses it anyway, and Postgres initialises into the bind target correctly.
+    That warning appears in the deploy log and is expected; the alternative was
+    editing `docker-compose.yml`, which belongs to the repository the operator
+    releases rather than the one this module lives in.
+
+    Left alone if it already points where it should: recreating a volume Postgres
+    has data in would be the one genuinely destructive thing in this feature.
+    """
+    rc, out = _run_root(
+        ['docker', 'volume', 'inspect', STORE_PG_VOLUME, '--format', '{{.Options.device}}'])
+    if rc == 0:
+        if out.strip() == pgdir:
+            plog(f'  ✓ {STORE_PG_VOLUME} already backed by the store')
+            return None
+        where = out.strip() or "Docker's own directory"
+        return (
+            f'{STORE_PG_VOLUME} already exists and points at {where}. '
+            f'Remove it before reserving a store — otherwise the database '
+            f'would sit outside the reservation while the console reported it '
+            f'inside.'
+        )
+
+    rc, out = _run_root([
+        'docker', 'volume', 'create', '--driver', 'local',
+        '-o', 'type=none', '-o', f'device={pgdir}', '-o', 'o=bind',
+        STORE_PG_VOLUME,
+    ])
+    if rc != 0:
+        return f'could not create {STORE_PG_VOLUME}: {out.strip()[:300]}'
+    plog(f'  ✓ {STORE_PG_VOLUME} backed by {pgdir}')
+    return None
+
+
 def _bridge_gateway():
     """The address Caddy appears as from inside the container.
 
@@ -621,8 +1069,31 @@ def detect(ctx):
 
 
 def deploy_validate(data):
-    """Nothing to validate: the repository is public and takes no credential."""
-    return {}, None
+    """The repository is public and takes no credential; the store size is the
+    one thing an operator can get wrong here (W205).
+
+    ⚠️ Validated **before** the deploy starts, not inside it. A refusal
+    halfway through a deploy leaves a half-built box, and the number is knowable
+    from the form alone.
+    """
+    data = data or {}
+    raw = data.get('store_gb')
+    if raw in (None, ''):
+        # Not supplied: an existing box keeps whatever it has, and a new one
+        # gets no reservation at all rather than a size nobody chose.
+        return {}, None
+
+    _, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    reserved = os.stat(STORE_IMAGE).st_size if os.path.exists(STORE_IMAGE) else 0
+
+    # ⚠️ `in_use` is not consulted here. The "already storing N GB" refusal
+    # needs the store mounted to measure, and this runs before the deploy that
+    # mounts it; `ensure_store` refuses a shrink against the real image anyway.
+    # Asking here with a zero would have looked like a check and been none.
+    size, error = validate_store_size(raw, free, 0, reserved)
+    if error:
+        return {}, error
+    return {'store_bytes': size}, None
 
 
 def _stale_deploy_key(dirpath):
@@ -759,6 +1230,29 @@ def deploy(ctx, job, params):
         plog('✓ Source in place')
 
         # ── 3/7 Configuration ─────────────────────────────────────────────────
+        plog('')
+        # ── Reserved store ───────────────────────────────────────────
+        # ⚠️ **Before configuration and long before compose.** The mounts have
+        # to exist before Docker creates a volume or a container writes a byte;
+        # otherwise ATLAS populates the root filesystem and the reservation
+        # stays an empty file that nobody notices until the disk is full.
+        store_bytes = params.get('store_bytes')
+        if store_bytes:
+            plog('')
+            plog('━━━ Reserving the ATLAS store ━━━')
+            plog(f'  {store_bytes / GIB:.1f} GB, allocated up front so nothing else')
+            plog('  on this box can claim it.')
+            plog('  ⚠ `df` will show this space as used from now on — that is the')
+            plog('  reservation working, not a leak.')
+            err = ensure_store(ctx, store_bytes, plog)
+            if err:
+                raise RuntimeError(f'Reserved store: {err}')
+            facts = store_facts(ctx)
+            plog(f'  ✓ {facts["usable_gb"]} GB usable inside a '
+                 f'{facts["reserved_gb"]} GB reservation')
+            plog('  ⚠ Compose will warn that the Postgres volume "was not created')
+            plog('  by Docker Compose". Expected: it is backed by the store.')
+
         plog('')
         plog('━━━ Step 3/7: Writing configuration ━━━')
         # Generated once and kept. Regenerating on a re-deploy would leave the
@@ -1868,6 +2362,20 @@ def register(ctx):
         steps.append('you will need it to renew, in about five years.')
         return jsonify({'success': True, 'steps': steps})
 
+    def store_view():
+        """What the box can offer, and what the reservation is doing (W205).
+
+        ⚠️ A live route rather than a value baked into the page. Free space
+        changes as other modules grow, and a ceiling rendered once at page load
+        would tell an operator they can reserve space that has since gone — they
+        would then be refused by a validator quoting a different number than the
+        page beside it.
+        """
+        try:
+            return jsonify(store_facts(ctx))
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
     def version_view():
         """What is installed, what is available, and whether that is a newer one.
 
@@ -1926,6 +2434,8 @@ def register(ctx):
              'endpoint': f'{KEY}_logs', 'view': logs_view},
             {'url': f'/api/{KEY}/version', 'methods': ['GET'],
              'endpoint': f'{KEY}_version', 'view': version_view},
+            {'url': f'/api/{KEY}/store', 'methods': ['GET'],
+             'endpoint': f'{KEY}_store', 'view': store_view},
             {'url': f'/api/{KEY}/update', 'methods': ['POST'],
              'endpoint': f'{KEY}_update', 'view': update_view},
             {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],
