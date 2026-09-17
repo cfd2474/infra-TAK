@@ -36,6 +36,10 @@ import subprocess
 import time
 
 from . import register_module, job_log
+# ⚠️ The sizing modes live in the instance model, not here. Two copies of
+# 'fixed'/'dynamic' would drift, and the one that drifted would be the one
+# deciding whether an image reserves its blocks.
+from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
 KEY = 'atlas'
 
@@ -282,7 +286,7 @@ def validate_store_size(requested_gb, free_bytes, in_use_bytes=0, already_reserv
 STORE_RESERVED_FRACTION = 0.95
 
 
-def mkfs_argv(image, label='atlas-store'):
+def mkfs_argv(image, label='atlas-store', mode=None):
     """The `mkfs.ext4` command for the store image.
 
     ⚠️ **`-E nodiscard` is why this function exists (W213).** `mkfs` discards
@@ -295,11 +299,43 @@ def mkfs_argv(image, label='atlas-store'):
     blocks; with `-E nodiscard` → 5121 MiB. Pure, so the flag can be asserted
     without a disk — the absence of one is exactly why nothing caught this.
 
+    ⚠️ **W216 makes the flag conditional.** Under **dynamic** sizing the discard
+    is exactly what is wanted: the image is sparse on purpose, the filesystem is
+    only a ceiling, and blocks come from the host as data arrives. So the flag is
+    present for `fixed`, absent for `dynamic`, and the two modes are one code
+    path with a single difference.
+
     ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB store is
     2 GB an operator asked for and cannot use. A dedicated data volume needs no
     headroom to recover.
     """
-    return ['mkfs.ext4', '-F', '-m', '0', '-E', 'nodiscard', '-L', label, image]
+    argv = ['mkfs.ext4', '-F', '-m', '0']
+    if (mode or MODE_FIXED) == MODE_FIXED:
+        argv += ['-E', 'nodiscard']
+    return argv + ['-L', label, image]
+
+
+def mount_options(mode=None):
+    """Mount options for the store, by sizing mode.
+
+    ⚠️ **`discard` is what makes dynamic shrink**, and it is not an
+    optimisation. Without it a dynamic store only ever grows: deleting 40 GB of
+    imagery would free space inside the agency's filesystem and hand nothing back
+    to the box, defeating the entire mode. Measured on the box — a 4 GB sparse
+    image went 67 → 667 MiB on a 600 MB write and straight back to 67 MiB on
+    delete, with the filesystem holding its size throughout.
+
+    ⚠️ **`errors=remount-ro` for dynamic only**, and deliberately. A dynamic
+    store's filesystem believes it has space the host may be unable to deliver,
+    so a write can fail as an *I/O error* rather than a clean `ENOSPC`. The live
+    fixed store measures `Errors behavior: Continue` — carrying on after such an
+    error, which for a database is the worst of the options. A loud stop beats
+    quiet damage. A fixed store cannot reach that state at all: its blocks are
+    already allocated.
+    """
+    if mode == MODE_DYNAMIC:
+        return 'loop,discard,errors=remount-ro'
+    return 'loop'
 
 
 def allocated_bytes(path):
@@ -333,7 +369,28 @@ def is_fully_reserved(apparent, allocated, fraction=STORE_RESERVED_FRACTION):
     return allocated >= apparent * fraction
 
 
-def store_facts(ctx=None):
+def deliverable_free(fs_free, host_free, mode):
+    """What an agency can *actually* still write — the second gauge (W216).
+
+    ⚠️ **The number a dynamic store reports about itself is not the truth.**
+    Its filesystem is a ceiling, so it will happily say "3.3 GB available" while
+    the host has no blocks left to hand over. That is precisely the class of
+    dishonest figure W213 existed to remove: authoritative-looking and wrong.
+
+    Under `fixed` the two agree by construction — the blocks are already
+    allocated, so the filesystem's own answer is the truth and the host's free
+    space is irrelevant to it.
+
+    Under `dynamic` the honest answer is **the smaller of the two**, because
+    either can run out first: the agency can hit its own ceiling, or the box can
+    run out of disk underneath it.
+    """
+    if mode != MODE_DYNAMIC:
+        return max(0, fs_free)
+    return max(0, min(fs_free, host_free))
+
+
+def store_facts(ctx=None, mode=None):
     """What the console needs to draw the size field honestly.
 
     Every number here is measured, never estimated: `mkfs` overhead and ext4's
@@ -356,6 +413,7 @@ def store_facts(ctx=None):
             reserved = 0
     allocated = allocated_bytes(STORE_IMAGE) if reserved else None
 
+    mode = mode or MODE_FIXED
     usable = used = 0
     mount = _store_mount(ctx) if ctx is not None else None
     if mount and os.path.ismount(mount):
@@ -374,6 +432,15 @@ def store_facts(ctx=None):
         'fully_reserved': is_fully_reserved(reserved, allocated),
         'usable_gb': round(usable / GIB, 1) if usable else 0,
         'used_gb': round(used / GIB, 1) if usable else 0,
+        'mode': mode,
+        # ⚠️ The second gauge. `usable_gb - used_gb` is what the agency's own
+        # filesystem claims; `deliverable_gb` is what the box can actually
+        # honour. They differ only under dynamic, and that difference is the
+        # whole reason this field exists.
+        'deliverable_gb': round(
+            deliverable_free(max(0, usable - used), free, mode) / GIB, 1),
+        # Named so a caller cannot mistake a ceiling for held space.
+        'size_is_reserved': mode == MODE_FIXED,
         'max_gb': round(store_ceiling_bytes(free, reserved) / GIB, 1),
         'min_gb': int(STORE_MIN_BYTES / GIB),
         'mounted': bool(mount and os.path.ismount(mount)),
@@ -507,15 +574,24 @@ def _bind_unit(source, target, plog):
     return None
 
 
-def ensure_store(ctx, size_bytes, plog):
-    """Create, grow or leave the reserved store. Returns an error, or None.
+def ensure_store(ctx, size_bytes, plog, mode=None):
+    """Create, grow or leave the store. Returns an error, or None.
 
     Idempotent: a deploy at the size already in place does nothing but report.
+
+    ⚠️ **`mode` decides whether the size is a reservation or a ceiling**
+    (W216). Under `fixed` the blocks are taken from the box up front and held,
+    which is what `fallocate` + `-E nodiscard` + `_reserve_blocks` achieve
+    together. Under `dynamic` the image is deliberately sparse: the filesystem
+    is only a cap, blocks arrive from the host as data does, and `discard`
+    hands them back on delete. Defaulting to `fixed` keeps every existing
+    call site behaving exactly as it does today.
 
     ⚠️ **Called before compose starts anything.** The mounts have to be in
     place before Docker creates a volume or a container writes a byte, or ATLAS
     populates the root filesystem and the reservation stays an empty file.
     """
+    mode = mode or MODE_FIXED
     image = STORE_IMAGE
     mount = _store_mount(ctx)
     parent = os.path.dirname(image)
@@ -534,27 +610,40 @@ def ensure_store(ctx, size_bytes, plog):
                 f'supported')
 
     if not existing:
-        plog(f'  Reserving {size_bytes / GIB:.1f} GB at {image}...')
-        # ⚠️ `fallocate`, not `truncate`. A sparse file reserves **nothing**:
-        # the disk would still be handed to whatever asked for it next, and
-        # ATLAS would hit ENOSPC inside a store that claims to be half empty.
-        # Allocating the blocks up front is the entire reservation.
-        rc, out = _run_root(['fallocate', '-l', str(size_bytes), image], timeout=600)
+        # ⚠️ **`fallocate` for fixed, `truncate` for dynamic, and the
+        # difference is the whole feature.** A sparse file reserves *nothing*:
+        # under `fixed` that was W213's bug, because the disk would still be
+        # handed to whatever asked next and ATLAS would hit ENOSPC inside a
+        # store claiming to be half empty. Under `dynamic` it is the point —
+        # the space stays available to the box until this agency uses it.
+        if mode == MODE_FIXED:
+            plog(f'  Reserving {size_bytes / GIB:.1f} GB at {image}...')
+            rc, out = _run_root(['fallocate', '-l', str(size_bytes), image],
+                                timeout=600)
+        else:
+            plog(f'  Creating a {size_bytes / GIB:.1f} GB ceiling at {image} '
+                 f'(dynamic — space is taken as it is used)...')
+            rc, out = _run_root(['truncate', '-s', str(size_bytes), image],
+                                timeout=600)
         if rc != 0:
-            return f'fallocate failed: {out.strip()[:300]}'
+            return f'creating the store image failed: {out.strip()[:300]}'
         # ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB
         # store is 2 GB an operator asked for and cannot use. This is a
         # dedicated data volume, not a root filesystem that needs headroom to
         # recover, so the reserve buys nothing.
-        rc, out = _run_root(mkfs_argv(image), timeout=900)
+        rc, out = _run_root(mkfs_argv(image, mode=mode), timeout=900)
         if rc != 0:
             return f'mkfs.ext4 failed: {out.strip()[:300]}'
         plog('  ✓ Filesystem created')
     elif size_bytes > existing:
         plog(f'  Growing the store {existing / GIB:.1f} → {size_bytes / GIB:.1f} GB...')
-        rc, out = _run_root(['fallocate', '-l', str(size_bytes), image], timeout=600)
+        # Fixed takes the new blocks now; dynamic only raises the ceiling and
+        # takes them when data arrives.
+        grow = 'fallocate' if mode == MODE_FIXED else 'truncate'
+        flag = '-l' if mode == MODE_FIXED else '-s'
+        rc, out = _run_root([grow, flag, str(size_bytes), image], timeout=600)
         if rc != 0:
-            return f'fallocate failed: {out.strip()[:300]}'
+            return f'{grow} failed: {out.strip()[:300]}'
         # Online growth needs the filesystem mounted; e2fsck first if it is not.
         if not os.path.ismount(mount):
             _run_root(['e2fsck', '-fp', image], timeout=900)
@@ -570,12 +659,16 @@ def ensure_store(ctx, size_bytes, plog):
     # apparent size is not evidence of a reservation, and this runs on every
     # deploy rather than only on creation — it is the repair path for existing
     # boxes as much as a belt-and-braces check for new ones.
-    err = _reserve_blocks(size_bytes, plog)
-    if err:
-        return err
+    # ⚠️ **Only for fixed.** Calling this on a dynamic store would allocate
+    # every block up front and turn it into a fixed one, silently — the
+    # operator would have chosen dynamic and received the opposite.
+    if mode == MODE_FIXED:
+        err = _reserve_blocks(size_bytes, plog)
+        if err:
+            return err
 
     if not os.path.ismount(mount):
-        err = _write_mount_unit(image, mount, plog)
+        err = _write_mount_unit(image, mount, plog, options=mount_options(mode))
         if err:
             return err
     else:
