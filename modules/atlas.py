@@ -552,9 +552,19 @@ def add_instance(ctx, agency_specific, slug, mode, size_gb):
     if err:
         return None, err
 
-    ok, err = fits_here(ctx, size_gb, instances)
-    if not ok:
-        return None, err
+    if mode == atlas_instances.MODE_DYNAMIC:
+        # ⚠️ Not asked for, by design: a dynamic deployment shares whatever is
+        # left rather than claiming a slice of it, so its ceiling *is* the pool.
+        # Recording the figure keeps the console honest about what the
+        # filesystem will report, which is a ceiling and not a reservation.
+        size_gb = round(_pool_gb(ctx, instances), 1)
+        if size_gb <= 0:
+            return None, ('There is no space left in the ATLAS budget for '
+                          'another deployment.')
+    else:
+        ok, err = fits_here(ctx, size_gb, instances)
+        if not ok:
+            return None, err
 
     inst = atlas_instances.make(
         slug, mode, size_gb,
@@ -602,11 +612,14 @@ def capacity_facts(ctx, size_gb=None):
     instances = load_instances(ctx)
     total, free = _disk_free(os.path.dirname(STORE_IMAGE))
     floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
-    reserved = atlas_instances.reserved_bytes(instances)
+    reserved = atlas_instances.committed_bytes(instances)
     # Everything on the disk that is not an ATLAS reservation.
     non_atlas = max(0, total - free - reserved)
     budget = atlas_instances.budget_bytes(total, non_atlas, floor)
     committed = atlas_instances.committed_bytes(instances)
+    pool = atlas_instances.pool_bytes(budget, instances)
+    dynamic = sum(1 for i in instances
+                  if i.get('mode') == atlas_instances.MODE_DYNAMIC)
 
     ram_total, ram_available = _memory_bytes()
     by_ram = atlas_instances.instances_that_ram_allows(
@@ -621,6 +634,12 @@ def capacity_facts(ctx, size_gb=None):
         'budget_gb': round(budget / gb, 1),
         'committed_gb': round(committed / gb, 1),
         'remaining_gb': round(max(0, budget - committed) / gb, 1),
+        # What dynamic deployments share. Equal to `remaining_gb` today, and a
+        # separate name because they answer different questions: one is "how
+        # much is left to give away", the other "how much can this deployment
+        # grow into".
+        'pool_gb': round(pool / gb, 1),
+        'dynamic_instances': dynamic,
         'reserved_gb': round(reserved / gb, 1),
         'floor_gb': atlas_instances.DEFAULT_FLOOR_GB,
         'disk_free_gb': round(free / gb, 1),
@@ -633,7 +652,21 @@ def capacity_facts(ctx, size_gb=None):
         'binding': which,
         'room_for': how_many,
         'may_deploy_plain': atlas_instances.may_deploy_plain(instances),
+        # ⚠️ So the page can refuse a duplicate slug before anything is
+        # recorded. The server refuses it too — this is the courtesy, not
+        # the control.
+        'slugs': [i.get('slug') for i in instances if i.get('slug')],
     }
+
+
+def _pool_gb(ctx, instances):
+    """The pool, in GB. One place, so the screen and the validator agree."""
+    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
+    committed = atlas_instances.committed_bytes(instances)
+    non_atlas = max(0, total - free - committed)
+    budget = atlas_instances.budget_bytes(total, non_atlas, floor)
+    return atlas_instances.pool_bytes(budget, instances) / atlas_instances.GIB
 
 
 def fits_here(ctx, size_gb, instances=None):
@@ -641,7 +674,7 @@ def fits_here(ctx, size_gb, instances=None):
     instances = load_instances(ctx) if instances is None else instances
     total, free = _disk_free(os.path.dirname(STORE_IMAGE))
     floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
-    reserved = atlas_instances.reserved_bytes(instances)
+    reserved = atlas_instances.committed_bytes(instances)
     non_atlas = max(0, total - free - reserved)
     budget = atlas_instances.budget_bytes(total, non_atlas, floor)
     return atlas_instances.fits(size_gb, instances, budget)

@@ -359,13 +359,6 @@ def test_one_card_lists_every_deployment(installed):
     assert 'id="instanceList"' in installed
 
 
-def test_the_agency_question_is_asked(installed):
-    """*"Every instance should ask if this is an agency specific deployment."*"""
-    span = installed[installed.index('id="agencyChoice"'):]
-    assert 'specific agency' in span[:600]
-    assert 'agencyKind' in span[:900]
-
-
 def test_the_slug_is_prompted_for_separately(installed):
     """*"if yes, now needs a new slug prompt"* — and it is its own field, so a
     plain deployment simply does not have one."""
@@ -400,31 +393,6 @@ def test_both_sizing_modes_are_offered(installed):
     assert 'value="dynamic"' in installed
 
 
-def test_the_size_field_is_relabelled_by_mode(installed):
-    """⚠️ One field, two meanings. Calling a ceiling "reserved" is the dishonest
-    number W213 was about, in the very place an operator chooses it."""
-    body = function_body(installed, 'onModeChanged')
-
-    assert 'Maximum storage' in body
-    assert 'Reserved storage' in body
-
-
-def test_each_mode_says_what_happens_to_free_disk(installed):
-    body = function_body(installed, 'onModeChanged')
-
-    assert 'does not drop now' in body
-    assert 'drops by this much immediately' in body
-
-
-def test_the_slug_preview_shows_what_will_actually_be_used(installed):
-    """⚠️ Case is forced, so echoing what was typed would show a hostname that
-    is not the one created."""
-    body = function_body(installed, 'previewSlug')
-
-    assert 'toLowerCase()' in body
-    assert 'atlas.' in body
-
-
 def test_the_capacity_panel_names_the_binding_constraint(installed):
     """⚠️ The panel's whole job beyond adding up. Disk 4, memory 12 — an
     operator shown only the larger number would plan for three times what
@@ -451,18 +419,135 @@ def test_capacity_is_fetched_live_rather_than_rendered_once(installed):
     assert "fetch('/api/atlas/instances" in body
 
 
-def test_a_plain_deployment_sends_no_slug(installed):
-    """⚠️ "No slug" and "the operator left it blank" are different answers, so
-    the page sends the choice explicitly rather than letting the server guess
-    from an empty string."""
-    body = function_body(installed, 'createInstance')
-
-    assert 'agency_specific' in body
-    assert 'agencySpecific && slug' in body
-
-
 def test_a_refused_deployment_shows_the_reason(installed):
     body = function_body(installed, 'createInstance')
 
     assert 'addInstanceError' in body
     assert 'd.error' in body
+
+
+# --------------------------------------------------------------------------- #
+# Choosing a deployment: type first, then slug (operator design, 2026-09-17)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_type_is_asked_first_and_defaults_to_dynamic(installed):
+    """⚠️ Dynamic is the default because it is the choice hardest to regret: it
+    takes nothing from the box until the agency stores something. Neither the
+    type nor the slug can be changed afterwards — `resize2fs` will not shrink a
+    mounted filesystem, and a fixed store cannot become sparse once allocated."""
+    assert 'value="dynamic" checked' in installed
+    assert 'value="fixed"' in installed
+    assert 'Deployment type' in installed
+
+
+def test_only_fixed_is_asked_for_a_size(installed):
+    """A dynamic deployment shares the pool, so there is no number to choose."""
+    body = function_body(installed, 'onModeChanged')
+
+    assert "getElementById('sizeField')" in body
+    assert "isFixed ? '' : 'none'" in body
+
+
+def test_dynamic_says_what_it_will_share(installed):
+    body = function_body(installed, 'onModeChanged')
+
+    assert 'pool_gb' in body
+    assert 'shares the' in body
+
+
+def test_fixed_still_warns_that_free_disk_drops(installed):
+    """⚠️ The W205 warning, carried across rather than lost in the redesign."""
+    span = installed[installed.index('id="sizeField"'):]
+
+    assert 'Free disk drops by this much immediately' in span[:900]
+
+
+def test_the_slug_field_says_blank_means_the_general_atlas(installed):
+    """*"blank is no slug"* — and the field has to say so, because an empty box
+    is exactly where an operator cannot infer it."""
+    span = installed[installed.index('id="agencySlug"'):]
+
+    assert 'Leave it blank' in span[:900]
+    assert 'general ATLAS' in span[:900]
+    assert 'Lowercase, no spaces' in span[:900]
+
+
+def test_the_slug_is_shown_back_normalised(installed):
+    """⚠️ Case is forced server-side, so echoing what was typed would promise a
+    hostname that is not the one created."""
+    assert 'toLowerCase()' in function_body(installed, 'typedSlug')
+    body = function_body(installed, 'previewSlug')
+    assert 'Will deploy as' in body
+
+
+# ⚠️ **These assert the *conditions*, not the messages.** Written as
+# `'already has a general ATLAS' in body`, three of them survived mutations that
+# replaced the guard with `if (false)` — the message stayed in the source, so the
+# assertion matched while the rule did nothing. Source-text assertions can only
+# ever pin what the code *says*; pinning the condition is the closest they get to
+# pinning what it does, and it is what kills that mutation.
+
+
+def test_a_blank_slug_is_refused_once_a_general_atlas_exists(installed):
+    """*"if instance with no slug already exists, reject submission with blank"*
+    — refused before anything is recorded, so the operator is never left with a
+    claimed slug and nothing built."""
+    body = function_body(installed, 'addInstanceProblem')
+
+    assert 'if (!slug && !mayPlain)' in body, 'the blank-slug rule is not enforced'
+    assert 'already has a general ATLAS' in body
+
+
+def test_a_slug_already_in_use_is_refused(installed):
+    body = function_body(installed, 'addInstanceProblem')
+
+    assert 'capacityState.slugs || []).indexOf(slug) !== -1' in body
+    assert 'already a deployment for' in body
+
+
+def test_a_fixed_deployment_without_a_size_is_refused(installed):
+    body = function_body(installed, 'addInstanceProblem')
+
+    assert "currentMode() === 'fixed'" in body
+    assert "size.value === '' || Number(size.value) <= 0" in body
+    assert 'Enter a size' in body
+
+
+def test_the_button_is_gated_on_the_same_check_the_submit_uses(installed):
+    """⚠️ One predicate for both, so the button cannot be enabled for something
+    the submit would refuse."""
+    gate = function_body(installed, 'refreshAddGate')
+
+    assert 'const problem = addInstanceProblem();' in gate
+    assert 'btn.disabled = problem !== null' in gate
+
+
+def test_the_summary_modal_lists_every_choice(installed):
+    """*"summary of selections should be shown on a modal for final approval"*."""
+    body = function_body(installed, 'openInstanceConfirm')
+
+    for field in ('agency', 'hostname', 'type', 'storage'):
+        assert field in body, f'the summary does not mention {field}'
+    assert 'instanceModal' in body
+
+
+def test_the_modal_will_not_open_on_an_invalid_choice(installed):
+    body = function_body(installed, 'openInstanceConfirm')
+
+    assert 'addInstanceProblem() !== null' in body
+
+
+def test_the_deploy_only_happens_after_approval(installed):
+    """Nothing is recorded or built until the operator approves the summary."""
+    confirm = function_body(installed, 'confirmCreateInstance')
+
+    assert 'createInstance()' in confirm
+    assert 'onclick="openInstanceConfirm()"' in installed
+
+
+def test_the_request_carries_the_choices(installed):
+    body = function_body(installed, 'createInstance')
+
+    assert 'agency_specific: !!slug' in body
+    assert "mode: mode" in body

@@ -229,23 +229,42 @@ def test_the_budget_leaves_the_floor_alone():
     assert round(budget / GIB) == 379
 
 
-def test_both_modes_count_against_the_budget():
-    """⚠️ A dynamic ceiling is a promise even though the space is not held. The
-    operator's rule is that a request exceeding the budget is refused, which
-    needs a figure including what has already been promised."""
+def test_only_fixed_deployments_commit_budget():
+    """⚠️ **This counted both modes until the operator settled the design.**
+    Their rule is that a dynamic deployment shares the available space and is
+    never asked for a size, so its ceiling is not a commitment — it *is* the
+    pool. Counting it would exhaust the budget the moment one existed."""
     instances = [ai.make(None, ai.MODE_FIXED, 100, 8760),
-                 ai.make('a', ai.MODE_DYNAMIC, 50, 8761)]
+                 ai.make('a', ai.MODE_DYNAMIC, 200, 8761)]
 
-    assert round(ai.committed_bytes(instances) / GIB) == 150
+    assert round(ai.committed_bytes(instances) / GIB) == 100
 
 
-def test_only_fixed_instances_actually_hold_disk():
-    """The difference that makes dynamic worth having: space inside a dynamic
-    ceiling is still available to the rest of the box."""
-    instances = [ai.make(None, ai.MODE_FIXED, 100, 8760),
-                 ai.make('a', ai.MODE_DYNAMIC, 50, 8761)]
+def test_the_pool_is_what_is_left_after_the_fixed_ones():
+    instances = [ai.make(None, ai.MODE_FIXED, 100, 8760)]
 
-    assert round(ai.reserved_bytes(instances) / GIB) == 100
+    assert round(ai.pool_bytes(379 * GIB, instances) / GIB) == 279
+
+
+def test_dynamic_ceilings_may_exceed_the_disk():
+    """⚠️ Deliberate over-commitment: several dynamic deployments can each be
+    capped at the whole pool, so their ceilings sum to more than the box holds.
+    That is what "share the same available space" means, and the cost is a
+    correlated failure if they all fill at once — which is why
+    `deliverable_free` exists and why a dynamic store mounts
+    `errors=remount-ro`."""
+    instances = [ai.make('a', ai.MODE_DYNAMIC, 300, 8761),
+                 ai.make('b', ai.MODE_DYNAMIC, 300, 8762)]
+
+    assert ai.committed_bytes(instances) == 0
+    assert round(ai.pool_bytes(300 * GIB, instances) / GIB) == 300
+
+
+def test_a_pool_never_goes_negative():
+    """A box over its budget has no pool, not a negative one."""
+    instances = [ai.make(None, ai.MODE_FIXED, 500, 8760)]
+
+    assert ai.pool_bytes(100 * GIB, instances) == 0
 
 
 def test_a_request_past_the_budget_is_refused_with_the_spare_named():

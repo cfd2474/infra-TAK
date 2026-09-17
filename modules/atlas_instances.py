@@ -285,26 +285,35 @@ def budget_bytes(disk_total, non_atlas_used, floor_bytes):
 
 
 def committed_bytes(instances):
-    """What the existing instances already account for.
+    """Space the existing deployments have actually taken — fixed ones only.
 
-    ⚠️ **Both modes count.** A fixed instance has taken its space; a dynamic one
-    has only a ceiling. Counting only the fixed ones would let the budget be
-    exhausted by ceilings nobody had allowed for — and the operator's rule is
-    that a request exceeding the budget is *refused*, which needs a figure that
-    includes what has already been promised.
-    """
-    return sum(int((i.get('size_gb') or 0) * GIB) for i in instances or ())
+    ⚠️ **This counted both modes until the operator settled the design**
+    (2026-09-17). Their rule is that dynamic deployments *share* the available
+    space and are not asked for a size at all, so a dynamic ceiling is not a
+    commitment against the budget — it is a ceiling on a pool everything
+    dynamic draws from.
 
+    Counting them would have exhausted the budget the moment one dynamic
+    deployment existed, because its ceiling is the whole remaining pool.
 
-def reserved_bytes(instances):
-    """Only what is actually held on disk — the fixed instances.
-
-    The difference from :func:`committed_bytes` is the whole point of dynamic
-    mode: space inside a dynamic instance's ceiling is still available to the
-    rest of the box until that agency writes to it.
+    ⚠️ The consequence is deliberate over-commitment: several dynamic
+    deployments can each be capped at the whole pool, so their ceilings sum to
+    more than the disk holds. That is what "share the same available space"
+    means, and the cost is a correlated failure if they all fill at once —
+    which is why `deliverable_free` exists and why a dynamic store mounts
+    `errors=remount-ro`.
     """
     return sum(int((i.get('size_gb') or 0) * GIB)
                for i in instances or () if i.get('mode') == MODE_FIXED)
+
+
+def pool_bytes(budget, instances):
+    """What the dynamic deployments share, and what a new fixed one may take.
+
+    The budget less the space fixed deployments have already claimed. Never
+    negative: a box over its budget has no pool, not a negative one.
+    """
+    return max(0, budget - committed_bytes(instances))
 
 
 def fits(requested_gb, instances, budget):

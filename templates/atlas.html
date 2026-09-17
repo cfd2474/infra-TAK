@@ -105,26 +105,72 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
 
       <!--
-        ⚠️ **Asked only while a plain deployment is still possible.** The
-        operator's rule: once a non-agency ATLAS exists another cannot be
-        deployed, so the question has one possible answer and is not put. The
-        block is hidden by `renderInstances` from the server's own predicate
-        rather than from anything counted here, so the page and the validator
-        cannot disagree.
+        ⚠️ **The sizing mode comes first, because everything below depends on
+        it** — and because neither it nor the slug can be changed afterwards:
+        `resize2fs` will not shrink a mounted filesystem, and a fixed store
+        cannot become sparse once its blocks are allocated.
+
+        Dynamic is the default: it takes nothing from the box until the agency
+        stores something, so it is the choice that is hardest to regret.
       -->
-      <div id="agencyChoice" style="margin-bottom:14px">
+      <div style="margin-bottom:16px">
         <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-          Is this deployment for a specific agency?
+          Deployment type
         </label>
         <label class="note" style="display:block">
-          <input type="radio" name="agencyKind" value="yes" checked
-                 onchange="onAgencyKindChanged()"> Yes — it gets its own slug and hostname
+          <input type="radio" name="sizeMode" value="dynamic" checked
+                 onchange="onModeChanged()">
+          <strong>Dynamic</strong> — shares whatever space is free, growing as it
+          is used and giving it back when things are deleted
         </label>
         <label class="note" style="display:block">
-          <input type="radio" name="agencyKind" value="no"
-                 onchange="onAgencyKindChanged()"> No — this is the box's general ATLAS
+          <input type="radio" name="sizeMode" value="fixed"
+                 onchange="onModeChanged()">
+          <strong>Fixed</strong> — a set amount, taken from the box now and held
+          for this deployment alone
         </label>
       </div>
+
+      <!-- Only fixed is asked for a size. Dynamic's ceiling is the pool. -->
+      <div id="sizeField" style="margin-bottom:16px;display:none">
+        <label for="instanceSize"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Reserved storage
+        </label>
+        <input type="number" id="instanceSize" min="2" step="1" placeholder="e.g. 50"
+               oninput="refreshAddGate()"
+               style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
+        <p class="note" style="margin:8px 0 0">
+          ⚠️ <strong>Free disk drops by this much immediately</strong> — that is
+          the reservation working, not a leak.
+        </p>
+      </div>
+      <p class="note" id="dynamicNote" style="margin:0 0 16px"></p>
+
+      <div style="margin-bottom:16px">
+        <label for="agencySlug"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency slug
+        </label>
+        <input type="text" id="agencySlug" placeholder="leave blank for the box's general ATLAS"
+               oninput="previewSlug()"
+               style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" style="margin:6px 0 0">
+          The agency this deployment belongs to. Lowercase, no spaces — it
+          becomes part of the hostname. <strong>Leave it blank</strong> for the
+          box&rsquo;s general ATLAS, of which there can be only one.
+        </p>
+        <p class="note" id="slugPreview" style="margin:6px 0 0"></p>
+      </div>
+
+      <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
+      <button class="btn btn-primary" id="createInstanceBtn" onclick="openInstanceConfirm()">
+        Review &amp; deploy
+      </button>
+      <button class="btn btn-secondary" onclick="closeAddInstance()">Cancel</button>
+      <p class="note" id="addInstanceGate" style="margin:8px 0 0"></p>
+    </div>
 
       <p class="note" id="agencyForced" style="display:none;margin-bottom:14px">
         This box already has a general ATLAS, so further deployments are
@@ -621,6 +667,23 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
   </div>
 </div>
 
+<!--
+  ⚠️ The summary an operator approves before anything is built. Same shape as
+  the reservation confirmation it replaces: neither the type nor the slug can be
+  changed after the deploy, so this is the last point at which a mistake is free.
+-->
+<div class="modal-overlay" id="instanceModal">
+  <div class="modal">
+    <h3>Deploy ATLAS</h3>
+    <div class="cmd" id="instanceConfirmSummary" style="margin-bottom:14px"></div>
+    <p class="note" id="instanceConfirmNote"></p>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeInstanceConfirm()">Cancel</button>
+      <button class="btn btn-primary" id="instanceConfirmBtn" onclick="confirmCreateInstance()">Deploy</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="uninstallModal">
   <div class="modal">
     <h3>Uninstall ATLAS</h3>
@@ -800,7 +863,8 @@ function renderInstances(data){
     const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
     if (yes) yes.checked = true;
   }
-  onAgencyKindChanged();
+  onModeChanged();
+  previewSlug();
 
   if (panel){
     const c = capacityState;
@@ -815,6 +879,106 @@ function renderInstances(data){
       '\n' +
       'room for ' + c.room_for + ' more - ' + c.binding + ' is the limit';
   }
+}
+
+function currentMode(){
+  const fixed = document.querySelector('input[name="sizeMode"][value="fixed"]');
+  return fixed && fixed.checked ? 'fixed' : 'dynamic';
+}
+
+function typedSlug(){
+  // ⚠️ Normalised, not echoed. Case is forced server-side, so showing what was
+  // typed would promise a hostname that is not the one created.
+  const input = document.getElementById('agencySlug');
+  return ((input && input.value) || '').trim().toLowerCase();
+}
+
+function onModeChanged(){
+  const isFixed = currentMode() === 'fixed';
+  const field = document.getElementById('sizeField');
+  const note = document.getElementById('dynamicNote');
+  if (field) field.style.display = isFixed ? '' : 'none';
+  if (note) note.textContent = isFixed ? '' :
+    'No size to choose: a dynamic deployment shares the ' +
+    ((capacityState && capacityState.pool_gb) || 0) +
+    ' GB left in the ATLAS budget, taking space as it is used and giving it back '
+    + 'when things are deleted.';
+  refreshAddGate();
+}
+
+function previewSlug(){
+  const out = document.getElementById('slugPreview');
+  if (!out) return;
+  const slug = typedSlug();
+  const mayPlain = !capacityState || capacityState.may_deploy_plain;
+  if (!slug){
+    out.textContent = mayPlain
+      ? 'No slug — this becomes the box\u2019s general ATLAS at its plain hostname.'
+      : '⚠ This box already has a general ATLAS, so a slug is required.';
+  } else if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(slug)){
+    out.textContent = '⚠ Lowercase letters, digits and hyphens only, and it '
+      + 'cannot start or end with a hyphen.';
+  } else {
+    out.textContent = 'Will deploy as ' + slug + ' at atlas.' + slug + '.<your-domain>';
+  }
+  refreshAddGate();
+}
+
+function addInstanceProblem(){
+  const slug = typedSlug();
+  const mayPlain = !capacityState || capacityState.may_deploy_plain;
+  // ⚠️ Blank means "the general ATLAS", and there can be only one. Refusing it
+  // here rather than after the deploy keeps the operator out of a state where a
+  // slug is claimed and nothing was built.
+  if (!slug && !mayPlain)
+    return 'This box already has a general ATLAS. Enter an agency slug.';
+  if (slug && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(slug))
+    return 'That slug cannot be used as a hostname.';
+  if (slug && (capacityState.slugs || []).indexOf(slug) !== -1)
+    return 'There is already a deployment for ' + slug + '.';
+  if (currentMode() === 'fixed'){
+    const size = document.getElementById('instanceSize');
+    if (!size || size.value === '' || Number(size.value) <= 0)
+      return 'Enter a size for a fixed deployment.';
+  }
+  return null;
+}
+
+function refreshAddGate(){
+  const problem = addInstanceProblem();
+  const btn = document.getElementById('createInstanceBtn');
+  const gate = document.getElementById('addInstanceGate');
+  if (btn) btn.disabled = problem !== null;
+  if (gate) gate.textContent = problem || '';
+}
+
+function openInstanceConfirm(){
+  if (addInstanceProblem() !== null) return;
+  const slug = typedSlug();
+  const mode = currentMode();
+  const size = document.getElementById('instanceSize');
+  const rows = [
+    '  agency      ' + (slug || 'none — the box\u2019s general ATLAS'),
+    '  hostname    ' + (slug ? 'atlas.' + slug + '.<your-domain>' : 'atlas.<your-domain>'),
+    '  type        ' + mode,
+    '  storage     ' + (mode === 'fixed'
+      ? (size.value + ' GB, reserved and held')
+      : ('shares the ' + ((capacityState && capacityState.pool_gb) || 0) + ' GB pool'))
+  ];
+  document.getElementById('instanceConfirmSummary').textContent = rows.join('\n');
+  document.getElementById('instanceConfirmNote').textContent = mode === 'fixed'
+    ? 'Free disk drops by this much straight away, and neither the type nor the slug can be changed afterwards.'
+    : 'Nothing is taken from the box now. Neither the type nor the slug can be changed afterwards.';
+  document.getElementById('instanceModal').classList.add('open');
+}
+
+function closeInstanceConfirm(){
+  document.getElementById('instanceModal').classList.remove('open');
+}
+
+function confirmCreateInstance(){
+  closeInstanceConfirm();
+  createInstance();
 }
 
 function refreshCapacity(){
@@ -837,48 +1001,15 @@ function closeAddInstance(){
   if (form) form.hidden = true;
 }
 
-function onAgencyKindChanged(){
-  const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
-  const field = document.getElementById('slugField');
-  // ⚠️ A plain deployment has no slug at all, so the prompt is not merely
-  // optional — it is absent, and nothing it holds is sent.
-  const wantsSlug = !yes || yes.checked;
-  if (field) field.style.display = wantsSlug ? '' : 'none';
-}
 
-function onModeChanged(){
-  const dynamic = document.querySelector('input[name="sizeMode"][value="dynamic"]');
-  const isDynamic = dynamic && dynamic.checked;
-  const label = document.getElementById('sizeLabel');
-  const note = document.getElementById('modeNote');
-  // ⚠️ One field, two meanings. Calling a ceiling "reserved" is the dishonest
-  // number W213 was about, in the place where the operator chooses it.
-  if (label) label.textContent = isDynamic ? 'Maximum storage' : 'Reserved storage';
-  if (note) note.textContent = isDynamic
-    ? 'Free disk does not drop now. It drops as this agency stores things, and returns when they are deleted.'
-    : 'Free disk drops by this much immediately - that is the reservation working, not a leak.';
-}
 
-function previewSlug(){
-  const input = document.getElementById('agencySlug');
-  const out = document.getElementById('slugPreview');
-  if (!input || !out) return;
-  // ⚠️ Shows what will actually be used. Case is forced, so echoing what was
-  // typed would show a hostname that is not the one created.
-  const slug = (input.value || '').trim().toLowerCase();
-  out.textContent = slug
-    ? 'Will deploy as atlas.' + slug + '.<your-domain>'
-    : 'Lowercase letters, digits and hyphens. It becomes the hostname.';
-}
 
 function createInstance(){
   const btn = document.getElementById('createInstanceBtn');
   const err = document.getElementById('addInstanceError');
-  const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
-  const dynamic = document.querySelector('input[name="sizeMode"][value="dynamic"]');
-  const slug = document.getElementById('agencySlug');
+  const slug = typedSlug();
   const size = document.getElementById('instanceSize');
-  const agencySpecific = !yes || yes.checked;
+  const mode = currentMode();
   if (err) err.style.display = 'none';
   if (btn) btn.disabled = true;
   fetch('/api/atlas/instances', {
@@ -886,10 +1017,10 @@ function createInstance(){
     headers: {'Content-Type': 'application/json'},
     credentials: 'same-origin',
     body: JSON.stringify({
-      agency_specific: agencySpecific,
-      slug: agencySpecific && slug ? slug.value : null,
-      mode: dynamic && dynamic.checked ? 'dynamic' : 'fixed',
-      size_gb: size && size.value ? Number(size.value) : null
+      agency_specific: !!slug,
+      slug: slug || null,
+      mode: mode,
+      size_gb: (mode === 'fixed' && size && size.value) ? Number(size.value) : null
     })
   }).then(r => r.json()).then(d => {
     if (btn) btn.disabled = false;
