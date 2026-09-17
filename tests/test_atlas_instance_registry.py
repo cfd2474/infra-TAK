@@ -312,3 +312,29 @@ def test_the_facts_say_a_plain_deployment_is_still_available(roomy):
     facts = atlas.capacity_facts(Ctx(), size_gb=50)
 
     assert facts['may_deploy_plain'] is True
+
+
+def test_memory_is_read_as_available_not_free(tmp_path):
+    """⚠️ **`MemAvailable`, not `MemFree`.** On a box running eight stacks free
+    memory is near zero because the page cache holds the rest — planning against
+    it would refuse every instance the box could comfortably run. These are the
+    real proportions from the measured box: 32 GB total, 19.7 GB free, 20.5 GB
+    available."""
+    meminfo = tmp_path / 'meminfo'
+    meminfo.write_text(chr(10).join([
+        'MemTotal:       32862208 kB',
+        'MemFree:        20193280 kB',
+        'MemAvailable:   21027840 kB',
+        'Buffers:          102400 kB',
+        '',
+    ]), encoding='utf-8')
+
+    total, available = atlas._memory_bytes(str(meminfo))
+
+    assert total == 32862208 * 1024
+    assert available == 21027840 * 1024, 'planning read MemFree, not MemAvailable'
+
+
+def test_unreadable_memory_is_zero_rather_than_a_guess(tmp_path):
+    """A fabricated figure here would offer instances the box cannot run."""
+    assert atlas._memory_bytes(str(tmp_path / 'absent')) == (0, 0)

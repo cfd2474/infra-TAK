@@ -337,3 +337,132 @@ def test_the_streaming_log_keeps_a_stable_height(idle):
     rule = re.search(r'\.log-box\{([^}]*)\}', idle).group(1)
 
     assert "height:340px" in rule
+
+
+# --------------------------------------------------------------------------- #
+# Deployments: several ATLAS instances on one box (W216)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_deployments_card_is_always_offered(installed):
+    """The operator asked for it to be there always: *"there should always be an
+    option on the infratak atlas page to 'Deploy additional instance'"*."""
+    assert 'id="addInstanceBtn"' in installed
+    assert 'Deploy additional instance' in installed
+
+
+def test_one_card_lists_every_deployment(installed):
+    """⚠️ One card for N instances, not N cards. `register()` runs only at
+    console import, so a deployment created from this page would not exist as a
+    module until a restart — and the button has to work without one."""
+    assert installed.count('id="instancesCard"') == 1
+    assert 'id="instanceList"' in installed
+
+
+def test_the_agency_question_is_asked(installed):
+    """*"Every instance should ask if this is an agency specific deployment."*"""
+    span = installed[installed.index('id="agencyChoice"'):]
+    assert 'specific agency' in span[:600]
+    assert 'agencyKind' in span[:900]
+
+
+def test_the_slug_is_prompted_for_separately(installed):
+    """*"if yes, now needs a new slug prompt"* — and it is its own field, so a
+    plain deployment simply does not have one."""
+    assert 'id="slugField"' in installed
+    assert 'id="agencySlug"' in installed
+
+
+def test_the_question_disappears_from_the_server_s_own_predicate(installed):
+    """⚠️ **The rule, and where it is decided.** `may_deploy_plain` comes from
+    the module, and the page hides the question from that rather than from
+    anything it counts itself — otherwise the page and the validator could
+    disagree, and the operator would be refused by a rule the screen did not
+    show."""
+    body = function_body(installed, 'renderInstances')
+
+    assert 'may_deploy_plain' in body
+    assert "getElementById('agencyChoice')" in body
+    assert 'id="agencyForced"' in installed
+
+
+def test_a_forced_agency_deployment_preselects_the_only_answer(installed):
+    """With the question hidden there is still a radio behind it, and it has to
+    hold the answer the server will accept."""
+    body = function_body(installed, 'renderInstances')
+
+    assert 'value="agencyKind"' not in body  # not a typo'd selector
+    assert 'agencyKind' in body and 'checked = true' in body
+
+
+def test_both_sizing_modes_are_offered(installed):
+    assert 'value="fixed"' in installed
+    assert 'value="dynamic"' in installed
+
+
+def test_the_size_field_is_relabelled_by_mode(installed):
+    """⚠️ One field, two meanings. Calling a ceiling "reserved" is the dishonest
+    number W213 was about, in the very place an operator chooses it."""
+    body = function_body(installed, 'onModeChanged')
+
+    assert 'Maximum storage' in body
+    assert 'Reserved storage' in body
+
+
+def test_each_mode_says_what_happens_to_free_disk(installed):
+    body = function_body(installed, 'onModeChanged')
+
+    assert 'does not drop now' in body
+    assert 'drops by this much immediately' in body
+
+
+def test_the_slug_preview_shows_what_will_actually_be_used(installed):
+    """⚠️ Case is forced, so echoing what was typed would show a hostname that
+    is not the one created."""
+    body = function_body(installed, 'previewSlug')
+
+    assert 'toLowerCase()' in body
+    assert 'atlas.' in body
+
+
+def test_the_capacity_panel_names_the_binding_constraint(installed):
+    """⚠️ The panel's whole job beyond adding up. Disk 4, memory 12 — an
+    operator shown only the larger number would plan for three times what
+    fits."""
+    body = function_body(installed, 'renderInstances')
+
+    assert 'is the limit' in body
+    assert 'c.binding' in body
+    assert 'by_disk' in body and 'by_ram' in body
+
+
+def test_the_capacity_panel_shows_the_protected_floor(installed):
+    body = function_body(installed, 'renderInstances')
+
+    assert 'floor_gb' in body
+
+
+def test_capacity_is_fetched_live_rather_than_rendered_once(installed):
+    """⚠️ Free space and memory move as the other modules grow. A figure baked
+    in at page load would offer room that has since gone, and the operator would
+    then be refused by a validator quoting a different number."""
+    body = function_body(installed, 'refreshCapacity')
+
+    assert "fetch('/api/atlas/instances" in body
+
+
+def test_a_plain_deployment_sends_no_slug(installed):
+    """⚠️ "No slug" and "the operator left it blank" are different answers, so
+    the page sends the choice explicitly rather than letting the server guess
+    from an empty string."""
+    body = function_body(installed, 'createInstance')
+
+    assert 'agency_specific' in body
+    assert 'agencySpecific && slug' in body
+
+
+def test_a_refused_deployment_shows_the_reason(installed):
+    body = function_body(installed, 'createInstance')
+
+    assert 'addInstanceError' in body
+    assert 'd.error' in body

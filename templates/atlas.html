@@ -217,6 +217,109 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
 
   {% else %}
+  <!--
+    Deployments (W216).
+
+    ⚠️ **One card listing N instances, not N cards.** The registry holds any
+    number of distinct keys, but `register()` runs only at console import — so a
+    deployment created here would not exist as a module until a restart, and
+    "Deploy additional instance" has to work without one.
+  -->
+  <div class="card" id="instancesCard">
+    <div class="card-title">ATLAS deployments</div>
+
+    <div id="instanceList" class="note">Reading this box&hellip;</div>
+
+    <!--
+      ⚠️ **The capacity panel names the binding constraint.** On the box
+      measured, disk allowed four or five more instances and memory about
+      twelve; an operator shown only the larger figure would plan for three
+      times what fits.
+    -->
+    <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
+
+    <button class="btn btn-primary" id="addInstanceBtn"
+            onclick="openAddInstance()" style="margin-top:16px">
+      Deploy additional instance
+    </button>
+
+    <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+
+      <!--
+        ⚠️ **Asked only while a plain deployment is still possible.** The
+        operator's rule: once a non-agency ATLAS exists another cannot be
+        deployed, so the question has one possible answer and is not put. The
+        block is hidden by `renderInstances` from the server's own predicate
+        rather than from anything counted here, so the page and the validator
+        cannot disagree.
+      -->
+      <div id="agencyChoice" style="margin-bottom:14px">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Is this deployment for a specific agency?
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="agencyKind" value="yes" checked
+                 onchange="onAgencyKindChanged()"> Yes — it gets its own slug and hostname
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="agencyKind" value="no"
+                 onchange="onAgencyKindChanged()"> No — this is the box's general ATLAS
+        </label>
+      </div>
+
+      <p class="note" id="agencyForced" style="display:none;margin-bottom:14px">
+        This box already has a general ATLAS, so further deployments are
+        agency-specific.
+      </p>
+
+      <div id="slugField" style="margin-bottom:14px">
+        <label for="agencySlug" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency slug
+        </label>
+        <input type="text" id="agencySlug" placeholder="e.g. county-sheriff"
+               oninput="previewSlug()"
+               style="width:260px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" id="slugPreview" style="margin:6px 0 0">
+          Lowercase letters, digits and hyphens. It becomes the hostname.
+        </p>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Storage
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="fixed" checked
+                 onchange="onModeChanged()">
+          <strong>Fixed</strong> — the space is taken from the box now and held for this agency
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="dynamic"
+                 onchange="onModeChanged()">
+          <strong>Dynamic</strong> — a ceiling; space is taken as it is used and given back when freed
+        </label>
+        <p class="note" id="modeNote" style="margin:8px 0 0"></p>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label for="instanceSize" id="sizeLabel"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Reserved storage
+        </label>
+        <input type="number" id="instanceSize" min="2" step="1" placeholder="e.g. 50"
+               oninput="refreshCapacity()"
+               style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
+      </div>
+
+      <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
+      <button class="btn btn-primary" id="createInstanceBtn" onclick="createInstance()">
+        Create deployment
+      </button>
+      <button class="btn btn-secondary" onclick="closeAddInstance()">Cancel</button>
+    </div>
+  </div>
+
   <div class="card">
     <div class="card-title">Status</div>
     <div class="url-row"><strong>Console</strong>
@@ -656,6 +759,141 @@ function confirmDeploy(){
 // ⚠️ Shown again on refusal or failure, because a retry needs the reserved
 // storage field that lives on it. Hiding it and leaving it hidden would strand
 // an operator on a page with nothing left to act on.
+// --------------------------------------------------------------------------- //
+// Deployments (W216)
+// --------------------------------------------------------------------------- //
+
+let capacityState = null;
+
+function renderInstances(data){
+  const list = document.getElementById('instanceList');
+  const panel = document.getElementById('capacityPanel');
+  if (!list) return;
+  capacityState = data.capacity || {};
+
+  const rows = (data.instances || []).map(i => {
+    const name = i.slug ? i.slug : 'general (no slug)';
+    const held = i.mode === 'fixed' ? 'reserved' : 'maximum';
+    return '  ' + name.padEnd(24) + String(i.size_gb || 0).padStart(5) +
+           ' GB ' + held.padEnd(9) + ' ' + i.mode;
+  });
+  list.textContent = rows.length
+    ? 'Deployments on this box:\n' + rows.join('\n')
+    : 'No ATLAS deployment on this box yet.';
+
+  // ⚠️ The question disappears from the server's own predicate, never from a
+  // count made here — the page and the validator must not be able to disagree.
+  const choice = document.getElementById('agencyChoice');
+  const forced = document.getElementById('agencyForced');
+  const mayPlain = !!capacityState.may_deploy_plain;
+  if (choice) choice.style.display = mayPlain ? '' : 'none';
+  if (forced) forced.style.display = mayPlain ? 'none' : '';
+  if (!mayPlain){
+    const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
+    if (yes) yes.checked = true;
+  }
+  onAgencyKindChanged();
+
+  if (panel){
+    const c = capacityState;
+    panel.style.display = '';
+    panel.textContent =
+      'ATLAS budget      ' + c.budget_gb + ' GB   (floor ' + c.floor_gb + ' GB protected)\n' +
+      'committed         ' + c.committed_gb + ' GB across ' + c.instances + '\n' +
+      'remaining         ' + c.remaining_gb + ' GB\n' +
+      '\n' +
+      'disk allows       ' + c.by_disk + ' more\n' +
+      'memory allows     ' + c.by_ram + ' more   (' + c.per_instance_peak_gb + ' GB peak each)\n' +
+      '\n' +
+      'room for ' + c.room_for + ' more - ' + c.binding + ' is the limit';
+  }
+}
+
+function refreshCapacity(){
+  const size = document.getElementById('instanceSize');
+  const q = size && size.value ? ('?size_gb=' + encodeURIComponent(size.value)) : '';
+  fetch('/api/atlas/instances' + q, {credentials:'same-origin'})
+    .then(r => r.json())
+    .then(renderInstances)
+    .catch(() => {});
+}
+
+function openAddInstance(){
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = false;
+  refreshCapacity();
+}
+
+function closeAddInstance(){
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = true;
+}
+
+function onAgencyKindChanged(){
+  const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
+  const field = document.getElementById('slugField');
+  // ⚠️ A plain deployment has no slug at all, so the prompt is not merely
+  // optional — it is absent, and nothing it holds is sent.
+  const wantsSlug = !yes || yes.checked;
+  if (field) field.style.display = wantsSlug ? '' : 'none';
+}
+
+function onModeChanged(){
+  const dynamic = document.querySelector('input[name="sizeMode"][value="dynamic"]');
+  const isDynamic = dynamic && dynamic.checked;
+  const label = document.getElementById('sizeLabel');
+  const note = document.getElementById('modeNote');
+  // ⚠️ One field, two meanings. Calling a ceiling "reserved" is the dishonest
+  // number W213 was about, in the place where the operator chooses it.
+  if (label) label.textContent = isDynamic ? 'Maximum storage' : 'Reserved storage';
+  if (note) note.textContent = isDynamic
+    ? 'Free disk does not drop now. It drops as this agency stores things, and returns when they are deleted.'
+    : 'Free disk drops by this much immediately - that is the reservation working, not a leak.';
+}
+
+function previewSlug(){
+  const input = document.getElementById('agencySlug');
+  const out = document.getElementById('slugPreview');
+  if (!input || !out) return;
+  // ⚠️ Shows what will actually be used. Case is forced, so echoing what was
+  // typed would show a hostname that is not the one created.
+  const slug = (input.value || '').trim().toLowerCase();
+  out.textContent = slug
+    ? 'Will deploy as atlas.' + slug + '.<your-domain>'
+    : 'Lowercase letters, digits and hyphens. It becomes the hostname.';
+}
+
+function createInstance(){
+  const btn = document.getElementById('createInstanceBtn');
+  const err = document.getElementById('addInstanceError');
+  const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
+  const dynamic = document.querySelector('input[name="sizeMode"][value="dynamic"]');
+  const slug = document.getElementById('agencySlug');
+  const size = document.getElementById('instanceSize');
+  const agencySpecific = !yes || yes.checked;
+  if (err) err.style.display = 'none';
+  if (btn) btn.disabled = true;
+  fetch('/api/atlas/instances', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      agency_specific: agencySpecific,
+      slug: agencySpecific && slug ? slug.value : null,
+      mode: dynamic && dynamic.checked ? 'dynamic' : 'fixed',
+      size_gb: size && size.value ? Number(size.value) : null
+    })
+  }).then(r => r.json()).then(d => {
+    if (btn) btn.disabled = false;
+    if (!d.success){
+      if (err){ err.textContent = d.error || 'Could not create the deployment.'; err.style.display = ''; }
+      return;
+    }
+    closeAddInstance();
+    refreshCapacity();
+  }).catch(() => { if (btn) btn.disabled = false; });
+}
+
 function setInstallCard(visible){
   const card = document.getElementById('installCard');
   if (card) card.style.display = visible ? '' : 'none';
@@ -845,6 +1083,7 @@ function pollUpdate(){
 }
 
 {% if installed %}loadLogs(); loadVersion();{% endif %}
+{% if installed %}refreshCapacity();{% endif %}
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
 {% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
 

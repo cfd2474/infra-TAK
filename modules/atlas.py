@@ -647,15 +647,18 @@ def fits_here(ctx, size_gb, instances=None):
     return atlas_instances.fits(size_gb, instances, budget)
 
 
-def _memory_bytes():
+def _memory_bytes(path='/proc/meminfo'):
     """`(total, available)` from /proc/meminfo, or `(0, 0)`.
+
+    The path is a parameter so this can be checked against a real
+    meminfo body on a machine that has none.
 
     ⚠️ `MemAvailable`, not `MemFree`. Free memory on a box running eight stacks
     is near zero because the page cache holds the rest, and planning against it
     would refuse every instance the box could comfortably run.
     """
     try:
-        with open('/proc/meminfo') as fh:
+        with open(path) as fh:
             fields = {}
             for line in fh:
                 name, _, rest = line.partition(':')
@@ -2961,6 +2964,49 @@ def register(ctx):
         steps.append('you will need it to renew, in about five years.')
         return jsonify({'success': True, 'steps': steps})
 
+    def instances_view():
+        """The deployments on this box, and how much room is left for more.
+
+        ⚠️ A live route, not a value baked into the page, for the same reason
+        `store_view` is: free space and memory move as the other modules grow,
+        and a figure rendered once at load would offer room that has since gone.
+        """
+        try:
+            from flask import request as _rq
+            size = _rq.args.get('size_gb', type=float)
+            found = load_instances(ctx)
+            return jsonify({
+                'instances': [
+                    dict(i, paths={k: instance_paths(ctx, i)[k]
+                                   for k in ('dir', 'vhost', 'compose_project')})
+                    for i in found
+                ],
+                'capacity': capacity_facts(ctx, size_gb=size),
+            })
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    def instance_create_view():
+        """Record a new deployment. Does not build it — that is the deploy job.
+
+        ⚠️ **`agency_specific` is sent explicitly rather than inferred from the
+        slug.** "No slug" and "the operator left the slug blank" are different
+        answers, and guessing between them would let an empty box silently
+        receive a plain deployment when an agency one was intended.
+        """
+        from flask import request as _rq
+        data = _rq.get_json(silent=True) or {}
+        inst, err = add_instance(
+            ctx,
+            bool(data.get('agency_specific')),
+            data.get('slug'),
+            data.get('mode'),
+            data.get('size_gb'),
+        )
+        if err:
+            return jsonify({'success': False, 'error': err}), 400
+        return jsonify({'success': True, 'instance': inst})
+
     def store_view():
         """What the box can offer, and what the reservation is doing (W205).
 
@@ -3033,6 +3079,10 @@ def register(ctx):
              'endpoint': f'{KEY}_logs', 'view': logs_view},
             {'url': f'/api/{KEY}/version', 'methods': ['GET'],
              'endpoint': f'{KEY}_version', 'view': version_view},
+            {'url': f'/api/{KEY}/instances', 'methods': ['GET'],
+             'endpoint': f'{KEY}_instances', 'view': instances_view},
+            {'url': f'/api/{KEY}/instances', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_create', 'view': instance_create_view},
             {'url': f'/api/{KEY}/store', 'methods': ['GET'],
              'endpoint': f'{KEY}_store', 'view': store_view},
             {'url': f'/api/{KEY}/update', 'methods': ['POST'],
