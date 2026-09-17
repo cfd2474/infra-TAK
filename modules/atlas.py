@@ -713,6 +713,33 @@ def version_drift(ctx):
         'available': _latest_version(use_cache=True),
     }
 
+
+def caddy_sites(settings, plain_host):
+    """One entry per deployment, for the console's Caddyfile generator (W216).
+
+    ⚠️ **Exactly one entry on a box with a single deployment**, carrying the same
+    host, upstream and CA path the generator used before this existed — so the
+    emitted Caddyfile is unchanged there. That property is what makes this safe
+    to land on a live box: a Caddyfile that differs by one character takes every
+    vhost on the machine with it, not just ATLAS's.
+
+    Each agency needs its own device CA path, because `client_auth` verifies
+    against exactly one trust pool: pointing two agencies at one file would have
+    Caddy accept either agency's devices at either agency's hostname.
+    """
+    ctx = {'load_settings': lambda: settings}
+    sites = []
+    for inst in load_instances(ctx):
+        slug = (inst or {}).get('slug')
+        port = (inst or {}).get('port') or atlas_instances.BASE_PORT
+        sites.append({
+            'slug': slug,
+            'host': atlas_instances.agency_host(plain_host, slug),
+            'upstream': f'127.0.0.1:{port}',
+            'ca_path': sync_device_ca_for_caddy(inst),
+        })
+    return sites
+
 def _store_mount(ctx, inst=None):
     return instance_paths(ctx, inst)['mount']
 
@@ -2057,7 +2084,7 @@ def deploy(ctx, job, params):
 # sanctioned direction (rule 10: a module imports nothing from app.py).
 # --------------------------------------------------------------------------- #
 
-def sync_device_ca_for_caddy():
+def sync_device_ca_for_caddy(inst=None):
     """Deploy a Caddy-readable copy of ATLAS's device CA; return its path or None.
 
     ATLAS issues its own client certificates to enrolled tablets, and Caddy has
@@ -2072,7 +2099,14 @@ def sync_device_ca_for_caddy():
     file-read away.
     """
     import shutil, pwd
-    for base_dir in ('/root/atlas', os.path.expanduser('~/atlas')):
+    # ⚠️ The instance's own directory first, then the two historical locations
+    # for the plain deployment. Dropping the legacy probe would break a box whose
+    # checkout predates `install_base`, and keeping it costs two `os.path.exists`
+    # calls.
+    candidates = [instance_paths(None, inst)['dir']]
+    if not atlas_instances.derive(inst)['slug']:
+        candidates += ['/root/atlas', os.path.expanduser('~/atlas')]
+    for base_dir in candidates:
         src = os.path.join(base_dir, 'pki', 'ca.crt')
         if os.path.exists(src):
             break
@@ -2111,7 +2145,11 @@ def sync_device_ca_for_caddy():
         except KeyError:
             caddy_pw = None
             base = '/var/lib/caddy'
-        dest_dir = os.path.join(base, KEY)
+        # ⚠️ One directory per deployment. A shared `atlas/device-ca.crt`
+        # would have the last instance to deploy overwrite every other
+        # agency's trust pool — and Caddy would then verify one agency's
+        # devices against another agency's CA.
+        dest_dir = os.path.join(base, atlas_instances.derive(inst)['name'])
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'device-ca.crt')
         with open(dest, 'w') as fh:

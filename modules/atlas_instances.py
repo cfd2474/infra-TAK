@@ -232,6 +232,26 @@ def derive(instance, fqdn=None):
     }
 
 
+def agency_host(plain_host, slug):
+    """`atlas.example.com` + `agency-a` -> `atlas.agency-a.example.com`.
+
+    ⚠️ The slug is inserted after the *first* label rather than prepended to the
+    whole name, so a box whose console is at `mdm.example.com` gets
+    `mdm.agency-a.example.com` and not `agency-a.mdm.example.com`. The first
+    label is the service; the agency qualifies it.
+
+    ⚠️ A third-level label needs its own DNS record and its own certificate.
+    There is no wildcard in this deployment — 13 named per-host certificates —
+    and `tiles.map.<fqdn>` already proves the shape works here.
+    """
+    if not plain_host or not slug:
+        return plain_host
+    head, dot, rest = plain_host.partition('.')
+    if not dot:
+        return f'{head}.{slug}'
+    return f'{head}.{slug}.{rest}'
+
+
 # --------------------------------------------------------------------------- #
 # Capacity: what this box can still take
 # --------------------------------------------------------------------------- #

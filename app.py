@@ -29296,11 +29296,21 @@ def generate_caddyfile(settings=None):
         _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
 
     atlas_mod = modules.get('atlas', {})
-    if atlas_mod.get('installed'):
-        at_host = sd.get('atlas') or _get_service_domain(settings, 'atlas')
-        at_up = '127.0.0.1:8760'
+    # W216 — one console vhost, one plain-HTTP APK vhost and one device site per
+    # ATLAS deployment, because a box may host several (one per agency).
+    #
+    # The body below is unchanged: replacing the `if` with a `for` at the same
+    # indent keeps it where it was, which matters because a Caddyfile that
+    # differs by one character takes every vhost on this box with it, not just
+    # ATLAS's. `caddy_sites` returns exactly one entry for a single deployment,
+    # carrying the host, upstream and CA path this block used before.
+    for _at_site in (mod_registry.atlas.caddy_sites(
+            settings, sd.get('atlas') or _get_service_domain(settings, 'atlas'))
+            if atlas_mod.get('installed') else []):
+        at_host = _at_site['host']
+        at_up = _at_site['upstream']
         at_device_paths = '/api/v1/device/* /api/v1/enroll /api/v1/provisioning/*'
-        at_ca = mod_registry.atlas.sync_device_ca_for_caddy()
+        at_ca = _at_site['ca_path']
 
         # Administration console (443). Admin tooling, so Authentik fronts it and
         # the device paths are refused here — a tablet cannot complete an
@@ -29364,7 +29374,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"    respond 404")
         lines.append(f"}}")
         lines.append("")
-        _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
+        if _at_site['slug'] is None:
+            # The alias names the box's general ATLAS. Emitting it per
+            # agency would point one name at several hosts.
+            _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
 
         # The agent package, in the clear on the well-known port.
         #
