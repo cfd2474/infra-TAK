@@ -47,7 +47,6 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
 <div class="main">
   <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
 
-  {% if not installed %}
   <!--
     ⚠️ **The deploy log is the first card, above Install.** It used to be
     last, so the one thing an operator watches for five to ten minutes sat
@@ -69,6 +68,118 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
   </div>
 
+  <!--
+    ⚠️ **Outside the installed/not-installed branch, deliberately.** This card
+    lived in the installed-only arm, so a box with nothing deployed saw only the
+    legacy Install form — fixed size, no slug, no choice of mode. The *first*
+    deployment is exactly the one that most needs them: neither choice can be
+    changed afterwards, because `resize2fs` will not shrink a mounted filesystem
+    and a fixed store cannot become sparse once its blocks are allocated.
+  -->
+  <!--
+    Deployments (W216).
+
+    ⚠️ **One card listing N instances, not N cards.** The registry holds any
+    number of distinct keys, but `register()` runs only at console import — so a
+    deployment created here would not exist as a module until a restart, and
+    "Deploy additional instance" has to work without one.
+  -->
+  <div class="card" id="instancesCard">
+    <div class="card-title">ATLAS deployments</div>
+
+    <div id="instanceList" class="note">Reading this box&hellip;</div>
+
+    <!--
+      ⚠️ **The capacity panel names the binding constraint.** On the box
+      measured, disk allowed four or five more instances and memory about
+      twelve; an operator shown only the larger figure would plan for three
+      times what fits.
+    -->
+    <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
+
+    <button class="btn btn-primary" id="addInstanceBtn"
+            onclick="openAddInstance()" style="margin-top:16px">
+      Deploy additional instance
+    </button>
+
+    <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+
+      <!--
+        ⚠️ **Asked only while a plain deployment is still possible.** The
+        operator's rule: once a non-agency ATLAS exists another cannot be
+        deployed, so the question has one possible answer and is not put. The
+        block is hidden by `renderInstances` from the server's own predicate
+        rather than from anything counted here, so the page and the validator
+        cannot disagree.
+      -->
+      <div id="agencyChoice" style="margin-bottom:14px">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Is this deployment for a specific agency?
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="agencyKind" value="yes" checked
+                 onchange="onAgencyKindChanged()"> Yes — it gets its own slug and hostname
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="agencyKind" value="no"
+                 onchange="onAgencyKindChanged()"> No — this is the box's general ATLAS
+        </label>
+      </div>
+
+      <p class="note" id="agencyForced" style="display:none;margin-bottom:14px">
+        This box already has a general ATLAS, so further deployments are
+        agency-specific.
+      </p>
+
+      <div id="slugField" style="margin-bottom:14px">
+        <label for="agencySlug" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency slug
+        </label>
+        <input type="text" id="agencySlug" placeholder="e.g. county-sheriff"
+               oninput="previewSlug()"
+               style="width:260px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" id="slugPreview" style="margin:6px 0 0">
+          Lowercase letters, digits and hyphens. It becomes the hostname.
+        </p>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Storage
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="fixed" checked
+                 onchange="onModeChanged()">
+          <strong>Fixed</strong> — the space is taken from the box now and held for this agency
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="dynamic"
+                 onchange="onModeChanged()">
+          <strong>Dynamic</strong> — a ceiling; space is taken as it is used and given back when freed
+        </label>
+        <p class="note" id="modeNote" style="margin:8px 0 0"></p>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label for="instanceSize" id="sizeLabel"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Reserved storage
+        </label>
+        <input type="number" id="instanceSize" min="2" step="1" placeholder="e.g. 50"
+               oninput="refreshCapacity()"
+               style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
+      </div>
+
+      <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
+      <button class="btn btn-primary" id="createInstanceBtn" onclick="createInstance()">
+        Create deployment
+      </button>
+      <button class="btn btn-secondary" onclick="closeAddInstance()">Cancel</button>
+    </div>
+  </div>
+
+  {% if not installed %}
   <!--
     ⚠️ **Hidden while a deploy runs**, server-side here and again in
     `startDeploy`, because nothing on it can be acted on once one is under
@@ -217,109 +328,6 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
 
   {% else %}
-  <!--
-    Deployments (W216).
-
-    ⚠️ **One card listing N instances, not N cards.** The registry holds any
-    number of distinct keys, but `register()` runs only at console import — so a
-    deployment created here would not exist as a module until a restart, and
-    "Deploy additional instance" has to work without one.
-  -->
-  <div class="card" id="instancesCard">
-    <div class="card-title">ATLAS deployments</div>
-
-    <div id="instanceList" class="note">Reading this box&hellip;</div>
-
-    <!--
-      ⚠️ **The capacity panel names the binding constraint.** On the box
-      measured, disk allowed four or five more instances and memory about
-      twelve; an operator shown only the larger figure would plan for three
-      times what fits.
-    -->
-    <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
-
-    <button class="btn btn-primary" id="addInstanceBtn"
-            onclick="openAddInstance()" style="margin-top:16px">
-      Deploy additional instance
-    </button>
-
-    <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
-
-      <!--
-        ⚠️ **Asked only while a plain deployment is still possible.** The
-        operator's rule: once a non-agency ATLAS exists another cannot be
-        deployed, so the question has one possible answer and is not put. The
-        block is hidden by `renderInstances` from the server's own predicate
-        rather than from anything counted here, so the page and the validator
-        cannot disagree.
-      -->
-      <div id="agencyChoice" style="margin-bottom:14px">
-        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-          Is this deployment for a specific agency?
-        </label>
-        <label class="note" style="display:block">
-          <input type="radio" name="agencyKind" value="yes" checked
-                 onchange="onAgencyKindChanged()"> Yes — it gets its own slug and hostname
-        </label>
-        <label class="note" style="display:block">
-          <input type="radio" name="agencyKind" value="no"
-                 onchange="onAgencyKindChanged()"> No — this is the box's general ATLAS
-        </label>
-      </div>
-
-      <p class="note" id="agencyForced" style="display:none;margin-bottom:14px">
-        This box already has a general ATLAS, so further deployments are
-        agency-specific.
-      </p>
-
-      <div id="slugField" style="margin-bottom:14px">
-        <label for="agencySlug" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-          Agency slug
-        </label>
-        <input type="text" id="agencySlug" placeholder="e.g. county-sheriff"
-               oninput="previewSlug()"
-               style="width:260px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
-        <p class="note" id="slugPreview" style="margin:6px 0 0">
-          Lowercase letters, digits and hyphens. It becomes the hostname.
-        </p>
-      </div>
-
-      <div style="margin-bottom:14px">
-        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-          Storage
-        </label>
-        <label class="note" style="display:block">
-          <input type="radio" name="sizeMode" value="fixed" checked
-                 onchange="onModeChanged()">
-          <strong>Fixed</strong> — the space is taken from the box now and held for this agency
-        </label>
-        <label class="note" style="display:block">
-          <input type="radio" name="sizeMode" value="dynamic"
-                 onchange="onModeChanged()">
-          <strong>Dynamic</strong> — a ceiling; space is taken as it is used and given back when freed
-        </label>
-        <p class="note" id="modeNote" style="margin:8px 0 0"></p>
-      </div>
-
-      <div style="margin-bottom:14px">
-        <label for="instanceSize" id="sizeLabel"
-               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-          Reserved storage
-        </label>
-        <input type="number" id="instanceSize" min="2" step="1" placeholder="e.g. 50"
-               oninput="refreshCapacity()"
-               style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
-        <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
-      </div>
-
-      <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
-      <button class="btn btn-primary" id="createInstanceBtn" onclick="createInstance()">
-        Create deployment
-      </button>
-      <button class="btn btn-secondary" onclick="closeAddInstance()">Cancel</button>
-    </div>
-  </div>
-
   <div class="card">
     <div class="card-title">Status</div>
     <div class="url-row"><strong>Console</strong>
@@ -891,6 +899,10 @@ function createInstance(){
     }
     closeAddInstance();
     refreshCapacity();
+    // ⚠️ Recording a deployment is not deploying one. The instance row claims
+    // the slug and the port; this is what builds it, carrying the mode and slug
+    // so the store is created the way the operator chose.
+    startDeployFor(d.instance);
   }).catch(() => { if (btn) btn.disabled = false; });
 }
 
@@ -908,6 +920,29 @@ function setInstallCard(visible){
 function setDeployNote(visible){
   const note = document.getElementById('deployNote');
   if (note) note.style.display = visible ? '' : 'none';
+}
+
+function startDeployFor(inst){
+  // The deploy for one recorded instance. `store_gb` still carries the size,
+  // because that is what `deploy_validate` measures against the box's free
+  // space; `mode` and `slug` are what the older single-instance path could not
+  // express.
+  const body = {
+    store_gb: inst && inst.size_gb,
+    mode: inst && inst.mode,
+    slug: (inst && inst.slug) || null
+  };
+  setInstallCard(false);
+  setDeployNote(true);
+  fetch('/api/atlas/deploy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+    credentials: 'same-origin'
+  }).then(r => r.json()).then(d => {
+    if (d.error) { setInstallCard(true); setDeployNote(false); alert(d.error); return; }
+    polling = true; pollDeploy();
+  }).catch(() => { setInstallCard(true); setDeployNote(false); });
 }
 
 function startDeploy(){
@@ -1083,7 +1118,7 @@ function pollUpdate(){
 }
 
 {% if installed %}loadLogs(); loadVersion();{% endif %}
-{% if installed %}refreshCapacity();{% endif %}
+refreshCapacity();
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
 {% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
 

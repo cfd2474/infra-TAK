@@ -1625,11 +1625,18 @@ def atlas_dir(ctx=None):
     return posixpath.join(install_base(ctx), KEY)
 
 
-def _compose_argv(ctx, *action):
-    return ['docker', 'compose', '--project-directory', atlas_dir(ctx)] + list(action)
+def _compose_argv(ctx, *action, inst=None):
+    paths = instance_paths(ctx, inst)
+    argv = ['docker', 'compose', '--project-directory', paths['dir']]
+    if paths['slug']:
+        # ⚠️ Only for agencies. The plain deployment takes its project name from
+        # the compose file exactly as before, so its argv is unchanged — and an
+        # unchanged argv is what keeps a running deployment running.
+        argv += ['-p', paths['compose_project']]
+    return argv + list(action)
 
 
-def _compose(ctx, action, timeout=180):
+def _compose(ctx, action, timeout=180, inst=None):
     """Run `docker compose <action>` in the install directory, via the broker.
 
     ⚠️ **`action` is a string, not argv.** `_broker_compose` does
@@ -1639,7 +1646,13 @@ def _compose(ctx, action, timeout=180):
     opposite: the registry sudo-wraps and runs that one itself, so it takes a
     real argv list. Two neighbouring seams, two conventions.
     """
-    return ctx['_broker_compose'](atlas_dir(ctx), action, timeout=timeout)
+    paths = instance_paths(ctx, inst)
+    if paths['slug']:
+        # `-p` is a global flag, so it goes before the subcommand. The broker
+        # shlex-splits `action` and appends it after `--project-directory`,
+        # which is exactly where this needs to land.
+        action = f"-p {paths['compose_project']} " + action
+    return ctx['_broker_compose'](paths['dir'], action, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -1725,7 +1738,18 @@ def deploy_validate(data):
     size, error = validate_store_size(raw, free, 0, reserved)
     if error:
         return {}, error
-    return {'store_bytes': size}, None
+
+    # ⚠️ The sizing mode and the agency travel with the deploy, because the
+    # store is built during it and cannot be changed afterwards: `resize2fs`
+    # will not shrink a mounted filesystem, and a fixed store cannot become
+    # sparse once its blocks are allocated. Choosing wrong here is not a setting
+    # an operator can correct later.
+    mode, error = atlas_instances.validate_mode(
+        data.get('mode') or atlas_instances.MODE_FIXED)
+    if error:
+        return {}, error
+    return {'store_bytes': size, 'mode': mode,
+            'slug': (data.get('slug') or None)}, None
 
 
 def _stale_deploy_key(dirpath):
@@ -1801,8 +1825,12 @@ def _verify_pin(ctx, dirpath, plog):
 
 def deploy(ctx, job, params):
     plog = _plog
-    dirpath = atlas_dir(ctx)
     params = params or {}
+    # ⚠️ The deployment being built, which is the plain one unless a slug was
+    # chosen. Resolved from the recorded list rather than from the request, so a
+    # deploy cannot build a deployment nobody registered.
+    _inst = atlas_instances.by_slug(load_instances(ctx), params.get('slug'))
+    dirpath = instance_paths(ctx, _inst)['dir']
     try:
         settings = ctx['load_settings']()
 
@@ -1876,7 +1904,8 @@ def deploy(ctx, job, params):
             plog('  on this box can claim it.')
             plog('  ⚠ `df` will show this space as used from now on — that is the')
             plog('  reservation working, not a leak.')
-            err = ensure_store(ctx, store_bytes, plog)
+            err = ensure_store(ctx, store_bytes, plog,
+                               mode=params.get('mode'), inst=_inst)
             if err:
                 raise RuntimeError(f'Reserved store: {err}')
             facts = store_facts(ctx)
