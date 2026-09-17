@@ -3191,6 +3191,7 @@ def detect_modules():
             'installed': bool(_ef_state.get('installed')),
             'running': bool(_ef_state.get('running')),
             'description': _ef_desc['description'], 'icon': _ef_desc['icon'],
+            'icon_url': _ef_desc.get('icon_url'),
             'route': _ef_desc['route'], 'priority': _ef_desc['priority'],
             'tokens': int(_ef_state.get('tokens') or 0)}
 

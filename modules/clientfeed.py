@@ -881,6 +881,11 @@ def register(ctx):
         'name': 'TAK Client Feed',
         'description': 'Publish connected TAK clients to outside agencies as a map feed',
         'icon': '🛰️',
+        # The ATAK team "skittle" — the circle a TAK client renders as on the map,
+        # tinted Cyan, which is ATAK's own default team colour
+        # (call_sign_preference.xml: locationTeam android:defaultValue="Cyan").
+        # Source asset: TAK-Product-Center/atak-civ, GPL-3.0 — see static/logos/ATTRIBUTION.md.
+        'icon_url': '/static/logos/tak-client-skittle.png',
         'route': '/clientfeed',
         'template': 'clientfeed.html',
         'priority': 14,
