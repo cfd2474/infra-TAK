@@ -3629,6 +3629,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
+    cf = modules.get('clientfeed', {})
+    if cf.get('installed'):
+        parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
