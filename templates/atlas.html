@@ -17,7 +17,21 @@
 .spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .atlas-link:hover{text-decoration:underline}
-.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
+/* A scrolling viewer for streaming output. The fixed height is deliberate: the
+   box exists before the first line arrives and must not resize under the
+   operator as a deploy writes into it.
+   ⚠️ `white-space:pre-wrap` is load-bearing, not decoration. `renderLog` sets
+   `textContent` to lines joined with a newline, and the CSS default `normal`
+   collapsed every one — so a running deploy rendered as one run-on paragraph.
+   Every other module's template already carried this. */
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+/* A command to copy, which is a different thing from a log to watch.
+   ⚠️ The break-glass commands used `.log-box`, so a one-line `sed` got a 340px
+   box of empty space — and with newlines collapsing, two commands printed as
+   one line that cannot run: `sed -i '...' /root/atlas/.env cd /root/atlas &&
+   ...` makes `sed` treat `cd` as a file to edit. Height follows the content
+   here, and the newline survives. */
+.cmd{background:#050810;border:1px solid var(--border);border-radius:6px;padding:8px 11px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.55;color:#94a3b8;white-space:pre-wrap;overflow-x:auto}
 .url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
 .url-row:last-child{border-bottom:none}
 .note{font-size:12px;color:var(--text-dim);line-height:1.7}
@@ -34,7 +48,25 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
 
   {% if not installed %}
-  <div class="card">
+  <!--
+    ⚠️ **The deploy log is the first card, above Install.** It used to be
+    last, so the one thing an operator watches for five to ten minutes sat
+    below two cards of prose they had just finished reading — off-screen at
+    the moment it starts moving.
+  -->
+  <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
+    <div class="card-title">Deploy log</div>
+    <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  </div>
+
+  <!--
+    ⚠️ **Hidden while a deploy runs**, server-side here and again in
+    `startDeploy`, because nothing on it can be acted on once one is under
+    way: the button is disabled, the size is already committed, and the prose
+    describes a decision made. `startDeploy` puts it back if the deploy is
+    refused or fails, because retrying needs the field it carries.
+  -->
+  <div class="card" id="installCard"{% if deploy_running %} style="display:none"{% endif %}>
     <div class="card-title">Install</div>
     <p class="note">
       Android device management for ATAK tablets — policies, app catalogues,
@@ -96,7 +128,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <p class="note" id="deployGate" style="margin:8px 0 0">
       Enter a reserved storage size above to enable this.
     </p>
-    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
+    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log above.</div>
   </div>
 
   <!--
@@ -174,10 +206,6 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     </p>
   </div>
 
-  <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
-    <div class="card-title">Deploy log</div>
-    <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
-  </div>
   {% else %}
   <div class="card">
     <div class="card-title">Status</div>
@@ -279,7 +307,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       ATLAS is demanding the header Caddy attaches after sign-in, and is not
       getting it — usually a Caddyfile that has not been regenerated.
     </p>
-    <div class="log-box" style="margin:6px 0 0 18px">sed -i '/^TAKMDM_PROXY_AUTH_SECRET=/d' /root/atlas/.env
+    <div class="cmd" style="margin:6px 0 0 18px">sed -i '/^TAKMDM_PROXY_AUTH_SECRET=/d' /root/atlas/.env
 cd /root/atlas &amp;&amp; docker compose up -d api</div>
 
     <p class="note" style="margin-top:14px"><strong>2. "administrator access requires membership of …"</strong></p>
@@ -287,7 +315,7 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
       You signed in, but not as a member of the group ATLAS requires. Either add
       yourself to that group in Authentik, or stop requiring one:
     </p>
-    <div class="log-box" style="margin:6px 0 0 18px">sed -i 's/^TAKMDM_ADMIN_GROUP=.*/TAKMDM_ADMIN_GROUP=/' /root/atlas/.env
+    <div class="cmd" style="margin:6px 0 0 18px">sed -i 's/^TAKMDM_ADMIN_GROUP=.*/TAKMDM_ADMIN_GROUP=/' /root/atlas/.env
 cd /root/atlas &amp;&amp; docker compose up -d api</div>
 
     <p class="note" style="margin-top:14px"><strong>3. "not within TAKMDM_TRUSTED_PROXIES"</strong></p>
@@ -295,7 +323,7 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
       The request reached ATLAS from an address it does not serve the console to.
       The log line names both what arrived and what was allowed.
     </p>
-    <div class="log-box" style="margin:6px 0 0 18px">sed -i 's|^TAKMDM_TRUSTED_PROXIES=.*|TAKMDM_TRUSTED_PROXIES=any|' /root/atlas/.env
+    <div class="cmd" style="margin:6px 0 0 18px">sed -i 's|^TAKMDM_TRUSTED_PROXIES=.*|TAKMDM_TRUSTED_PROXIES=any|' /root/atlas/.env
 cd /root/atlas &amp;&amp; docker compose up -d api</div>
 
     <p class="note" style="margin-top:14px"><strong>4. ATLAS will not start: "root key missing"</strong></p>
@@ -307,7 +335,7 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
     </p>
 
     <p class="note" style="margin-top:14px"><strong>Seeing why, before changing anything</strong></p>
-    <div class="log-box" style="margin:6px 0 0 18px">docker logs --tail 50 takmdm-api-1</div>
+    <div class="cmd" style="margin:6px 0 0 18px">docker logs --tail 50 takmdm-api-1</div>
     <p class="note" style="margin-left:18px;margin-top:6px">
       Every refusal above logs the reason and the setting responsible. ⚠️ Read it
       first: turning off the wrong gate leaves the real fault in place and
@@ -612,6 +640,17 @@ function confirmDeploy(){
   startDeploy();
 }
 
+// The Install card stands down while a deploy runs: nothing on it can be acted
+// on, and the log above it is the only thing worth the screen.
+//
+// ⚠️ Shown again on refusal or failure, because a retry needs the reserved
+// storage field that lives on it. Hiding it and leaving it hidden would strand
+// an operator on a page with nothing left to act on.
+function setInstallCard(visible){
+  const card = document.getElementById('installCard');
+  if (card) card.style.display = visible ? '' : 'none';
+}
+
 function startDeploy(){
   const btn = document.getElementById('deployBtn');
   const field = document.getElementById('storeGb');
@@ -624,9 +663,12 @@ function startDeploy(){
     body: JSON.stringify(body),
     credentials: 'same-origin'
   }).then(r => r.json()).then(d => {
-    if (d.error) { btn.disabled = false; alert(d.error); return; }
+    // ⚠️ Hidden only once the deploy is actually accepted, never on the click.
+    // Doing it up front blanks the card for a request the server then refuses.
+    if (d.error) { btn.disabled = false; setInstallCard(true); alert(d.error); return; }
+    setInstallCard(false);
     polling = true; pollDeploy();
-  }).catch(() => { btn.disabled = false; });
+  }).catch(() => { btn.disabled = false; setInstallCard(true); });
 }
 
 function renderLog(entries){
@@ -654,6 +696,8 @@ function pollDeploy(){
       polling = false;
       const e = document.getElementById('deployError');
       if (e) e.style.display = '';
+      // Back, so the size can be corrected and the deploy tried again.
+      setInstallCard(true);
       return;
     }
     setTimeout(pollDeploy, 2000);
