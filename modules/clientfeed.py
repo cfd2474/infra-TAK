@@ -52,6 +52,7 @@ import hashlib
 import secrets
 import binascii
 import threading
+import math
 from datetime import datetime, timezone
 
 from . import register_module
@@ -495,6 +496,48 @@ FIELDS = [
 ]
 
 SR = {'wkid': 4326, 'latestWkid': 4326}
+SR_WEBMERC = {'wkid': 102100, 'latestWkid': 3857}
+
+# ArcGIS map clients ask for geometry in the MAP's spatial reference via outSR, and
+# ArcGIS Online's viewer asks for Web Mercator. We were ignoring outSR and always
+# answering in degrees while telling the client it was getting what it asked for — so
+# AGOL plotted -117.57, 33.84 as METRES and put the unit on Null Island (observed
+# 2026-09-17). Honour the two references that matter; anything else gets 4326, which is
+# what we actually have, declared honestly.
+WEBMERC_R = 20037508.342789244
+WEBMERC_LAT_LIMIT = 85.05112878
+
+
+def _webmerc(lon, lat):
+    """EPSG:4326 -> EPSG:3857/102100. Latitude clamps at the Mercator pole limit."""
+    lat = max(min(float(lat), WEBMERC_LAT_LIMIT), -WEBMERC_LAT_LIMIT)
+    x = float(lon) * WEBMERC_R / 180.0
+    y = math.log(math.tan((90.0 + lat) * math.pi / 360.0)) / (math.pi / 180.0)
+    return round(x, 3), round(y * WEBMERC_R / 180.0, 3)
+
+
+def _resolve_out_sr(params):
+    """(spatialReference dict, project?) for the requested outSR.
+
+    outSR arrives either bare ('102100') or as JSON ({"wkid":102100}), depending on
+    the client."""
+    raw = str(params.get('outSR') or '').strip()
+    if not raw:
+        return SR, False
+    wkid = None
+    if raw.startswith('{'):
+        try:
+            wkid = (json.loads(raw) or {}).get('latestWkid') or (json.loads(raw) or {}).get('wkid')
+        except Exception:
+            wkid = None
+    else:
+        try:
+            wkid = int(raw)
+        except ValueError:
+            wkid = None
+    if wkid in (102100, 3857, 900913, 102113):
+        return SR_WEBMERC, True
+    return SR, False
 
 
 def _fields_json():
@@ -634,12 +677,16 @@ def query_json(entry, feats, params):
         limit = MAX_RECORD_COUNT
     limit = max(1, min(limit, MAX_RECORD_COUNT))
 
+    out_sr, project = _resolve_out_sr(params)
     out = []
     for f in feats[:limit]:
         item = {'attributes': {k: f.get(k) for k in keep}}
         if want_geom and f.get('_lat') is not None and f.get('_lon') is not None:
-            item['geometry'] = {'x': f['_lon'], 'y': f['_lat'],
-                                'spatialReference': SR}
+            if project:
+                x, y = _webmerc(f['_lon'], f['_lat'])
+            else:
+                x, y = f['_lon'], f['_lat']
+            item['geometry'] = {'x': x, 'y': y, 'spatialReference': out_sr}
         out.append(item)
 
     return {
@@ -647,7 +694,7 @@ def query_json(entry, feats, params):
         'uniqueIdField': {'name': 'OBJECTID', 'isSystemMaintained': True},
         'globalIdFieldName': '',
         'geometryType': 'esriGeometryPoint',
-        'spatialReference': SR,
+        'spatialReference': out_sr,
         'hasZ': False,
         'hasM': False,
         'fields': [f for f in _fields_json() if f['name'] in keep],
@@ -658,7 +705,10 @@ def query_json(entry, feats, params):
 
 def geojson_response(entry, feats, params):
     """RFC 7946 FeatureCollection — the representation for consumers that do not
-    speak the ArcGIS REST spec (Leaflet, Mapbox, OpenLayers, plain HTTP clients)."""
+    speak the ArcGIS REST spec (Leaflet, Mapbox, OpenLayers, plain HTTP clients).
+
+    RFC 7946 mandates WGS84, so outSR is deliberately NOT honoured here: reprojecting
+    would produce a GeoJSON document that lies about its own coordinates."""
     keep = _wanted_fields(params.get('outFields') or '*')
     want_geom = str(params.get('returnGeometry', 'true')).lower() not in ('false', '0')
     try:
