@@ -80746,7 +80746,8 @@ def clientfeed_rest_info(entry):
            methods=['GET', 'OPTIONS'])
 @feed_token_required
 def clientfeed_service_rest(entry, service):
-    return _feed_response(mod_registry.clientfeed.service_json(entry))
+    mod = mod_registry.clientfeed
+    return _feed_response(mod.service_json(entry, _feed_features(mod, entry)))
 
 
 @app.route('/feed/<token>/rest/services/<service>/FeatureServer/<int:layer>',
@@ -80768,7 +80769,10 @@ def clientfeed_query_rest(entry, service, layer):
 @app.route('/feed/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
 @feed_token_required
 def clientfeed_service(entry):
-    return _feed_response(mod_registry.clientfeed.service_json(entry))
+    # Pass the live features so the service extent matches the layer's. The snapshot
+    # is cached for 15s, so this costs nothing on a client that fetches both.
+    mod = mod_registry.clientfeed
+    return _feed_response(mod.service_json(entry, _feed_features(mod, entry)))
 
 
 def _clientfeed_layer_impl(entry, layer):

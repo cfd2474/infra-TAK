@@ -69,6 +69,20 @@ GROUPS_BITMAP_LEN = 32768          # TAK's cot_router.groups width
 # feed, a service or a plugin and is deliberately out of scope.
 EUD_PLATFORMS = ('ATAK', 'ITAK', 'WINTAK', 'TAK-CIV', 'ATAK-CIV', 'ATAK-MIL')
 
+# CoT writes 9999999.0 into hae/ce/le when the value is UNKNOWN — it is a sentinel,
+# not a measurement. Passing it through put a unit at 9,999,999 m in ArcGIS (observed
+# 2026-09-17). Anything at or beyond this is "no altitude fix", which is null, not a
+# number. Also guards the plain-wrong: Earth's deepest point is about -11 km and no
+# EUD is above low orbit.
+COT_UNKNOWN = 9999999.0
+ALT_MIN_M = -12000.0
+ALT_MAX_M = 100000.0
+
+# Degenerate extents break client zoom: a single client (or several at one spot) makes
+# xmin == xmax, and ArcGIS cannot zoom to a zero-area box. Pad it to something a map
+# can actually frame — ~550 m at the equator.
+EXTENT_PAD_DEG = 0.005
+
 # Channels never offered in the picker — TAK internals, not operational channels.
 HIDDEN_CHANNELS = ('ROLE_ADMIN', '__ANON__')
 
@@ -351,6 +365,17 @@ _RE_VERSION = re.compile(r'<takv\b[^>]*\bversion="([^"]*)"', re.I)
 _RE_CALLSIGN = re.compile(r'<contact\b[^>]*\bcallsign="([^"]*)"', re.I)
 
 
+def _clean_alt(hae):
+    """CoT altitude -> metres, or None when it is the unknown sentinel or absurd."""
+    try:
+        v = float(hae)
+    except (TypeError, ValueError):
+        return None
+    if abs(v) >= COT_UNKNOWN or not (ALT_MIN_M <= v <= ALT_MAX_M):
+        return None
+    return round(v, 1)
+
+
 def _is_eud(platform):
     """True for a real end-user device. Prefix match only — a substring test made
     anything merely CONTAINING 'ATAK' qualify, which is how a feed sneaks in."""
@@ -439,7 +464,7 @@ def snapshot(ctx, bitpos_list, stale_minutes, channel_names=None):
             'deviceType': device or platform,   # Tablet Command vocabulary
             'takVersion': version,
             'battery': battery,
-            'altitude': row.get('hae'),
+            'altitude': _clean_alt(row.get('hae')),
             'channel': chan_label,
             'last_update': ts * 1000,       # Esri dates are epoch MILLISECONDS
             'age_seconds': max(0, int(now) - ts),
@@ -485,16 +510,26 @@ def _fields_json():
 
 
 def _extent(feats=None):
+    """Bounding box of the current clients, padded so it is never zero-area.
+
+    A feed with one client — the normal case for a small agency — produced
+    xmin == xmax == the unit's longitude, and ArcGIS cannot frame a box with no area.
+    Falls back to the whole world only when there is genuinely nothing to show."""
     pts = [(f['_lon'], f['_lat']) for f in (feats or [])
            if f.get('_lat') is not None and f.get('_lon') is not None]
     if not pts:
         return {'xmin': -180, 'ymin': -90, 'xmax': 180, 'ymax': 90, 'spatialReference': SR}
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    return {'xmin': min(xs), 'ymin': min(ys), 'xmax': max(xs), 'ymax': max(ys),
-            'spatialReference': SR}
+    xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+    if xmax - xmin < EXTENT_PAD_DEG:
+        xmin, xmax = xmin - EXTENT_PAD_DEG, xmax + EXTENT_PAD_DEG
+    if ymax - ymin < EXTENT_PAD_DEG:
+        ymin, ymax = ymin - EXTENT_PAD_DEG, ymax + EXTENT_PAD_DEG
+    return {'xmin': round(xmin, 6), 'ymin': round(ymin, 6),
+            'xmax': round(xmax, 6), 'ymax': round(ymax, 6), 'spatialReference': SR}
 
 
-def service_json(entry):
+def service_json(entry, feats=None):
     return {
         'currentVersion': 11.2,
         'serviceDescription': 'Connected TAK clients published by infra-TAK',
@@ -508,8 +543,8 @@ def service_json(entry):
                        % (', '.join(entry.get('channels') or []) or 'no channels'),
         'copyrightText': '',
         'spatialReference': SR,
-        'initialExtent': _extent(),
-        'fullExtent': _extent(),
+        'initialExtent': _extent(feats),
+        'fullExtent': _extent(feats),
         'allowGeometryUpdates': False,
         'units': 'esriDecimalDegrees',
         'syncEnabled': False,
