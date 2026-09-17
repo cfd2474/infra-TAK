@@ -90,7 +90,6 @@ def test_a_usable_slug_is_accepted(good):
         ("", "required"),
         (None, "required"),
         ("   ", "required"),
-        ("Agency", "lowercase"),
         ("-lead", "letters, digits and hyphens"),
         ("trail-", "letters, digits and hyphens"),
         ("under_score", "letters, digits and hyphens"),
@@ -106,21 +105,51 @@ def test_an_unusable_slug_is_refused_with_a_reason(bad, because):
     assert err and because in err
 
 
-def test_a_slug_is_refused_rather_than_repaired():
-    """⚠️ Silently lowercasing would put a hostname on the box that is not the
-    one the operator typed, and they would find out from DNS.
+@pytest.mark.parametrize(
+    "typed,stored",
+    [("Agency-A", "agency-a"), ("PD", "pd"), ("  County-1  ", "county-1")],
+)
+def test_case_is_forced_rather_than_refused(typed, stored):
+    """⚠️ **Operator decision: force lowercase.** The slug is a DNS label, a
+    systemd unit name, a Compose project and a volume name, none of which agree
+    about case, and a capital letter has exactly one sensible interpretation.
 
-    ⚠️ **Assert the lowercase guard's own sentence, not the word "lowercase".**
-    Written as `"lowercase" in err` this survived deleting the guard: the charset
-    message below also says "Use lowercase letters, digits and hyphens", so the
-    assertion matched the wrong message and the test passed for the wrong reason.
-    Both paths refuse; only one explains *why case matters here*, and the
-    diagnostic is the whole reason the guard sits ahead of the regex.
-    """
-    slug, err = inst.validate_slug("Agency-A")
+    The *normalised* value is what comes back, because it is what gets stored and
+    what the hostname is built from — the console has to show the operator
+    `atlas.agency-a.<fqdn>` rather than echoing what they typed."""
+    slug, err = inst.validate_slug(typed)
+
+    assert err is None
+    assert slug == stored
+
+
+@pytest.mark.parametrize("bad", ["two words", "under_score", "sub.domain"])
+def test_only_case_is_forced_and_nothing_else_is(bad):
+    """⚠️ There is one obvious reading of a capital letter and no obvious reading
+    of a space or an underscore. Guessing at those would put a hostname on the
+    box that the operator never chose."""
+    slug, err = inst.validate_slug(bad)
 
     assert slug is None
-    assert "do not agree about case" in err
+    assert err
+
+
+def test_uniqueness_survives_the_case_change():
+    """A consequence worth pinning: `Agency-A` and `agency-a` resolve to the same
+    hostname, so the second must be refused as a duplicate."""
+    slug, err = inst.validate_slug("Agency-A", [AGENCY_A])
+
+    assert slug is None
+    assert "already" in err
+
+
+def test_a_reserved_slug_cannot_be_smuggled_in_by_case():
+    """⚠️ `PG` must be as reserved as `pg` — the collision it causes is with
+    `atlas_pg_password`, which does not care how it was typed."""
+    slug, err = inst.validate_slug("PG")
+
+    assert slug is None
+    assert "reserved" in err
 
 
 def test_a_duplicate_slug_is_refused():

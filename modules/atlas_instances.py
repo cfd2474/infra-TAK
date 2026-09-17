@@ -119,18 +119,25 @@ def may_deploy_plain(instances):
 def validate_slug(raw, instances=()):
     """`(slug, error)`. `error` is a sentence for the operator, or None.
 
-    ⚠️ Refuses rather than repairs. Silently lowercasing or trimming an
-    operator's slug would put a hostname on the box that is not the one they
-    typed, and they would find out from DNS.
+    ⚠️ **Case is forced, everything else is refused** (operator decision,
+    2026-09-17). `Agency-A` becomes `agency-a` rather than being rejected: the
+    slug is a DNS label, a systemd unit name, a Compose project and a volume
+    name, none of which agree about case, and there is exactly one sensible
+    interpretation of a capital letter. There is no such single interpretation
+    of a space or an underscore, so those still refuse.
+
+    **The normalised slug is what gets stored and used**, so the console must
+    show the operator what it settled on — `atlas.agency-a.<fqdn>`, not the
+    string they typed. Returning it here is what makes that possible.
+
+    Uniqueness therefore becomes case-insensitive for free: `Agency-A` collides
+    with an existing `agency-a`, which is the right answer, because they would
+    resolve to the same hostname.
     """
     if raw is None or not str(raw).strip():
         return None, 'An agency slug is required for an agency-specific deployment.'
 
-    slug = str(raw).strip()
-    if slug != slug.lower():
-        return None, (f'Use lowercase: {slug!r} would become part of a hostname, '
-                      f'a systemd unit name and a Docker volume name, and those '
-                      f'do not agree about case.')
+    slug = str(raw).strip().lower()
     if len(slug) > SLUG_MAX:
         return None, f'Keep the slug to {SLUG_MAX} characters or fewer.'
     if '.' in slug:
