@@ -447,7 +447,7 @@ def deploy(ctx, job, params):
 
         plog('')
         plog('✓ TAK Video Restreamer deployed successfully.')
-        # v10.1.78: the UI is served on the TVR vhost — stream.<fqdn> by default, or the
+        # v10.1.77: the UI is served on the TVR vhost — stream.<fqdn> by default, or the
         # operator's tak_video_restreamer_domain override — NOT the apex. Printing the apex
         # sent operators to the console/portal vhost and read as "Caddy never registered
         # TVR" (field false alarm, 2026-09-17). Resolve it the same way the console page

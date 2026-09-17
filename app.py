@@ -33755,7 +33755,7 @@ fedhub_rotate_status = {'running': False, 'complete': False, 'error': False}
 def mediamtx_deploy_api():
     if mediamtx_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
-    # v10.1.78: the symmetric half of the registry's conflict guard (_active_conflict in
+    # v10.1.77: the symmetric half of the registry's conflict guard (_active_conflict in
     # modules/__init__.py). MediaMTX is not a registry module, so it needs its own. Both it
     # and TVR default to the `stream` subdomain (SERVICE_DOMAIN_DEFAULTS), so a box with
     # both installed makes generate_caddyfile emit two identical site blocks and Caddy
@@ -80558,7 +80558,7 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
-    # v10.1.78: the vhost a module is actually served on — stream.<fqdn> for TVR by
+    # v10.1.77: the vhost a module is actually served on — stream.<fqdn> for TVR by
     # default, or the operator's {service}_domain override. Modules must not rebuild it
     # from fqdn: that is exactly how the TVR deploy log came to print the apex.
     '_get_service_domain': _get_service_domain,
