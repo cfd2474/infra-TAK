@@ -669,6 +669,50 @@ def _memory_bytes(path='/proc/meminfo'):
     except (OSError, ValueError):
         return 0, 0
 
+
+# --------------------------------------------------------------------------- #
+# Per-instance jobs and version drift (W216)
+# --------------------------------------------------------------------------- #
+
+
+def instance_job_key(inst):
+    """The job slot and lock for one deployment.
+
+    ⚠️ `job_start` creates a slot lazily for any key, so instances get their own
+    locks without being registered as modules — which they cannot be, because
+    `register()` runs only at console import.
+
+    ⚠️ The charset is `[a-z0-9_-]` and nothing more: the descriptor validator
+    rejects anything else, so `atlas:agency-a` — the obvious first shape — would
+    fail at import.
+    """
+    return atlas_instances.derive(inst)['job_key']
+
+
+def version_drift(ctx):
+    """What each deployment is running, and whether they agree.
+
+    ⚠️ **Drift is expected here, not a fault.** Updates are deliberately manual
+    (§9) and, with several agencies, will not all happen on the same day. Showing
+    it is what makes a staged rollout *deliberate* rather than something
+    discovered later — and it is the reason an "update all" button needs a
+    per-instance result list rather than a single success flag.
+    """
+    rows = []
+    for inst in load_instances(ctx):
+        rows.append({
+            'slug': inst.get('slug'),
+            'mode': inst.get('mode'),
+            'version': _installed_version(ctx, inst),
+        })
+    versions = sorted({r['version'] for r in rows if r['version']})
+    return {
+        'instances': rows,
+        'versions': versions,
+        'drifted': len(versions) > 1,
+        'available': _latest_version(use_cache=True),
+    }
+
 def _store_mount(ctx, inst=None):
     return instance_paths(ctx, inst)['mount']
 
@@ -2363,17 +2407,22 @@ def _running_version():
     return (body.get('version') or '').strip().lstrip('vV') or None
 
 
-def _installed_version(ctx):
+def _installed_version(ctx, inst=None):
     """The version on disk, read from the checkout rather than from settings.
 
     ⚠️ This is the same VERSION file the running console shows in its footer,
     so the two cannot disagree. A settings value could, if a deploy half-finished
     — and an update badge that contradicts the footer is worse than no badge.
+
+    ⚠️ Extended for instances rather than copied (W216). A second function
+    reading the same file is how two readings come to disagree; the default is
+    the plain instance, so every existing call site is unchanged.
     """
     try:
-        with open(os.path.join(atlas_dir(ctx), 'VERSION'), encoding='utf-8') as handle:
+        path = posixpath.join(instance_paths(ctx, inst)['dir'], 'VERSION')
+        with open(path, encoding='utf-8') as handle:
             return handle.read().strip().lstrip('vV') or None
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 

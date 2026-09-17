@@ -338,3 +338,103 @@ def test_memory_is_read_as_available_not_free(tmp_path):
 def test_unreadable_memory_is_zero_rather_than_a_guess(tmp_path):
     """A fabricated figure here would offer instances the box cannot run."""
     assert atlas._memory_bytes(str(tmp_path / 'absent')) == (0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Per-instance jobs and version drift (chunk 5)
+# --------------------------------------------------------------------------- #
+
+
+def test_each_instance_gets_its_own_job_key():
+    """⚠️ Separate slots mean separate locks, so one agency's update cannot
+    block or clobber another's."""
+    plain = atlas.instance_job_key(ai.make(None, ai.MODE_FIXED, 50, 8760))
+    agency = atlas.instance_job_key(ai.make('agency-a', ai.MODE_FIXED, 50, 8761))
+
+    assert plain == 'atlas'
+    assert agency == 'atlas-agency-a'
+    assert plain != agency
+
+
+def test_a_job_key_is_acceptable_to_the_registry():
+    """⚠️ `[a-z0-9_-]` only — `atlas:agency-a` was the obvious first shape and
+    the descriptor validator rejects it at import."""
+    key = atlas.instance_job_key(ai.make('agency-a', ai.MODE_FIXED, 50, 8761))
+
+    assert all(c.isalnum() or c in '-_' for c in key)
+
+
+def _checkout(base, name, version):
+    d = base / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'VERSION').write_text(version, encoding='utf-8')
+
+
+@pytest.fixture
+def deployed(monkeypatch, tmp_path):
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    return tmp_path
+
+
+def test_a_version_is_read_from_the_checkout_not_from_settings(deployed):
+    """⚠️ Settings record what was *intended*. After a half-finished update the
+    two disagree, and that is exactly when someone looks."""
+    _checkout(deployed, 'atlas', '1.47.3')
+
+    assert atlas._installed_version(Ctx(), None) == '1.47.3'
+
+
+def test_each_instance_reports_its_own_version(deployed):
+    _checkout(deployed, 'atlas', '1.47.3')
+    _checkout(deployed, 'atlas-agency-a', '1.48.0')
+    ctx = Ctx({ai.INSTANCES_KEY: [
+        ai.make(None, ai.MODE_FIXED, 100, 8760),
+        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+    ]})
+
+    drift = atlas.version_drift(ctx)
+
+    assert {r['slug']: r['version'] for r in drift['instances']} == {
+        None: '1.47.3', 'agency-a': '1.48.0'}
+
+
+def test_drift_is_reported_when_deployments_disagree(deployed):
+    """⚠️ Expected, not a fault: updates are manual by design and will not all
+    happen on the same day. Showing it makes a staged rollout deliberate rather
+    than something discovered later."""
+    _checkout(deployed, 'atlas', '1.47.3')
+    _checkout(deployed, 'atlas-agency-a', '1.48.0')
+    ctx = Ctx({ai.INSTANCES_KEY: [
+        ai.make(None, ai.MODE_FIXED, 100, 8760),
+        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+    ]})
+
+    assert atlas.version_drift(ctx)['drifted'] is True
+
+
+def test_agreement_is_not_reported_as_drift(deployed):
+    _checkout(deployed, 'atlas', '1.47.3')
+    _checkout(deployed, 'atlas-agency-a', '1.47.3')
+    ctx = Ctx({ai.INSTANCES_KEY: [
+        ai.make(None, ai.MODE_FIXED, 100, 8760),
+        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+    ]})
+
+    drift = atlas.version_drift(ctx)
+
+    assert drift['drifted'] is False
+    assert drift['versions'] == ['1.47.3']
+
+
+def test_an_unreadable_checkout_is_none_rather_than_a_guess(deployed):
+    """A fabricated version would make an update badge lie in both directions."""
+    ctx = Ctx({ai.INSTANCES_KEY: [ai.make('gone', ai.MODE_FIXED, 50, 8761)]})
+
+    assert atlas.version_drift(ctx)['instances'][0]['version'] is None
+
+
+def test_drift_carries_what_is_available(deployed):
+    _checkout(deployed, 'atlas', '1.47.3')
+
+    assert atlas.version_drift(Ctx({'atlas_enabled': True}))['available'] == '1.48.0'
