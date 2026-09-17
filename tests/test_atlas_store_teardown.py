@@ -76,6 +76,11 @@ class Recorder:
         raise AssertionError(f"never ran anything matching {fragments}")
 
 
+def _posix(path) -> str:
+    """Box-shaped. The module builds paths with `posixpath`."""
+    return str(path).replace(chr(92), "/")
+
+
 def _escape(path: str) -> str:
     return path.strip("/").replace("-", "\\x2d").replace("/", "-") + ".mount"
 
@@ -91,8 +96,11 @@ def box(monkeypatch, tmp_path):
     image.parent.mkdir(parents=True)
     image.write_bytes(b"not really an ext4 image")
 
-    monkeypatch.setattr(atlas, "STORE_IMAGE", str(image))
-    monkeypatch.setattr(atlas, "atlas_dir", lambda _ctx: str(base))
+    # ⚠️ POSIX-shaped: the module builds box paths with `posixpath`, and a
+    # Windows temp path would produce separators that exist nowhere on a box.
+    monkeypatch.setattr(atlas, "STORE_IMAGE", str(image).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, "atlas_dir",
+                        lambda _ctx=None: str(base).replace(chr(92), '/'))
     # Nothing is a mount point unless a test says so.
     monkeypatch.setattr(os.path, "ismount", lambda _p: False)
     return base
@@ -118,7 +126,7 @@ def test_the_binds_come_down_before_the_store_they_mount_out_of(box, rec):
 
     artifacts = rec.index_of("disable", "artifacts")
     cache = rec.index_of("disable", "cache")
-    store = rec.index_of("disable", _escape(str(box / "store")))
+    store = rec.index_of("disable", _escape(_posix(box / "store")))
 
     assert artifacts < store, "the store came down before its artifacts bind"
     assert cache < store, "the store came down before its cache bind"
@@ -154,7 +162,7 @@ def test_all_three_units_are_disabled(box, rec):
 
     disabled = " ".join(" ".join(c) for c in rec.ran("disable"))
     for path in (box / "store", box / "artifacts", box / "cache"):
-        assert _escape(str(path)) in disabled, f"{path} was left enabled"
+        assert _escape(_posix(path)) in disabled, f"{path} was left enabled"
 
 
 def test_the_reservation_is_deleted(box, rec):
@@ -211,7 +219,7 @@ def test_a_live_mount_is_unmounted_even_without_its_unit(box, rec, monkeypatch):
 
 
 def test_a_busy_mount_falls_back_to_a_lazy_unmount(box, monkeypatch):
-    recorder = Recorder(fail=("umount " + str(box / "store"),))
+    recorder = Recorder(fail=("umount " + _posix(box / "store"),))
     monkeypatch.setattr(atlas, "_run_root", recorder)
     monkeypatch.setattr(os.path, "ismount", lambda p: p.endswith("store"))
 

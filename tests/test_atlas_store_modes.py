@@ -187,13 +187,17 @@ def store(monkeypatch, tmp_path):
     (base / 'store').mkdir(parents=True)
     image = tmp_path / 'var' / 'store.img'
     image.parent.mkdir(parents=True)
+    # ⚠️ POSIX-shaped, because these fixtures simulate a Linux box and the
+    # module now builds box paths with `posixpath`. A Windows temp path here
+    # produces mixed separators that exist nowhere in production.
+    posix_base = str(base).replace(chr(92), '/')
 
     runner = Runner()
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(image))
-    monkeypatch.setattr(atlas, 'atlas_dir', lambda _c: str(base))
+    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(image).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'atlas_dir', lambda _c=None: posix_base)
     monkeypatch.setattr(atlas, '_run_root', runner)
-    monkeypatch.setattr(atlas, '_bind_unit', lambda *a: None)
-    monkeypatch.setattr(atlas, '_bind_pg_volume', lambda *a: None)
+    monkeypatch.setattr(atlas, '_bind_unit', lambda *a, **k: None)
+    monkeypatch.setattr(atlas, '_bind_pg_volume', lambda *a, **k: None)
     monkeypatch.setattr(atlas.os, 'chown', lambda *a: None, raising=False)
     monkeypatch.setattr(atlas.os, 'chmod', lambda *a: None)
     monkeypatch.setattr(atlas.os.path, 'ismount', lambda _p: True)
@@ -224,7 +228,7 @@ def test_dynamic_never_reserves_its_blocks_afterwards(monkeypatch, store):
     while the operator believed they had chosen dynamic."""
     called = []
     monkeypatch.setattr(atlas, '_reserve_blocks',
-                        lambda size, plog: called.append(size) or None)
+                        lambda size, plog, image=None: called.append(size) or None)
 
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, mode=MODE_DYNAMIC)
 
@@ -234,7 +238,7 @@ def test_dynamic_never_reserves_its_blocks_afterwards(monkeypatch, store):
 def test_fixed_still_reserves_its_blocks(monkeypatch, store):
     called = []
     monkeypatch.setattr(atlas, '_reserve_blocks',
-                        lambda size, plog: called.append(size) or None)
+                        lambda size, plog, image=None: called.append(size) or None)
 
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, mode=MODE_FIXED)
 
@@ -245,7 +249,7 @@ def test_the_default_keeps_existing_deployments_reserving(monkeypatch, store):
     """⚠️ Omitting the mode must behave exactly as before this chunk."""
     called = []
     monkeypatch.setattr(atlas, '_reserve_blocks',
-                        lambda size, plog: called.append(size) or None)
+                        lambda size, plog, image=None: called.append(size) or None)
 
     atlas.ensure_store({}, 4 * GIB, lambda *_: None)
 

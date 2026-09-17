@@ -323,17 +323,18 @@ def test_ensure_store_reserves_the_blocks(monkeypatch, tmp_path):
     image.write_bytes(b"x" * 64)
 
     asked = []
-    monkeypatch.setattr(atlas, "STORE_IMAGE", str(image))
-    monkeypatch.setattr(atlas, "atlas_dir", lambda _c: str(base))
+    monkeypatch.setattr(atlas, "STORE_IMAGE", str(image).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, "atlas_dir",
+                        lambda _c=None: str(base).replace(chr(92), '/'))
     monkeypatch.setattr(atlas, "_run_root", lambda *a, **k: (0, ""))
     monkeypatch.setattr(os.path, "ismount", lambda _p: True)
     monkeypatch.setattr(atlas.os, "chown", lambda *a: None, raising=False)
     monkeypatch.setattr(atlas.os, "chmod", lambda *a: None)
-    monkeypatch.setattr(atlas, "_bind_unit", lambda *a: None)
-    monkeypatch.setattr(atlas, "_bind_pg_volume", lambda *a: None)
+    monkeypatch.setattr(atlas, "_bind_unit", lambda *a, **k: None)
+    monkeypatch.setattr(atlas, "_bind_pg_volume", lambda *a, **k: None)
     monkeypatch.setattr(
         atlas, "_reserve_blocks",
-        lambda size, plog: asked.append(size) or None,
+        lambda size, plog, image=None: asked.append(size) or None,
     )
 
     err = atlas.ensure_store({}, 64, lambda *_: None)

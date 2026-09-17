@@ -25,6 +25,10 @@ resolve in a config file, it means one of them quietly stops renewing.
 import json
 import os
 from glob import glob as _glob
+# ⚠️ These are paths on the *managed box*, which is always Linux. Building
+# them with `os.path.join` uses the separator of whichever machine this code
+# runs on, which is invisible only because production happens to match.
+import posixpath
 import secrets
 import shutil
 import subprocess
@@ -39,6 +43,7 @@ from . import register_module, job_log
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
+from . import atlas_instances
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
 KEY = 'atlas'
@@ -390,7 +395,7 @@ def deliverable_free(fs_free, host_free, mode):
     return max(0, min(fs_free, host_free))
 
 
-def store_facts(ctx=None, mode=None):
+def store_facts(ctx=None, mode=None, inst=None):
     """What the console needs to draw the size field honestly.
 
     Every number here is measured, never estimated: `mkfs` overhead and ext4's
@@ -404,18 +409,19 @@ def store_facts(ctx=None, mode=None):
     check for themselves. `allocated_gb` is the measured truth and
     `fully_reserved` says whether the two agree.
     """
-    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    image = instance_paths(ctx, inst)['image'] if inst else STORE_IMAGE
+    total, free = _disk_free(os.path.dirname(image))
     reserved = 0
-    if os.path.exists(STORE_IMAGE):
+    if os.path.exists(image):
         try:
-            reserved = os.stat(STORE_IMAGE).st_size
+            reserved = os.stat(image).st_size
         except OSError:
             reserved = 0
-    allocated = allocated_bytes(STORE_IMAGE) if reserved else None
+    allocated = allocated_bytes(image) if reserved else None
 
     mode = mode or MODE_FIXED
     usable = used = 0
-    mount = _store_mount(ctx) if ctx is not None else None
+    mount = _store_mount(ctx, inst) if ctx is not None else None
     if mount and os.path.ismount(mount):
         try:
             usage = shutil.disk_usage(mount)
@@ -447,8 +453,35 @@ def store_facts(ctx=None, mode=None):
     }
 
 
-def _store_mount(ctx):
-    return os.path.join(atlas_dir(ctx), STORE_DIRNAME)
+def instance_paths(ctx=None, inst=None):
+    """Every path one instance uses, on this box's layout.
+
+    ⚠️ `atlas_instances.derive` decides the *names*; this decides where they
+    sit, because only the module can see whether the box keeps deployments under
+    `/root` or a home directory. Splitting it that way keeps the naming rules
+    pure and testable while the filesystem question stays here.
+    """
+    d = dict(atlas_instances.derive(inst))
+    # ⚠️ Rebased onto whatever layout the *plain* instance resolves to, so a
+    # test double that patches `atlas_dir` moves every instance with it, and
+    # a box under `~` keeps its agencies there too.
+    plain_dir = atlas_dir(ctx)
+    base = plain_dir if not d['slug'] else posixpath.join(
+        posixpath.dirname(plain_dir), d['name'])
+    d['dir'] = base
+    d['mount'] = posixpath.join(base, STORE_DIRNAME)
+    d['artifacts'] = posixpath.join(base, 'artifacts')
+    d['cache'] = posixpath.join(base, 'cache')
+    # ⚠️ `STORE_IMAGE` stays authoritative for the plain instance. `derive`
+    # would produce the same string, but the module constant is what a
+    # deployment configures and what tests redirect, so it wins.
+    d['image'] = STORE_IMAGE if not d['slug'] else d['image']
+    d['image_dir'] = posixpath.dirname(d['image'])
+    return d
+
+
+def _store_mount(ctx, inst=None):
+    return instance_paths(ctx, inst)['mount']
 
 
 #: The Postgres image runs as uid/gid 70 and refuses to start unless its data
@@ -574,7 +607,7 @@ def _bind_unit(source, target, plog):
     return None
 
 
-def ensure_store(ctx, size_bytes, plog, mode=None):
+def ensure_store(ctx, size_bytes, plog, mode=None, inst=None):
     """Create, grow or leave the store. Returns an error, or None.
 
     Idempotent: a deploy at the size already in place does nothing but report.
@@ -592,9 +625,10 @@ def ensure_store(ctx, size_bytes, plog, mode=None):
     populates the root filesystem and the reservation stays an empty file.
     """
     mode = mode or MODE_FIXED
-    image = STORE_IMAGE
-    mount = _store_mount(ctx)
-    parent = os.path.dirname(image)
+    paths = instance_paths(ctx, inst)
+    image = paths['image']
+    mount = paths['mount']
+    parent = paths['image_dir']
 
     try:
         os.makedirs(parent, exist_ok=True)
@@ -663,7 +697,7 @@ def ensure_store(ctx, size_bytes, plog, mode=None):
     # every block up front and turn it into a fixed one, silently — the
     # operator would have chosen dynamic and received the opposite.
     if mode == MODE_FIXED:
-        err = _reserve_blocks(size_bytes, plog)
+        err = _reserve_blocks(size_bytes, plog, image=image)
         if err:
             return err
 
@@ -689,17 +723,18 @@ def ensure_store(ctx, size_bytes, plog, mode=None):
         return f'could not set ownership on {pgdir}: {exc}'
 
     for sub in ('artifacts', 'cache'):
-        err = _bind_unit(os.path.join(mount, sub), os.path.join(atlas_dir(ctx), sub), plog)
+        err = _bind_unit(os.path.join(mount, sub),
+                         os.path.join(paths['dir'], sub), plog)
         if err:
             return err
 
-    err = _bind_pg_volume(pgdir, plog)
+    err = _bind_pg_volume(pgdir, plog, volume=paths['pg_volume'])
     if err:
         return err
     return None
 
 
-def remove_store(ctx, plog):
+def remove_store(ctx, plog, inst=None):
     """Undo `ensure_store`. Returns a list of what it did, and a list of errors.
 
     ⚠️ **This is the step whose absence made uninstall a no-op.** W205 added the
@@ -720,20 +755,27 @@ def remove_store(ctx, plog):
     failure.
     """
     did, errs = [], []
-    mount = _store_mount(ctx)
-    base = atlas_dir(ctx)
+    paths = instance_paths(ctx, inst)
+    mount = paths['mount']
+    base = paths['dir']
+    image = paths['image']
+    volume = paths['pg_volume']
 
     # The named volume first: it is only a pointer at `pgdata`, but leaving it
     # behind would make the next deploy refuse — `_bind_pg_volume` rejects a
     # volume that already exists pointing somewhere unexpected.
-    rc, out = _run_root(['docker', 'volume', 'rm', '-f', STORE_PG_VOLUME])
+    rc, out = _run_root(['docker', 'volume', 'rm', '-f', volume])
     if rc == 0:
-        did.append(f'Docker volume {STORE_PG_VOLUME} removed')
+        did.append(f'Docker volume {volume} removed')
 
     # ⚠️ Binds before the store they come out of.
-    for path in (os.path.join(base, 'artifacts'),
-                 os.path.join(base, 'cache'),
-                 mount):
+    #
+    # ⚠️ Taken from `instance_paths` rather than rebuilt here. Constructing a
+    # path twice is how a teardown ends up naming something the setup never
+    # created — W212 in miniature, and now multiplied by the number of agencies.
+    # It was already wrong on the development machine, where `os.path.join`
+    # produced a separator no box uses.
+    for path in (paths['artifacts'], paths['cache'], mount):
         name = _systemd_unit_name(path)
         _run_root(['systemctl', 'disable', '--now', name], timeout=90)
         # `disable --now` stops a *loaded* unit. A unit whose file was already
@@ -758,7 +800,7 @@ def remove_store(ctx, plog):
 
     # ⚠️ Only ours. `losetup -D` would detach every loop device on the box,
     # including other modules' — so the image is named explicitly.
-    rc, out = _run_root(['losetup', '-j', STORE_IMAGE])
+    rc, out = _run_root(['losetup', '-j', image])
     if rc == 0 and out.strip():
         for line in out.strip().splitlines():
             dev = line.split(':', 1)[0].strip()
@@ -766,16 +808,16 @@ def remove_store(ctx, plog):
                 _run_root(['losetup', '-d', dev])
                 did.append(f'Loop device {dev} detached')
 
-    if os.path.exists(STORE_IMAGE):
+    if os.path.exists(image):
         try:
-            os.remove(STORE_IMAGE)
-            did.append(f'Reservation {STORE_IMAGE} deleted')
+            os.remove(image)
+            did.append(f'Reservation {image} deleted')
         except OSError as exc:
-            errs.append(f'could not delete {STORE_IMAGE}: {exc}')
+            errs.append(f'could not delete {image}: {exc}')
 
     # Only if empty: /var/lib/atlas is ours, but rmdir refusing on a non-empty
     # directory is the correct outcome rather than something to force.
-    parent = os.path.dirname(STORE_IMAGE)
+    parent = os.path.dirname(image)
     try:
         if os.path.isdir(parent) and not os.listdir(parent):
             os.rmdir(parent)
@@ -786,7 +828,7 @@ def remove_store(ctx, plog):
     return did, errs
 
 
-def _reserve_blocks(size_bytes, plog):
+def _reserve_blocks(size_bytes, plog, image=None):
     """Fill any holes in the image, so the reservation is one. Error, or None.
 
     ⚠️ **Safe on a mounted store, and proven so before being written here.**
@@ -799,19 +841,20 @@ def _reserve_blocks(size_bytes, plog):
 
     Idempotent: a store already holding its blocks is measured and left alone.
     """
-    allocated = allocated_bytes(STORE_IMAGE)
+    image = image or STORE_IMAGE
+    allocated = allocated_bytes(image)
     if is_fully_reserved(size_bytes, allocated):
         return None
 
     if allocated is not None:
         plog(f'  Reserving blocks: {allocated / GIB:.1f} of '
              f'{size_bytes / GIB:.1f} GB are actually allocated...')
-    rc, out = _run_root(['fallocate', '-l', str(size_bytes), STORE_IMAGE],
+    rc, out = _run_root(['fallocate', '-l', str(size_bytes), image],
                         timeout=900)
     if rc != 0:
         return f'fallocate (reserving blocks) failed: {out.strip()[:300]}'
 
-    after = allocated_bytes(STORE_IMAGE)
+    after = allocated_bytes(image)
     if after is None:
         # No `st_blocks` to check against. The fallocate succeeded, so say what
         # is known rather than either failing or claiming success.
@@ -825,7 +868,7 @@ def _reserve_blocks(size_bytes, plog):
     return None
 
 
-def _bind_pg_volume(pgdir, plog):
+def _bind_pg_volume(pgdir, plog, volume=None):
     """Back the Postgres named volume with a bind into the store.
 
     ⚠️ **Proven against a real Docker before it was written here.** Compose
@@ -838,15 +881,16 @@ def _bind_pg_volume(pgdir, plog):
     Left alone if it already points where it should: recreating a volume Postgres
     has data in would be the one genuinely destructive thing in this feature.
     """
+    volume = volume or STORE_PG_VOLUME
     rc, out = _run_root(
-        ['docker', 'volume', 'inspect', STORE_PG_VOLUME, '--format', '{{.Options.device}}'])
+        ['docker', 'volume', 'inspect', volume, '--format', '{{.Options.device}}'])
     if rc == 0:
         if out.strip() == pgdir:
-            plog(f'  ✓ {STORE_PG_VOLUME} already backed by the store')
+            plog(f'  ✓ {volume} already backed by the store')
             return None
         where = out.strip() or "Docker's own directory"
         return (
-            f'{STORE_PG_VOLUME} already exists and points at {where}. '
+            f'{volume} already exists and points at {where}. '
             f'Remove it before reserving a store — otherwise the database '
             f'would sit outside the reservation while the console reported it '
             f'inside.'
@@ -855,11 +899,11 @@ def _bind_pg_volume(pgdir, plog):
     rc, out = _run_root([
         'docker', 'volume', 'create', '--driver', 'local',
         '-o', 'type=none', '-o', f'device={pgdir}', '-o', 'o=bind',
-        STORE_PG_VOLUME,
+        volume,
     ])
     if rc != 0:
-        return f'could not create {STORE_PG_VOLUME}: {out.strip()[:300]}'
-    plog(f'  ✓ {STORE_PG_VOLUME} backed by {pgdir}')
+        return f'could not create {volume}: {out.strip()[:300]}'
+    plog(f'  ✓ {volume} backed by {pgdir}')
     return None
 
 
@@ -1288,18 +1332,37 @@ def _plog(msg):
     job_log(KEY, msg)
 
 
-def atlas_dir(ctx):
-    """Where ATLAS is installed.
+def install_base(ctx=None):
+    """The directory ATLAS deployments live under: `/root` or the console's home.
 
     ⚠️ Two layouts, and the difference is not cosmetic. A console born
     unprivileged keeps modules under its own home; a box flipped from root keeps
     them at `/root`. Guessing wrong means a deploy that "succeeds" against an
     empty directory while the real install sits elsewhere.
+
+    ⚠️ **One box, one layout — the probe is not per instance.** A new agency
+    has no checkout yet, so it cannot be asked where it lives; it goes wherever
+    the deployments that already exist do. Any `atlas*` checkout under `/root`
+    settles it, which is why the glob is wider than the plain instance: a box
+    holding only agency deployments must still resolve to `/root`.
+
+    For the box deployed today this returns `/root`, exactly as before.
     """
-    root_path = os.path.join('/root', KEY)
-    if os.path.isdir(os.path.join(root_path, '.git')):
-        return root_path
-    return os.path.expanduser(os.path.join('~', KEY))
+    if _glob(posixpath.join('/root', KEY + '*', '.git')):
+        return '/root'
+    return os.path.expanduser('~')
+
+
+def atlas_dir(ctx=None):
+    """Where the **plain** ATLAS deployment is installed.
+
+    ⚠️ **One argument, deliberately.** Every existing call site and every test
+    double passes exactly one, and widening the signature broke 33 of them at a
+    stroke — which was the right signal: agency paths belong in
+    `instance_paths`, not here. This answers one question and keeps answering
+    it the way it always has.
+    """
+    return posixpath.join(install_base(ctx), KEY)
 
 
 def _compose_argv(ctx, *action):
