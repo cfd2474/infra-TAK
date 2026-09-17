@@ -49,12 +49,24 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.47.1'
+ATLAS_TAG = 'v1.47.3'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
 # every deploy refuse itself. `git rev-parse 'v0.1.0^{}'` is the one to record.
-ATLAS_SHA = 'fead761a5bf5efe07a13f8dad0674dc0a8c2e90a'
+#
+# ⚠️ **And it is the commit in the repository above, which is now a mirror.**
+# As of v1.47.2 `cfd2474/TAK-MDM` is published from a private development
+# repository — one orphan commit per release — so every release has *two*
+# commits: the private one the work was done in, and the public one that
+# `_verify_pin` will actually see in the clone. Recording the private SHA, which
+# is exactly what the previous value here was, pins a hash the clone can never
+# produce, and the deploy then refuses itself with "refusing to install a tag
+# that has moved" — a message pointing at tampering rather than at bookkeeping.
+# Take it from the mirror, never from the working copy you are standing in:
+#
+#     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
+ATLAS_SHA = '8b730f769e26fcfc44f5f6247fa0d36c4fcd41ef'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
