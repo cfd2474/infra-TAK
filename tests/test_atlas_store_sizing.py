@@ -425,3 +425,76 @@ def test_the_store_field_behaves():
 
     assert result.returncode == 0, output
     assert "all checks passed" in output, output
+
+
+# --------------------------------------------------------------------------- #
+# The deploy gate and its confirmation (W206)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_deploy_button_starts_disabled():
+    """⚠️ A size is required now, so the button cannot be pressed without
+    one. Deploying blank used to mean "share the disk as before" — an operator
+    could pass the field without noticing and find out months later, when ATLAS
+    had filled the root filesystem."""
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    button = page[page.index('id="deployBtn"'): page.index('id="deployBtn"') + 260]
+
+    assert "disabled" in button
+
+
+def test_the_page_no_longer_offers_to_reserve_nothing():
+    """The copy and the control have to agree — a required field beside "leave it
+    blank" is a page arguing with itself."""
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+
+    assert "Leave it blank to reserve nothing" not in page
+    assert "is <strong>required</strong>" in page
+
+
+def test_deploy_asks_before_it_reserves():
+    """⚠️ Asserted against the **button**, not the page.
+
+    The first version looked for "openDeployConfirm()" anywhere in the HTML, and
+    `function openDeployConfirm(){` contains that substring — so the check
+    matched the function's own definition and passed with the button wired
+    straight to `startDeploy()`. A mutation sweep found it. Fourth time this
+    pattern has bitten: an assertion that names a thing rather than locating it.
+    """
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    start = page.index('id="deployBtn"')
+    button = page[start - 200: start + 260]
+
+    assert 'id="deployModal"' in page
+    assert "openDeployConfirm()" in button, "the button no longer opens the modal"
+    assert "startDeploy()" not in button, "the button reserves without asking"
+    assert "confirmDeploy()" in page
+
+
+def test_the_gate_and_the_modal_behave():
+    """⚠️ Driven, not matched.
+
+    A button that enables at the right moment, a refusal that explains itself in
+    the server's own words, and a modal that repeats the number back before
+    anything is allocated — none of it visible in a string search.
+    `scripts/check_deploy_gate.js` is plain node with a hand-rolled DOM.
+
+    ⚠️ That DOM coerces `value` to a string, because a real input does and a
+    convenient fake does not. The first version stored the raw number, `.trim()`
+    threw, and it looked exactly like a bug in the page.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip(
+            "no node on PATH, so the deploy gate is unexercised. The rest of this "
+            "module only checks the markup is present."
+        )
+
+    result = subprocess.run(
+        [node, str(ROOT / "scripts" / "check_deploy_gate.js")],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "all checks passed" in output, output

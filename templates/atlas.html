@@ -73,13 +73,29 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       </p>
       <p class="note" style="margin:6px 0 0">
         ⚠️ <strong>Free disk will drop by this much immediately</strong> — that
-        is the reservation working, not a leak. Leave it blank to reserve nothing
-        and share the disk as before.
+        is the reservation working, not a leak. A size is <strong>required</strong>:
+        ATLAS will not deploy without one.
       </p>
       <p class="note" id="storeState" style="margin:6px 0 0;display:none"></p>
     </div>
 
-    <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" style="margin-top:16px">Deploy ATLAS</button>
+    <!--
+      ⚠️ **Disabled until the store size is a number this box can honour.**
+      Deploying without one used to be allowed and meant "share the disk as
+      before" — an operator could pass the field without noticing it, and find
+      out months later when ATLAS had filled the root filesystem. The size is
+      required now, so the button waits for it.
+
+      Disabled for a value that is *out of range* too, not only for a blank one.
+      The server refuses those before the deploy starts, so allowing the click
+      would trade a greyed-out button for a red banner — and the reason sits
+      beside the button either way.
+    -->
+    <button class="btn btn-primary" id="deployBtn" onclick="openDeployConfirm()"
+            style="margin-top:16px" disabled>Deploy ATLAS</button>
+    <p class="note" id="deployGate" style="margin:8px 0 0">
+      Enter a reserved storage size above to enable this.
+    </p>
     <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log below.</div>
   </div>
 
@@ -429,6 +445,33 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
   </div>
 </div>
 
+<!--
+  ⚠️ Confirming a **reservation**, not a deployment. The number is the one
+  thing on this page that changes the box outside ATLAS: the space leaves `df`
+  immediately and does not come back without deliberate work. So it is repeated
+  here, in the operator's own units, after they have typed it and before
+  anything is allocated.
+-->
+<div class="modal-overlay" id="deployModal">
+  <div class="modal">
+    <h3>Deploy ATLAS</h3>
+    <p class="note">
+      ATLAS will reserve <strong id="deployConfirmSize">—</strong> of this box&rsquo;s
+      disk for its uploads, caches and database.
+    </p>
+    <p class="note" style="margin-top:10px">
+      ⚠️ <strong>Free disk drops by this much straight away.</strong> The space
+      is claimed up front so nothing else on the box can take it — that is what
+      makes it a reservation rather than a limit.
+    </p>
+    <p class="note" id="deployConfirmRoom" style="margin-top:10px"></p>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeDeployConfirm()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmDeploy()">Reserve &amp; deploy</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="uninstallModal">
   <div class="modal">
     <h3>Uninstall ATLAS</h3>
@@ -484,6 +527,7 @@ function loadStoreFacts(){
       // because a number typed past a browser control is not a validation.
       field.max = d.max_gb;
       field.min = d.min_gb;
+      storeLimits = {min: d.min_gb, max: d.max_gb, free: d.disk_free_gb};
       help.textContent = d.disk_free_gb + ' GB free on this box \u00b7 at most '
         + d.max_gb + ' GB may be reserved (85%).';
       if (d.mounted) {
@@ -492,10 +536,81 @@ function loadStoreFacts(){
           + d.used_gb + ' GB in use.';
         if (!field.value) field.value = d.reserved_gb;
       }
+      // \u26a0\ufe0f After the numbers land, not before. The gate runs once at page
+      // load with no limits known, and a prefilled reservation arrives later -
+      // without this the button stays greyed out on a box that already has a
+      // store, which reads as the page being broken.
+      refreshDeployGate();
     })
     .catch(() => { help.textContent = 'Could not read this box\u2019s disk.'; });
 }
 loadStoreFacts();
+
+// \u26a0\ufe0f The ceiling and floor the field was given by loadStoreFacts. Held here
+// so the gate can explain a refusal in the same words the server would, rather
+// than greying the button out for a reason nobody can see.
+let storeLimits = {min: 2, max: null};
+
+function storeSizeProblem(){
+  const field = document.getElementById('storeGb');
+  if (!field) return null;
+  const raw = (field.value || '').trim();
+  if (raw === '') return 'Enter a reserved storage size above to enable this.';
+  const gb = Number(raw);
+  if (!isFinite(gb)) return 'Reserved storage must be a number of gigabytes.';
+  if (gb < storeLimits.min){
+    return 'Reserve at least ' + storeLimits.min + ' GB \u2014 ATLAS ships about 570 MB '
+      + 'of applications and indexes before anything is uploaded.';
+  }
+  if (storeLimits.max !== null && gb > storeLimits.max){
+    return 'This box can offer at most ' + storeLimits.max + ' GB (85% of what is free).';
+  }
+  return null;
+}
+
+// \u26a0\ufe0f Disabled is not a security control - the server validates the same
+// number again before it allocates anything. This exists so the operator is
+// told now rather than after a deploy starts and stops.
+function refreshDeployGate(){
+  const btn = document.getElementById('deployBtn');
+  const note = document.getElementById('deployGate');
+  if (!btn) return;
+  const problem = storeSizeProblem();
+  btn.disabled = problem !== null;
+  if (note){
+    note.textContent = problem || '';
+    note.style.display = problem ? '' : 'none';
+  }
+}
+
+document.addEventListener('input', function(e){
+  if (e.target && e.target.id === 'storeGb') refreshDeployGate();
+});
+refreshDeployGate();
+
+function openDeployConfirm(){
+  if (storeSizeProblem() !== null) return;   // the button should already be off
+  const gb = Number(document.getElementById('storeGb').value);
+  document.getElementById('deployConfirmSize').textContent = gb + ' GB';
+  const room = document.getElementById('deployConfirmRoom');
+  if (room && storeLimits.free !== undefined && storeLimits.free !== null){
+    const left = Math.round((storeLimits.free - gb) * 10) / 10;
+    room.textContent = 'This box has ' + storeLimits.free + ' GB free; '
+      + left + ' GB will remain for everything else.';
+  } else if (room){
+    room.textContent = '';
+  }
+  document.getElementById('deployModal').classList.add('open');
+}
+
+function closeDeployConfirm(){
+  document.getElementById('deployModal').classList.remove('open');
+}
+
+function confirmDeploy(){
+  closeDeployConfirm();
+  startDeploy();
+}
 
 function startDeploy(){
   const btn = document.getElementById('deployBtn');

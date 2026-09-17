@@ -44,7 +44,15 @@ function fakeDom() {
   const els = {};
   return {
     el(id) {
-      if (!els[id]) els[id] = { id, style: {}, textContent: "", innerHTML: "", value: "" };
+      if (!els[id]) {
+        // `value` is a string on a real input whatever is assigned to it.
+        const node = { id, style: {}, textContent: "", innerHTML: "", _value: "" };
+        Object.defineProperty(node, "value", {
+          get() { return this._value; },
+          set(v) { this._value = String(v); },
+        });
+        els[id] = node;
+      }
       return els[id];
     },
   };
@@ -52,7 +60,9 @@ function fakeDom() {
 
 function run(facts) {
   const dom = fakeDom();
-  global.document = { getElementById: dom.el };
+  // The page wires an input listener for the deploy gate (W206); a fake
+  // document without one throws before anything under test runs.
+  global.document = { getElementById: dom.el, addEventListener: () => {} };
   global.fetch = () => Promise.resolve({ json: () => Promise.resolve(facts) });
   eval(scripts.slice(start, end));
   loadStoreFacts();
@@ -84,7 +94,7 @@ function run(facts) {
   );
   check(
     "an existing reservation prefills the field",
-    String(dom.el("storeGb").value) === "40",
+    dom.el("storeGb").value === "40",
     "value=" + dom.el("storeGb").value,
   );
   check(
