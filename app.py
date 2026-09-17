@@ -18632,7 +18632,7 @@ def _f2b_arm_esrifeed_jail(log_fn=None):
         if log_fn:
             log_fn(m)
 
-    if not _f2b_installed():
+    if not _f2b_is_available():
         return (False, 'fail2ban is not installed — the feed works, but repeated bad '
                        'tokens are not throttled. Deploy the fail2ban module to arm it.')
     try:
@@ -18687,7 +18687,7 @@ def _f2b_arm_esrifeed_jail(log_fn=None):
 
 def _f2b_disarm_esrifeed_jail():
     """Remove the esrifeed jail + filter and reload. Returns (ok, message)."""
-    if not _f2b_installed():
+    if not _f2b_is_available():
         return (True, 'fail2ban not installed — nothing to remove')
     try:
         # Reuse the existing jail remover — it carries the filename guard and the
