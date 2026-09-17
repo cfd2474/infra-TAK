@@ -1,9 +1,20 @@
-"""Esri Outbound Feed — read-only ArcGIS REST FeatureServer of connected ATAK clients.
+"""TAK Client Feed — publish connected TAK clients to outside consumers.
 
-PLAN v10.1.76. infra-TAK hosts a standards-compliant ArcGIS Feature Service so an
-outside agency (Tablet Command first) can pull TAK situational awareness onto its
-own map. Each consumer gets its OWN token, scoped to the TAK channels the operator
-picks, revocable without touching any other consumer.
+PLAN v10.1.77. infra-TAK hosts a read-only map feed of the ATAK/iTAK/WinTAK clients
+connected to this TAK Server, so an outside agency can pull TAK situational awareness
+onto its own map. Each consumer gets its OWN token, scoped to the TAK channels the
+operator picks, revocable without touching any other consumer.
+
+Two representations off one URL:
+  * **ArcGIS REST FeatureServer** (`f=json`) — what Esri-spec consumers speak. Despite
+    the name that is not an Esri-only club: Tablet Command, Intterra, First Due,
+    WebEOC, QGIS and ArcGIS Pro all consume it.
+  * **GeoJSON** (`f=geojson`) — for everything else: Leaflet, Mapbox, OpenLayers, or
+    anything that can parse a FeatureCollection.
+
+The module is deliberately NOT named after either protocol or any vendor. It is named
+for what it publishes, so adding a third representation later does not make the name
+a lie.
 
 This is the mirror of the inbound integration the Node-RED Configurator already
 ships: it polls Tablet Command's tokenized feature service
@@ -45,7 +56,7 @@ from datetime import datetime, timezone
 
 from . import register_module
 
-STORE_NAME = 'esrifeed.json'
+STORE_NAME = 'clientfeed.json'
 
 # Fleet-uniform constants — no per-customer knobs (CLAUDE.md fleet-uniform config).
 DEFAULT_STALE_MINUTES = 5          # matches Tablet Command's own AVL stale concept
@@ -183,6 +194,33 @@ def update_token(ctx, token_id, label=None, channels=None, stale_minutes=None):
             _save_store(ctx, store)
             return True
     return False
+
+
+def rotate_token(ctx, token_id):
+    """Issue a NEW secret for an existing token, keeping its label, channels and
+    settings. Returns (entry, secret) or (None, None).
+
+    This exists because the alternative — revoke and re-mint — loses the agency's
+    label, channel scoping and stale window, and makes the operator rebuild a
+    consumer that was only ever asking for a fresh credential. Rotation is the
+    normal lifecycle event (a leaked URL, a staff change, a policy interval); a
+    teardown should not be the only way to get one.
+
+    The OLD secret stops working the instant this returns: its hash is replaced,
+    and resolve_token() compares against hashes only.
+    """
+    secret = secrets.token_urlsafe(32)
+    with _STORE_LOCK:
+        store = _load_store(ctx)
+        for t in store['tokens']:
+            if t.get('id') != token_id:
+                continue
+            t['token_hash'] = _hash_token(secret)
+            t['rotated_ts'] = _now_iso()
+            t['rotations'] = int(t.get('rotations') or 0) + 1
+            _save_store(ctx, store)
+            return t, secret
+    return None, None
 
 
 def resolve_token(ctx, presented):
@@ -583,6 +621,37 @@ def query_json(entry, feats, params):
     }
 
 
+def geojson_response(entry, feats, params):
+    """RFC 7946 FeatureCollection — the representation for consumers that do not
+    speak the ArcGIS REST spec (Leaflet, Mapbox, OpenLayers, plain HTTP clients)."""
+    keep = _wanted_fields(params.get('outFields') or '*')
+    want_geom = str(params.get('returnGeometry', 'true')).lower() not in ('false', '0')
+    try:
+        limit = int(params.get('resultRecordCount') or MAX_RECORD_COUNT)
+    except (TypeError, ValueError):
+        limit = MAX_RECORD_COUNT
+    limit = max(1, min(limit, MAX_RECORD_COUNT))
+
+    out = []
+    for f in feats[:limit]:
+        geom = None
+        if want_geom and f.get('_lat') is not None and f.get('_lon') is not None:
+            geom = {'type': 'Point', 'coordinates': [f['_lon'], f['_lat']]}
+        out.append({'type': 'Feature', 'id': f.get('OBJECTID'),
+                    'geometry': geom,
+                    'properties': {k: f.get(k) for k in keep if k != 'OBJECTID'}})
+    return {'type': 'FeatureCollection', 'features': out}
+
+
+def query_response(entry, feats, params):
+    """Dispatch on `f`. Esri JSON is the default because that is what the spec-
+    compliant consumers request by name; geojson is opt-in."""
+    fmt = str(params.get('f') or 'json').strip().lower()
+    if fmt == 'geojson':
+        return geojson_response(entry, feats, params)
+    return query_json(entry, feats, params)
+
+
 def esri_error(code, message, details=''):
     return {'error': {'code': code, 'message': message,
                       'details': [details] if details else []}}
@@ -611,13 +680,13 @@ def detect(ctx):
 
 def deploy(ctx, job, params):
     from . import job_log
-    key = 'esrifeed'
+    key = 'clientfeed'
 
     def plog(m):
         job_log(key, m)
 
     try:
-        plog('Enabling Esri Outbound Feed…')
+        plog('Enabling TAK Client Feed…')
         if not os.path.isdir('/opt/tak') and not os.path.exists('/opt/tak'):
             plog('⚠ TAK Server not detected on this host — the feed will return '
                  'no features until TAK Server is installed.')
@@ -634,7 +703,7 @@ def deploy(ctx, job, params):
         else:
             plog('   ✓ token store already present — left untouched')
 
-        plog('Regenerating Caddy config so /esri/* is reachable on 443…')
+        plog('Regenerating Caddy config so /feed/* is reachable on 443…')
         try:
             ctx['generate_caddyfile']()
             ctx['_caddy_reload']()
@@ -644,13 +713,13 @@ def deploy(ctx, job, params):
 
         plog('Arming the fail2ban jail for rejected tokens…')
         try:
-            ok, msg = ctx['_f2b_arm_esrifeed_jail'](plog)
+            ok, msg = ctx['_f2b_arm_clientfeed_jail'](plog)
             plog(('   ✓ ' if ok else '   ⚠ ') + msg)
         except Exception as e:
             plog('   ⚠ jail setup error: %s' % str(e)[:160])
 
         plog('')
-        plog('✅ Esri Outbound Feed ready. Mint a token to hand an agency a URL.')
+        plog('✅ TAK Client Feed ready. Mint a token to hand an agency a URL.')
         plog('   No new port was opened — the feed rides the existing Caddy 443 listener.')
         return True
     except Exception as e:
@@ -660,13 +729,13 @@ def deploy(ctx, job, params):
 
 def uninstall(ctx, job, params):
     from . import job_log
-    key = 'esrifeed'
+    key = 'clientfeed'
 
     def plog(m):
         job_log(key, m)
 
     try:
-        plog('Removing Esri Outbound Feed…')
+        plog('Removing TAK Client Feed…')
         p = _store_path(ctx)
         if os.path.exists(p):
             n = len(_load_store(ctx)['tokens'])
@@ -677,17 +746,17 @@ def uninstall(ctx, job, params):
         _snapshot_cache.clear()
         _pull_stats.clear()
         try:
-            ok, msg = ctx['_f2b_disarm_esrifeed_jail']()
+            ok, msg = ctx['_f2b_disarm_clientfeed_jail']()
             plog(('   ✓ ' if ok else '   ⚠ ') + msg)
         except Exception as e:
             plog('   ⚠ jail removal error: %s' % str(e)[:160])
         try:
             ctx['generate_caddyfile']()
             ctx['_caddy_reload']()
-            plog('   ✓ Caddy regenerated — /esri/* no longer served')
+            plog('   ✓ Caddy regenerated — /feed/* no longer served')
         except Exception as e:
             plog('   ⚠ Caddy regen failed: %s' % str(e)[:160])
-        plog('✅ Esri Outbound Feed removed.')
+        plog('✅ TAK Client Feed removed.')
         return True
     except Exception as e:
         plog('❌ Uninstall failed: %s' % str(e)[:300])
@@ -720,6 +789,8 @@ def register(ctx):
                 'created_ts': t.get('created_ts'), 'enabled': t.get('enabled', True),
                 'last_pull_ts': _lp_ts, 'last_pull_ip': _lp_ip,
                 'pull_count': _lp_n,
+                'rotated_ts': t.get('rotated_ts'),
+                'rotations': int(t.get('rotations') or 0),
             })
         return jsonify({'success': True, 'tokens': out})
 
@@ -737,11 +808,11 @@ def register(ctx):
             return jsonify({'success': False,
                             'error': 'Unknown channel(s): %s' % ', '.join(bad[:5])}), 400
         entry, secret = mint_token(ctx, label, channels, d.get('stale_minutes'))
-        ctx['audit']('esrifeed_token_mint',
+        ctx['audit']('clientfeed_token_mint',
                      'label=%s channels=%s' % (entry['label'], ','.join(channels)),
                      force=True)
         return jsonify({'success': True, 'id': entry['id'], 'token': secret,
-                        'path': '/esri/%s/FeatureServer' % secret})
+                        'path': '/feed/%s/FeatureServer' % secret})
 
     def revoke_view():
         d = request.get_json(silent=True) or {}
@@ -750,7 +821,7 @@ def register(ctx):
         label = next((t.get('label') for t in store['tokens'] if t.get('id') == tid), tid)
         if not revoke_token(ctx, tid):
             return jsonify({'success': False, 'error': 'No such token'}), 404
-        ctx['audit']('esrifeed_token_revoke', 'label=%s id=%s' % (label, tid), force=True)
+        ctx['audit']('clientfeed_token_revoke', 'label=%s id=%s' % (label, tid), force=True)
         return jsonify({'success': True})
 
     def toggle_view():
@@ -758,7 +829,7 @@ def register(ctx):
         tid, on = d.get('id'), bool(d.get('enabled'))
         if not set_token_enabled(ctx, tid, on):
             return jsonify({'success': False, 'error': 'No such token'}), 404
-        ctx['audit']('esrifeed_token_%s' % ('enable' if on else 'disable'), 'id=%s' % tid,
+        ctx['audit']('clientfeed_token_%s' % ('enable' if on else 'disable'), 'id=%s' % tid,
                      force=True)
         return jsonify({'success': True})
 
@@ -774,8 +845,21 @@ def register(ctx):
                                 'error': 'Unknown channel(s): %s' % ', '.join(bad[:5])}), 400
         if not update_token(ctx, tid, d.get('label'), channels, d.get('stale_minutes')):
             return jsonify({'success': False, 'error': 'No such token'}), 404
-        ctx['audit']('esrifeed_token_edit', 'id=%s' % tid, force=True)
+        ctx['audit']('clientfeed_token_edit', 'id=%s' % tid, force=True)
         return jsonify({'success': True})
+
+    def rotate_view():
+        d = request.get_json(silent=True) or {}
+        tid = d.get('id')
+        entry, secret = rotate_token(ctx, tid)
+        if not entry:
+            return jsonify({'success': False, 'error': 'No such token'}), 404
+        ctx['audit']('clientfeed_token_rotate',
+                     'label=%s id=%s rotations=%s' % (entry.get('label'), tid,
+                                                      entry.get('rotations')),
+                     force=True)
+        return jsonify({'success': True, 'id': entry['id'], 'token': secret,
+                        'path': '/feed/%s/FeatureServer' % secret})
 
     def preview_view():
         """What a given token currently returns — so the operator can see the
@@ -793,32 +877,34 @@ def register(ctx):
                         'sample': query_json(entry, feats[:5], {})})
 
     register_module({
-        'key': 'esrifeed',
-        'name': 'Esri Outbound Feed',
-        'description': 'Publish connected TAK clients as a tokenized Esri feature service',
+        'key': 'clientfeed',
+        'name': 'TAK Client Feed',
+        'description': 'Publish connected TAK clients to outside agencies as a map feed',
         'icon': '🛰️',
-        'route': '/esrifeed',
-        'template': 'esrifeed.html',
+        'route': '/clientfeed',
+        'template': 'clientfeed.html',
         'priority': 14,
         'detect': detect,
         'deploy': deploy,
         'uninstall': uninstall,
         'control_map': {},          # nothing to start/stop — it is a route, not a service
         'extra_routes': [
-            {'url': '/api/esrifeed/channels', 'methods': ['GET'],
-             'endpoint': 'esrifeed_channels', 'view': channels_view},
-            {'url': '/api/esrifeed/tokens', 'methods': ['GET'],
-             'endpoint': 'esrifeed_tokens', 'view': tokens_view},
-            {'url': '/api/esrifeed/tokens/mint', 'methods': ['POST'],
-             'endpoint': 'esrifeed_mint', 'view': mint_view},
-            {'url': '/api/esrifeed/tokens/revoke', 'methods': ['POST'],
-             'endpoint': 'esrifeed_revoke', 'view': revoke_view},
-            {'url': '/api/esrifeed/tokens/toggle', 'methods': ['POST'],
-             'endpoint': 'esrifeed_toggle', 'view': toggle_view},
-            {'url': '/api/esrifeed/tokens/edit', 'methods': ['POST'],
-             'endpoint': 'esrifeed_edit', 'view': edit_view},
-            {'url': '/api/esrifeed/preview', 'methods': ['POST'],
-             'endpoint': 'esrifeed_preview', 'view': preview_view},
+            {'url': '/api/clientfeed/channels', 'methods': ['GET'],
+             'endpoint': 'clientfeed_channels', 'view': channels_view},
+            {'url': '/api/clientfeed/tokens', 'methods': ['GET'],
+             'endpoint': 'clientfeed_tokens', 'view': tokens_view},
+            {'url': '/api/clientfeed/tokens/mint', 'methods': ['POST'],
+             'endpoint': 'clientfeed_mint', 'view': mint_view},
+            {'url': '/api/clientfeed/tokens/revoke', 'methods': ['POST'],
+             'endpoint': 'clientfeed_revoke', 'view': revoke_view},
+            {'url': '/api/clientfeed/tokens/toggle', 'methods': ['POST'],
+             'endpoint': 'clientfeed_toggle', 'view': toggle_view},
+            {'url': '/api/clientfeed/tokens/edit', 'methods': ['POST'],
+             'endpoint': 'clientfeed_edit', 'view': edit_view},
+            {'url': '/api/clientfeed/tokens/rotate', 'methods': ['POST'],
+             'endpoint': 'clientfeed_rotate', 'view': rotate_view},
+            {'url': '/api/clientfeed/preview', 'methods': ['POST'],
+             'endpoint': 'clientfeed_preview', 'view': preview_view},
         ],
         'ports': [],                # opens NO port — rides Caddy's existing 443
         'service_units': [],

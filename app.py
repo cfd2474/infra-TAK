@@ -3179,15 +3179,15 @@ def detect_modules():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
-    # Esri Outbound Feed — registry-resident (modules/esrifeed.py), v10.1.76.
+    # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
     # Tile identity + probes come from the descriptor, not an inline block.
-    _ef_desc = mod_registry.MODULES.get('esrifeed')
+    _ef_desc = mod_registry.MODULES.get('clientfeed')
     if _ef_desc:
         try:
             _ef_state = _ef_desc['detect'](mod_registry.get_ctx())
         except Exception:
             _ef_state = {}
-        modules['esrifeed'] = {'name': _ef_desc['name'],
+        modules['clientfeed'] = {'name': _ef_desc['name'],
             'installed': bool(_ef_state.get('installed')),
             'running': bool(_ef_state.get('running')),
             'description': _ef_desc['description'], 'icon': _ef_desc['icon'],
@@ -16479,18 +16479,18 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
-    'esrifeed': (
+    'clientfeed': (
         "[Definition]\n"
-        "# v10.1.77 — Esri Outbound Feed. The producer is _esri_log_failure() in app.py,\n"
+        "# v10.1.77 — TAK Client Feed. The producer is _clientfeed_log_failure() in app.py,\n"
         "# which writes exactly one shape:\n"
-        "#     2026-09-17 19:54:43 esrifeed: rejected token from 1.2.3.4 (unknown or disabled token)\n"
+        "#     2026-09-17 19:54:43 clientfeed: rejected token from 1.2.3.4 (unknown or disabled token)\n"
         "# The token itself is NEVER written to this log — only that an attempt was rejected\n"
         "# and the source. The IP is the REAL client: the feed is reached through Caddy, and\n"
         "# _client_ip() unwraps X-Forwarded-For when remote_addr is loopback.\n"
         "#\n"
         "# The date prefix may or may not be stripped before failregex is applied depending\n"
         "# on datepattern detection, so the leading timestamp is optional in the pattern.\n"
-        "failregex = ^\\s*(?:\\S+ \\S+ )?esrifeed: rejected token from <HOST> \\(\n"
+        "failregex = ^\\s*(?:\\S+ \\S+ )?clientfeed: rejected token from <HOST> \\(\n"
         "ignoreregex =\n"
         "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
     ),
@@ -18605,15 +18605,15 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
 
 # Fleet-uniform thresholds for the Esri feed jail. Deliberately NOT a UI knob:
 # per-customer tuning of a security control is the anti-pattern CLAUDE.md names.
-ESRIFEED_F2B_MAXRETRY = 10
-ESRIFEED_F2B_FINDTIME = 600
-ESRIFEED_F2B_BANTIME = 3600
+CLIENTFEED_F2B_MAXRETRY = 10
+CLIENTFEED_F2B_FINDTIME = 600
+CLIENTFEED_F2B_BANTIME = 3600
 
 
-def _f2b_arm_esrifeed_jail(log_fn=None):
-    """Write the esrifeed filter + jail and reload fail2ban. Returns (ok, message).
+def _f2b_arm_clientfeed_jail(log_fn=None):
+    """Write the clientfeed filter + jail and reload fail2ban. Returns (ok, message).
 
-    Called from the Esri Outbound Feed module's deploy through a ctx seam — every
+    Called from the TAK Client Feed module's deploy through a ctx seam — every
     other jail writer lives here too, so fail2ban knowledge stays in one file.
 
     Two things this deliberately handles, both learned the hard way:
@@ -18638,33 +18638,33 @@ def _f2b_arm_esrifeed_jail(log_fn=None):
     try:
         # (1) seed the log so the jail is never born 0-byte / STARVING
         try:
-            if not os.path.exists(ESRI_FEED_FAIL_LOG) or os.path.getsize(ESRI_FEED_FAIL_LOG) == 0:
-                with open(ESRI_FEED_FAIL_LOG, 'a') as f:
-                    f.write('%s esrifeed: jail armed (no rejected tokens yet)\n'
+            if not os.path.exists(CLIENTFEED_FAIL_LOG) or os.path.getsize(CLIENTFEED_FAIL_LOG) == 0:
+                with open(CLIENTFEED_FAIL_LOG, 'a') as f:
+                    f.write('%s clientfeed: jail armed (no rejected tokens yet)\n'
                             % datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
-                os.chmod(ESRI_FEED_FAIL_LOG, 0o600)
+                os.chmod(CLIENTFEED_FAIL_LOG, 0o600)
         except Exception:
             pass
 
         _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
         _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
-        _write_priv('/etc/fail2ban/filter.d/esrifeed.conf', _F2B_OWNED_FILTERS['esrifeed'])
+        _write_priv('/etc/fail2ban/filter.d/clientfeed.conf', _F2B_OWNED_FILTERS['clientfeed'])
 
         guarddog_action = ""
         if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
             guarddog_action = "\n         infratak-guarddog"
         jail_conf = (
-            "[esrifeed]\n"
+            "[clientfeed]\n"
             "enabled  = true\n"
-            "filter   = esrifeed\n"
-            f"logpath  = {ESRI_FEED_FAIL_LOG}\n"
-            f"maxretry = {ESRIFEED_F2B_MAXRETRY}\n"
-            f"findtime = {ESRIFEED_F2B_FINDTIME}\n"
-            f"bantime  = {ESRIFEED_F2B_BANTIME}\n"
+            "filter   = clientfeed\n"
+            f"logpath  = {CLIENTFEED_FAIL_LOG}\n"
+            f"maxretry = {CLIENTFEED_F2B_MAXRETRY}\n"
+            f"findtime = {CLIENTFEED_F2B_FINDTIME}\n"
+            f"bantime  = {CLIENTFEED_F2B_BANTIME}\n"
             f"ignoreip = {_f2b_trusted_ignoreip()}\n"
             f"action   = {_f2b_banaction()}{guarddog_action}\n"
         )
-        _write_priv('/etc/fail2ban/jail.d/infratak-esrifeed.conf', jail_conf)
+        _write_priv('/etc/fail2ban/jail.d/infratak-clientfeed.conf', jail_conf)
 
         r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
                            capture_output=True, text=True, timeout=45)
@@ -18674,27 +18674,27 @@ def _f2b_arm_esrifeed_jail(log_fn=None):
 
         # Verify it actually LOADED — writing the file is not the same as arming the
         # control, which is the entire lesson of the dead-jails audit.
-        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'esrifeed']),
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'clientfeed']),
                            capture_output=True, text=True, timeout=20)
         if v.returncode != 0:
             return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
                     % ((v.stderr or v.stdout or '')[:160]))
         return (True, 'jail armed and loaded (%d strikes / %ds → %ds ban)'
-                % (ESRIFEED_F2B_MAXRETRY, ESRIFEED_F2B_FINDTIME, ESRIFEED_F2B_BANTIME))
+                % (CLIENTFEED_F2B_MAXRETRY, CLIENTFEED_F2B_FINDTIME, CLIENTFEED_F2B_BANTIME))
     except Exception as e:
         return (False, 'jail setup failed: %s' % str(e)[:200])
 
 
-def _f2b_disarm_esrifeed_jail():
-    """Remove the esrifeed jail + filter and reload. Returns (ok, message)."""
+def _f2b_disarm_clientfeed_jail():
+    """Remove the clientfeed jail + filter and reload. Returns (ok, message)."""
     if not _f2b_is_available():
         return (True, 'fail2ban not installed — nothing to remove')
     try:
         # Reuse the existing jail remover — it carries the filename guard and the
         # reload, and it is the one path that knows about stale-jail cleanup.
-        removed = _f2b_remove_jail('infratak-esrifeed.conf',
-                                   'Esri Outbound Feed uninstalled')
-        fpath = '/etc/fail2ban/filter.d/esrifeed.conf'
+        removed = _f2b_remove_jail('infratak-clientfeed.conf',
+                                   'TAK Client Feed uninstalled')
+        fpath = '/etc/fail2ban/filter.d/clientfeed.conf'
         if _exists_priv(fpath):
             subprocess.run(_sudo_wrap(['rm', '-f', fpath]), capture_output=True, timeout=10)
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
@@ -28852,17 +28852,17 @@ def generate_caddyfile(settings=None):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
 
-    # v10.1.76 — Esri Outbound Feed: the ONE public, token-authed route family.
+    # v10.1.76 — TAK Client Feed: the ONE public, token-authed route family.
     # MUST be emitted BEFORE the catch-all `route {}` below. With Authentik installed
     # that catch-all applies forward_auth, and a machine consumer cannot complete an
     # SSO redirect — the feed would 302 into the login flow and die with an opaque
     # cross-origin error. Directive ORDER here is the entire reason this works.
     # Client X-Authentik-* is stripped exactly like every other console route (the
-    # v10.1.0 loopback-trust bypass); auth is the console's own @esri_token_required.
+    # v10.1.0 loopback-trust bypass); auth is the console's own @feed_token_required.
     # Emitted only when the feed is actually deployed, so a box that never enabled it
     # gains no public surface at all.
-    if os.path.exists(os.path.join(CONFIG_DIR, 'esrifeed.json')):
-        lines.append(f"    route /esri/* {{")
+    if os.path.exists(os.path.join(CONFIG_DIR, 'clientfeed.json')):
+        lines.append(f"    route /feed/* {{")
         _emit_ak_header_strip("        ")
         lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
         lines.append(f"            transport http {{")
@@ -33755,6 +33755,20 @@ fedhub_rotate_status = {'running': False, 'complete': False, 'error': False}
 def mediamtx_deploy_api():
     if mediamtx_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    # v10.1.78: the symmetric half of the registry's conflict guard (_active_conflict in
+    # modules/__init__.py). MediaMTX is not a registry module, so it needs its own. Both it
+    # and TVR default to the `stream` subdomain (SERVICE_DOMAIN_DEFAULTS), so a box with
+    # both installed makes generate_caddyfile emit two identical site blocks and Caddy
+    # rejects the WHOLE file — every vhost on the box goes down, not just streaming. The
+    # marketplace greys the card, but this route is reachable by direct curl.
+    # Fails OPEN: a transient detection error must never brick a deploy.
+    try:
+        _tvr_installed = detect_modules().get('tak_video_restreamer', {}).get('installed')
+    except Exception:
+        _tvr_installed = False
+    if _tvr_installed:
+        return jsonify({'error': 'Conflicts with TAK Video Restreamer, which is already '
+                                 'installed — uninstall it first, then return here.'}), 409
     data = request.get_json() or {}
     if data.get('config'):
         settings = load_settings()
@@ -80544,6 +80558,10 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
+    # v10.1.78: the vhost a module is actually served on — stream.<fqdn> for TVR by
+    # default, or the operator's {service}_domain override. Modules must not rebuild it
+    # from fqdn: that is exactly how the TVR deploy log came to print the apex.
+    '_get_service_domain': _get_service_domain,
     # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
     # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
     # eternal-grace-period hang inside the module registry, where the deploy-job runner's
@@ -80575,13 +80593,13 @@ _MODULE_CTX = {
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
-    # esrifeed seams (v10.1.76) — the cot DB reader, the private config dir the
+    # clientfeed seams (v10.1.76) — the cot DB reader, the private config dir the
     # token store lives in (0600), and the audit writer for mint/revoke events.
     '_pg_exec': _pg_exec,
     'CONFIG_DIR': CONFIG_DIR,
     'audit': audit,
-    '_f2b_arm_esrifeed_jail': _f2b_arm_esrifeed_jail,
-    '_f2b_disarm_esrifeed_jail': _f2b_disarm_esrifeed_jail,
+    '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
+    '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
@@ -80592,8 +80610,8 @@ mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 
 
-# ── Esri Outbound Feed — the ONE public, token-authed route family (v10.1.76) ──
-# PLAN v10.1.76 §4-W5. This does NOT live in modules/esrifeed.py: init_registry()
+# ── TAK Client Feed — the ONE public, token-authed route family (v10.1.76) ──
+# PLAN v10.1.76 §4-W5. This does NOT live in modules/clientfeed.py: init_registry()
 # wraps every registry view — generic AND extra_routes — in the same login_required
 # app.py uses, deliberately and with no opt-out (a v10.1.22 acceptance check). A
 # token-authed public route therefore cannot go through the registry.
@@ -80606,13 +80624,13 @@ print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 # constant time. An unknown token returns 404, never 401, so the URL space cannot
 # be enumerated and a scanner cannot tell a bad token from a missing service.
 
-ESRI_FEED_FAIL_LOG = os.path.join(CONFIG_DIR, 'esrifeed-auth.log')
+CLIENTFEED_FAIL_LOG = os.path.join(CONFIG_DIR, 'clientfeed-auth.log')
 
 
-ESRI_FEED_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
+CLIENTFEED_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
 
 
-def _esri_log_failure(reason):
+def _clientfeed_log_failure(reason):
     """Record a rejected token for the fail2ban jail. The presented token is
     NEVER written — only that an attempt was rejected, and from where.
 
@@ -80621,20 +80639,20 @@ def _esri_log_failure(reason):
     reading the live file after a roll, so the jail is unaffected."""
     try:
         try:
-            if os.path.getsize(ESRI_FEED_FAIL_LOG) > ESRI_FEED_FAIL_LOG_MAX:
-                os.replace(ESRI_FEED_FAIL_LOG, ESRI_FEED_FAIL_LOG + '.1')
+            if os.path.getsize(CLIENTFEED_FAIL_LOG) > CLIENTFEED_FAIL_LOG_MAX:
+                os.replace(CLIENTFEED_FAIL_LOG, CLIENTFEED_FAIL_LOG + '.1')
         except OSError:
             pass
-        with open(ESRI_FEED_FAIL_LOG, 'a') as f:
-            f.write('%s esrifeed: rejected token from %s (%s)\n'
+        with open(CLIENTFEED_FAIL_LOG, 'a') as f:
+            f.write('%s clientfeed: rejected token from %s (%s)\n'
                     % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                        _client_ip(), reason))
-        os.chmod(ESRI_FEED_FAIL_LOG, 0o600)
+        os.chmod(CLIENTFEED_FAIL_LOG, 0o600)
     except Exception:
         pass
 
 
-def _esri_response(payload, status=200):
+def _feed_response(payload, status=200):
     """JSON plus the CORS headers a browser-hosted Esri client needs.
 
     The wildcard origin is deliberate and weakens nothing: the token in the path
@@ -80651,28 +80669,28 @@ def _esri_response(payload, status=200):
     return resp
 
 
-def _esri_not_found():
-    return _esri_response(
+def _feed_not_found():
+    return _feed_response(
         {'error': {'code': 404, 'message': 'Service not found', 'details': []}}, 404)
 
 
-def esri_token_required(fn):
-    """Resolve <token> to a feed entry or 404. EVERY view in the /esri/ family
+def feed_token_required(fn):
+    """Resolve <token> to a feed entry or 404. EVERY view in the /feed/ family
     carries this — there is no unauthenticated path into it."""
     @wraps(fn)
     def wrapper(token, *args, **kwargs):
         if request.method == 'OPTIONS':
-            return _esri_response({})
-        mod = getattr(mod_registry, 'esrifeed', None)
+            return _feed_response({})
+        mod = getattr(mod_registry, 'clientfeed', None)
         if mod is None:
-            return _esri_not_found()
+            return _feed_not_found()
         try:
             entry = mod.resolve_token(_MODULE_CTX, token)
         except Exception:
             entry = None
         if not entry:
-            _esri_log_failure('unknown or disabled token')
-            return _esri_not_found()
+            _clientfeed_log_failure('unknown or disabled token')
+            return _feed_not_found()
         try:
             mod.record_pull(_MODULE_CTX, entry['id'], _client_ip())
         except Exception:
@@ -80681,7 +80699,7 @@ def esri_token_required(fn):
     return wrapper
 
 
-def _esri_features(mod, entry):
+def _feed_features(mod, entry):
     """Channel NAMES -> int bit positions -> snapshot. A channel that no longer
     resolves contributes nothing; it never widens scope to 'all channels'."""
     bits, _missing = mod._resolve_bitpos(_MODULE_CTX, entry.get('channels'))
@@ -80690,52 +80708,52 @@ def _esri_features(mod, entry):
                         entry.get('channels'))
 
 
-@app.route('/esri/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
-@esri_token_required
-def esri_feed_service(entry):
-    return _esri_response(mod_registry.esrifeed.service_json(entry))
+@app.route('/feed/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_service(entry):
+    return _feed_response(mod_registry.clientfeed.service_json(entry))
 
 
-@app.route('/esri/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
-@esri_token_required
-def esri_feed_layer(entry, layer):
-    mod = mod_registry.esrifeed
+@app.route('/feed/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_layer(entry, layer):
+    mod = mod_registry.clientfeed
     if layer != 0:
-        return _esri_response(
+        return _feed_response(
             {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
-    return _esri_response(mod.layer_json(entry, _esri_features(mod, entry)))
+    return _feed_response(mod.layer_json(entry, _feed_features(mod, entry)))
 
 
-@app.route('/esri/<token>/FeatureServer/<int:layer>/query',
+@app.route('/feed/<token>/FeatureServer/<int:layer>/query',
            methods=['GET', 'POST', 'OPTIONS'])
-@esri_token_required
-def esri_feed_query(entry, layer):
-    mod = mod_registry.esrifeed
+@feed_token_required
+def clientfeed_query(entry, layer):
+    mod = mod_registry.clientfeed
     if layer != 0:
-        return _esri_response(
+        return _feed_response(
             {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
     # Esri clients POST the query form as often as they GET it.
     params = request.form.to_dict() if request.method == 'POST' else {}
     params.update(request.args.to_dict())
-    feats = _esri_features(mod, entry)
-    audit('esrifeed_pull', 'token=%s label=%s channels=%s features=%d'
+    feats = _feed_features(mod, entry)
+    audit('clientfeed_pull', 'token=%s label=%s channels=%s features=%d'
           % (entry.get('id'), entry.get('label'),
              ','.join(entry.get('channels') or []), len(feats)))
-    return _esri_response(mod.query_json(entry, feats, params))
+    return _feed_response(mod.query_response(entry, feats, params))
 
 
-@app.route('/esrifeed')
+@app.route('/clientfeed')
 @login_required
-def esrifeed_page():
-    """Esri Outbound Feed console page (v10.1.76)."""
+def clientfeed_page():
+    """TAK Client Feed console page (v10.1.76)."""
     from flask import abort
-    if not mod_registry.MODULES.get('esrifeed'):
+    if not mod_registry.MODULES.get('clientfeed'):
         abort(404)
     settings = load_settings()
     modules = detect_modules()
-    state = modules.get('esrifeed', {})
+    state = modules.get('clientfeed', {})
     # The feed is served on the CONSOLE vhost (infratak.<fqdn>), not the bare fqdn —
-    # that is the site block generate_caddyfile() emits `route /esri/*` into. Showing
+    # that is the site block generate_caddyfile() emits `route /feed/*` into. Showing
     # the bare fqdn here would hand the operator a URL that does not resolve to this
     # box's Caddy (caught on test6 2026-09-17: bare fqdn has no vhost and no cert).
     # Resolve it from the same source Caddy does so a custom subdomain map follows.
@@ -80745,8 +80763,8 @@ def esrifeed_page():
         # IP-only box: no Caddy vhost, so the feed is only reachable on the console port.
         _ip = (settings.get('server_ip') or '').strip()
         feed_host = f'{_ip}:5001' if _ip else ''
-    return render_template('esrifeed.html', settings=settings, modules=modules,
-                           esrifeed=state, feed_host=feed_host, version=VERSION)
+    return render_template('clientfeed.html', settings=settings, modules=modules,
+                           clientfeed=state, feed_host=feed_host, version=VERSION)
 
 try:
     import threading as _threading_sh
