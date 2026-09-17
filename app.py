@@ -80603,9 +80603,19 @@ def esrifeed_page():
     settings = load_settings()
     modules = detect_modules()
     state = modules.get('esrifeed', {})
-    fqdn = (settings.get('fqdn') or settings.get('server_ip') or '').strip()
+    # The feed is served on the CONSOLE vhost (infratak.<fqdn>), not the bare fqdn —
+    # that is the site block generate_caddyfile() emits `route /esri/*` into. Showing
+    # the bare fqdn here would hand the operator a URL that does not resolve to this
+    # box's Caddy (caught on test6 2026-09-17: bare fqdn has no vhost and no cert).
+    # Resolve it from the same source Caddy does so a custom subdomain map follows.
+    sd = _get_all_service_domains(settings)
+    feed_host = (sd.get('infratak') or '').strip()
+    if not feed_host:
+        # IP-only box: no Caddy vhost, so the feed is only reachable on the console port.
+        _ip = (settings.get('server_ip') or '').strip()
+        feed_host = f'{_ip}:5001' if _ip else ''
     return render_template('esrifeed.html', settings=settings, modules=modules,
-                           esrifeed=state, fqdn=fqdn, version=VERSION)
+                           esrifeed=state, feed_host=feed_host, version=VERSION)
 
 try:
     import threading as _threading_sh

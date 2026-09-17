@@ -78,7 +78,7 @@
   </div>
   <div style="font-size:12px;color:var(--text-secondary);line-height:1.7">
     Each token is handed out as its own URL:
-    <div class="url-box" style="margin-top:8px">https://{{ fqdn }}/esri/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer</div>
+    <div class="url-box" style="margin-top:8px">https://{{ feed_host }}/esri/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer</div>
     <div style="margin-top:10px;color:var(--text-dim);font-size:11px">
       Consumers query <span class="mono">/FeatureServer/0/query?where=1=1&amp;outFields=*&amp;f=json</span>.
       Positions refresh on their poll; Tablet Command polls AVL at most once a minute.
@@ -154,7 +154,7 @@
 {% endif %}
 
 <script>
-const FQDN = {{ fqdn|tojson }};
+const FEED_HOST = {{ feed_host|tojson }};
 
 function closeModal(id){ document.getElementById(id).classList.remove('open'); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -260,7 +260,7 @@ async function doMint(){
     const d = await r.json();
     if(!d.success){ err.textContent = d.error || 'Failed.'; err.style.display='block'; return; }
     closeModal('mintModal');
-    document.getElementById('urlOut').textContent = 'https://' + FQDN + d.path;
+    document.getElementById('urlOut').textContent = 'https://' + FEED_HOST + d.path;
     document.getElementById('urlModal').classList.add('open');
   }catch(e){
     err.textContent = 'Request failed.'; err.style.display='block';
