@@ -80712,15 +80712,66 @@ def _feed_features(mod, entry):
                         entry.get('channels'))
 
 
+# ArcGIS clients do not just fetch the service — they first classify it from the URL
+# and probe the server root. ArcGIS Online rejected /feed/<token>/FeatureServer with
+# "This service type is not supported" (2026-09-17) even though every endpoint
+# answered 200 with valid Esri JSON: a real ArcGIS Server publishes its services under
+# /rest/services/ and exposes /rest/info, and AGOL uses that shape to decide what it is
+# talking to. So the same views are also mounted on the canonical Esri layout.
+#
+# The short /feed/<token>/FeatureServer form is KEPT as the primary, because it is what
+# a plain HTTP or GeoJSON consumer wants and it is the shape Tablet Command themselves
+# hand us. Esri-spec clients get the long form. One token, one scope, two layouts.
+
+_ESRI_REST_INFO = {
+    'currentVersion': 11.2,
+    'fullVersion': '11.2',
+    'soapUrl': '',
+    'secureSoapUrl': '',
+    'owningSystemUrl': '',
+    'authInfo': {'isTokenBasedSecurity': False},
+}
+
+
+@app.route('/feed/<token>/rest/info', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_rest_info(entry):
+    """ArcGIS server-root info. Declares no token security \xe2\x80\x94 the credential is the
+    token already in the path, and advertising Esri token auth would make clients go
+    looking for a /generateToken endpoint we deliberately do not have."""
+    return _feed_response(_ESRI_REST_INFO)
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer',
+           methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_service_rest(entry, service):
+    return _feed_response(mod_registry.clientfeed.service_json(entry))
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer/<int:layer>',
+           methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_layer_rest(entry, service, layer):
+    # Call the shared implementation, NOT the decorated view — that one takes a raw
+    # token as its first argument and would try to resolve this entry as one.
+    return _clientfeed_layer_impl(entry, layer)
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer/<int:layer>/query',
+           methods=['GET', 'POST', 'OPTIONS'])
+@feed_token_required
+def clientfeed_query_rest(entry, service, layer):
+    return _clientfeed_query_impl(entry, layer)
+
+
 @app.route('/feed/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
 @feed_token_required
 def clientfeed_service(entry):
     return _feed_response(mod_registry.clientfeed.service_json(entry))
 
 
-@app.route('/feed/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
-@feed_token_required
-def clientfeed_layer(entry, layer):
+def _clientfeed_layer_impl(entry, layer):
     mod = mod_registry.clientfeed
     if layer != 0:
         return _feed_response(
@@ -80728,10 +80779,13 @@ def clientfeed_layer(entry, layer):
     return _feed_response(mod.layer_json(entry, _feed_features(mod, entry)))
 
 
-@app.route('/feed/<token>/FeatureServer/<int:layer>/query',
-           methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/feed/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
 @feed_token_required
-def clientfeed_query(entry, layer):
+def clientfeed_layer(entry, layer):
+    return _clientfeed_layer_impl(entry, layer)
+
+
+def _clientfeed_query_impl(entry, layer):
     mod = mod_registry.clientfeed
     if layer != 0:
         return _feed_response(
@@ -80744,6 +80798,13 @@ def clientfeed_query(entry, layer):
           % (entry.get('id'), entry.get('label'),
              ','.join(entry.get('channels') or []), len(feats)))
     return _feed_response(mod.query_response(entry, feats, params))
+
+
+@app.route('/feed/<token>/FeatureServer/<int:layer>/query',
+           methods=['GET', 'POST', 'OPTIONS'])
+@feed_token_required
+def clientfeed_query(entry, layer):
+    return _clientfeed_query_impl(entry, layer)
 
 
 @app.route('/clientfeed')
