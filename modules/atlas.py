@@ -528,6 +528,93 @@ def ensure_store(ctx, size_bytes, plog):
     return None
 
 
+def remove_store(ctx, plog):
+    """Undo `ensure_store`. Returns a list of what it did, and a list of errors.
+
+    ⚠️ **This is the step whose absence made uninstall a no-op.** W205 added the
+    reservation and its three mount units and never wrote the counterpart, so
+    `uninstall` left `/root/atlas/store`, `/root/atlas/artifacts` and
+    `/root/atlas/cache` mounted — and `shutil.rmtree` cannot delete through a
+    mount point, so the install directory survived with the device CA, the
+    Postgres data directory and `.env` inside it. The operator was told the
+    uninstall had succeeded.
+
+    ⚠️ **Order is the entire function.** The two binds mount *out of* the store,
+    so they come first; unmounting the store underneath them would leave systemd
+    holding units over a vanished source. Reverse of `ensure_store`, deliberately
+    and in the same file so the two can be read against each other.
+
+    Best-effort by design: every step is idempotent and an already-clean box
+    produces no errors, because an uninstall must be re-runnable after a partial
+    failure.
+    """
+    did, errs = [], []
+    mount = _store_mount(ctx)
+    base = atlas_dir(ctx)
+
+    # The named volume first: it is only a pointer at `pgdata`, but leaving it
+    # behind would make the next deploy refuse — `_bind_pg_volume` rejects a
+    # volume that already exists pointing somewhere unexpected.
+    rc, out = _run_root(['docker', 'volume', 'rm', '-f', STORE_PG_VOLUME])
+    if rc == 0:
+        did.append(f'Docker volume {STORE_PG_VOLUME} removed')
+
+    # ⚠️ Binds before the store they come out of.
+    for path in (os.path.join(base, 'artifacts'),
+                 os.path.join(base, 'cache'),
+                 mount):
+        name = _systemd_unit_name(path)
+        _run_root(['systemctl', 'disable', '--now', name], timeout=90)
+        # `disable --now` stops a *loaded* unit. A unit whose file was already
+        # deleted while the mount stayed up is still a live mount, and only
+        # `umount` reaches that.
+        if os.path.ismount(path):
+            rc, out = _run_root(['umount', path], timeout=90)
+            if rc != 0:
+                rc, out = _run_root(['umount', '-l', path], timeout=90)
+                if rc != 0:
+                    errs.append(f'could not unmount {path}: {out.strip()[:200]}')
+                    continue
+        unit = os.path.join('/etc/systemd/system', name)
+        if os.path.exists(unit):
+            try:
+                os.remove(unit)
+            except OSError as exc:
+                errs.append(f'could not remove {unit}: {exc}')
+        did.append(f'{path} unmounted and its unit removed')
+
+    _run_root(['systemctl', 'daemon-reload'])
+
+    # ⚠️ Only ours. `losetup -D` would detach every loop device on the box,
+    # including other modules' — so the image is named explicitly.
+    rc, out = _run_root(['losetup', '-j', STORE_IMAGE])
+    if rc == 0 and out.strip():
+        for line in out.strip().splitlines():
+            dev = line.split(':', 1)[0].strip()
+            if dev:
+                _run_root(['losetup', '-d', dev])
+                did.append(f'Loop device {dev} detached')
+
+    if os.path.exists(STORE_IMAGE):
+        try:
+            os.remove(STORE_IMAGE)
+            did.append(f'Reservation {STORE_IMAGE} deleted')
+        except OSError as exc:
+            errs.append(f'could not delete {STORE_IMAGE}: {exc}')
+
+    # Only if empty: /var/lib/atlas is ours, but rmdir refusing on a non-empty
+    # directory is the correct outcome rather than something to force.
+    parent = os.path.dirname(STORE_IMAGE)
+    try:
+        if os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+            did.append(f'{parent} removed')
+    except OSError:
+        pass
+
+    return did, errs
+
+
 def _bind_pg_volume(pgdir, plog):
     """Back the Postgres named volume with a bind into the store.
 
@@ -2001,6 +2088,15 @@ def uninstall(ctx, job, params):
     not inside it, and it is the credential for fetching ATLAS rather than any
     part of ATLAS — taking it would make the next install fail at `git clone`
     with nothing on the page to explain why.
+
+    ⚠️ **The reserved store goes too, and the order matters (W212).** Three
+    mount points live *inside* the install directory, and `shutil.rmtree` cannot
+    delete through a mount — so `remove_store` runs first. Without it this
+    function removed the containers and then silently left the device CA, every
+    private key, the Postgres data directory and `.env` on disk, while reporting
+    success. It now returns `success: False` if either the store or the
+    directory cannot be removed, because an uninstall that half-worked is not a
+    thing to report as done.
     """
     steps = []
     dirpath = atlas_dir(ctx)
@@ -2017,6 +2113,25 @@ def uninstall(ctx, job, params):
     r = _run(ctx, ['docker', 'image', 'rm', '-f', 'takmdm-api', 'takmdm-init'])
     steps.append('Images removed' if r else 'Images already absent')
 
+    # ⚠️ **Before the rmtree below, which is what the mounts were blocking.**
+    # Three mount points live inside the install directory, and `shutil.rmtree`
+    # cannot delete through one — so until W212 this whole uninstall left the
+    # device CA, the Postgres data directory and `.env` on disk while reporting
+    # that it had removed them.
+    store_did, store_errs = remove_store(ctx, lambda *_: None)
+    steps.extend(store_did)
+    if store_errs:
+        return {
+            'success': False,
+            'error': 'the reserved store could not be removed: '
+                     + '; '.join(store_errs),
+            'steps': steps + [
+                'STOPPED before deleting the install directory, so the device '
+                'CA and database are still on disk. Re-run once the mounts are '
+                'clear.'
+            ],
+        }
+
     # The install directory carries the device CA, the bundle signing key, the
     # uploaded artifacts and the generated .env.
     # The obsolete deploy key goes with everything else now. It was kept while
@@ -2030,6 +2145,12 @@ def uninstall(ctx, job, params):
         except OSError:
             pass
 
+    # ⚠️ **A failed rmtree is a failed uninstall, not a footnote.** This used to
+    # append "NOT removed: {exc}" to the step list and carry on returning
+    # success — so when the mounts blocked it, the console reported a clean
+    # uninstall over a directory still holding the device CA, every private key,
+    # the database and `.env`. That silent success is why the real bug went
+    # unnoticed until someone audited the box by hand.
     for path, label in ((dirpath, 'Install directory (device CA, artifacts, .env)'),
                         (_caddy_ca_dir(), "Caddy's copy of the device CA")):
         try:
@@ -2037,7 +2158,14 @@ def uninstall(ctx, job, params):
                 shutil.rmtree(path)
                 steps.append(f'{label} removed')
         except OSError as exc:
-            steps.append(f'{label} NOT removed: {exc}')
+            return {
+                'success': False,
+                'error': f'{label} could not be removed: {exc}',
+                'steps': steps + [
+                    f'STOPPED: {path} is still on disk. Anything still mounted '
+                    f'inside it will block this — check `mount | grep atlas`.'
+                ],
+            }
 
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
     steps.append(f'Firewall rule for {DEVICE_PORT}/tcp removed')
