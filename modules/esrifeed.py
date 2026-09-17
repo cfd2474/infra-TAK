@@ -642,6 +642,13 @@ def deploy(ctx, job, params):
         except Exception as e:
             plog('   ⚠ Caddy regen/reload failed: %s' % str(e)[:160])
 
+        plog('Arming the fail2ban jail for rejected tokens…')
+        try:
+            ok, msg = ctx['_f2b_arm_esrifeed_jail'](plog)
+            plog(('   ✓ ' if ok else '   ⚠ ') + msg)
+        except Exception as e:
+            plog('   ⚠ jail setup error: %s' % str(e)[:160])
+
         plog('')
         plog('✅ Esri Outbound Feed ready. Mint a token to hand an agency a URL.')
         plog('   No new port was opened — the feed rides the existing Caddy 443 listener.')
@@ -668,6 +675,12 @@ def uninstall(ctx, job, params):
         else:
             plog('   • no token store present')
         _snapshot_cache.clear()
+        _pull_stats.clear()
+        try:
+            ok, msg = ctx['_f2b_disarm_esrifeed_jail']()
+            plog(('   ✓ ' if ok else '   ⚠ ') + msg)
+        except Exception as e:
+            plog('   ⚠ jail removal error: %s' % str(e)[:160])
         try:
             ctx['generate_caddyfile']()
             ctx['_caddy_reload']()

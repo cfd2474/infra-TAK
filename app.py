@@ -16479,6 +16479,21 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
+    'esrifeed': (
+        "[Definition]\n"
+        "# v10.1.77 — Esri Outbound Feed. The producer is _esri_log_failure() in app.py,\n"
+        "# which writes exactly one shape:\n"
+        "#     2026-09-17 19:54:43 esrifeed: rejected token from 1.2.3.4 (unknown or disabled token)\n"
+        "# The token itself is NEVER written to this log — only that an attempt was rejected\n"
+        "# and the source. The IP is the REAL client: the feed is reached through Caddy, and\n"
+        "# _client_ip() unwraps X-Forwarded-For when remote_addr is loopback.\n"
+        "#\n"
+        "# The date prefix may or may not be stripped before failregex is applied depending\n"
+        "# on datepattern detection, so the leading timestamp is optional in the pattern.\n"
+        "failregex = ^\\s*(?:\\S+ \\S+ )?esrifeed: rejected token from <HOST> \\(\n"
+        "ignoreregex =\n"
+        "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
+    ),
     'authentik': (
         "[Definition]\n"
         "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
@@ -18586,6 +18601,108 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     _write_priv(jail_path, jail_conf)
+
+
+# Fleet-uniform thresholds for the Esri feed jail. Deliberately NOT a UI knob:
+# per-customer tuning of a security control is the anti-pattern CLAUDE.md names.
+ESRIFEED_F2B_MAXRETRY = 10
+ESRIFEED_F2B_FINDTIME = 600
+ESRIFEED_F2B_BANTIME = 3600
+
+
+def _f2b_arm_esrifeed_jail(log_fn=None):
+    """Write the esrifeed filter + jail and reload fail2ban. Returns (ok, message).
+
+    Called from the Esri Outbound Feed module's deploy through a ctx seam — every
+    other jail writer lives here too, so fail2ban knowledge stays in one file.
+
+    Two things this deliberately handles, both learned the hard way:
+
+    1. **The log is seeded so the jail is not born STARVING.** _f2b_dead_jails()
+       treats a 0-byte logpath as proof a jail can never fire, which is right — but
+       a freshly-armed feed legitimately has no rejected tokens yet, and would be
+       reported dead on the fail2ban page from the moment it was enabled. Seeding one
+       non-matching "armed" line makes the file non-zero and is a truthful record of
+       when the control went live. See [[fail2ban-dead-jails-audit]].
+    2. **fail2ban may not be installed.** That is not an error — the feed works fine
+       without it, it is simply unthrottled. Say so plainly rather than failing the
+       deploy or, worse, reporting a jail that does not exist.
+    """
+    def _log(m):
+        if log_fn:
+            log_fn(m)
+
+    if not _f2b_installed():
+        return (False, 'fail2ban is not installed — the feed works, but repeated bad '
+                       'tokens are not throttled. Deploy the fail2ban module to arm it.')
+    try:
+        # (1) seed the log so the jail is never born 0-byte / STARVING
+        try:
+            if not os.path.exists(ESRI_FEED_FAIL_LOG) or os.path.getsize(ESRI_FEED_FAIL_LOG) == 0:
+                with open(ESRI_FEED_FAIL_LOG, 'a') as f:
+                    f.write('%s esrifeed: jail armed (no rejected tokens yet)\n'
+                            % datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+                os.chmod(ESRI_FEED_FAIL_LOG, 0o600)
+        except Exception:
+            pass
+
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _write_priv('/etc/fail2ban/filter.d/esrifeed.conf', _F2B_OWNED_FILTERS['esrifeed'])
+
+        guarddog_action = ""
+        if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+            guarddog_action = "\n         infratak-guarddog"
+        jail_conf = (
+            "[esrifeed]\n"
+            "enabled  = true\n"
+            "filter   = esrifeed\n"
+            f"logpath  = {ESRI_FEED_FAIL_LOG}\n"
+            f"maxretry = {ESRIFEED_F2B_MAXRETRY}\n"
+            f"findtime = {ESRIFEED_F2B_FINDTIME}\n"
+            f"bantime  = {ESRIFEED_F2B_BANTIME}\n"
+            f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+            f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        )
+        _write_priv('/etc/fail2ban/jail.d/infratak-esrifeed.conf', jail_conf)
+
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s'
+                    % ((r.stderr or r.stdout or '')[:160]))
+
+        # Verify it actually LOADED — writing the file is not the same as arming the
+        # control, which is the entire lesson of the dead-jails audit.
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'esrifeed']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        return (True, 'jail armed and loaded (%d strikes / %ds → %ds ban)'
+                % (ESRIFEED_F2B_MAXRETRY, ESRIFEED_F2B_FINDTIME, ESRIFEED_F2B_BANTIME))
+    except Exception as e:
+        return (False, 'jail setup failed: %s' % str(e)[:200])
+
+
+def _f2b_disarm_esrifeed_jail():
+    """Remove the esrifeed jail + filter and reload. Returns (ok, message)."""
+    if not _f2b_installed():
+        return (True, 'fail2ban not installed — nothing to remove')
+    try:
+        # Reuse the existing jail remover — it carries the filename guard and the
+        # reload, and it is the one path that knows about stale-jail cleanup.
+        removed = _f2b_remove_jail('infratak-esrifeed.conf',
+                                   'Esri Outbound Feed uninstalled')
+        fpath = '/etc/fail2ban/filter.d/esrifeed.conf'
+        if _exists_priv(fpath):
+            subprocess.run(_sudo_wrap(['rm', '-f', fpath]), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+            removed = True
+        return (True, 'jail removed' if removed else 'no jail present')
+    except Exception as e:
+        return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
 @app.route('/api/fail2ban/mediamtx/status')
@@ -80463,6 +80580,8 @@ _MODULE_CTX = {
     '_pg_exec': _pg_exec,
     'CONFIG_DIR': CONFIG_DIR,
     'audit': audit,
+    '_f2b_arm_esrifeed_jail': _f2b_arm_esrifeed_jail,
+    '_f2b_disarm_esrifeed_jail': _f2b_disarm_esrifeed_jail,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
@@ -80490,10 +80609,22 @@ print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 ESRI_FEED_FAIL_LOG = os.path.join(CONFIG_DIR, 'esrifeed-auth.log')
 
 
+ESRI_FEED_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
+
+
 def _esri_log_failure(reason):
     """Record a rejected token for the fail2ban jail. The presented token is
-    NEVER written — only that an attempt was rejected, and from where."""
+    NEVER written — only that an attempt was rejected, and from where.
+
+    Rolled at 2 MiB: this file is written on a PUBLIC, unauthenticated path, so an
+    attacker spraying tokens is also choosing how much disk we spend. fail2ban keeps
+    reading the live file after a roll, so the jail is unaffected."""
     try:
+        try:
+            if os.path.getsize(ESRI_FEED_FAIL_LOG) > ESRI_FEED_FAIL_LOG_MAX:
+                os.replace(ESRI_FEED_FAIL_LOG, ESRI_FEED_FAIL_LOG + '.1')
+        except OSError:
+            pass
         with open(ESRI_FEED_FAIL_LOG, 'a') as f:
             f.write('%s esrifeed: rejected token from %s (%s)\n'
                     % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
