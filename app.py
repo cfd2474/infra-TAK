@@ -3179,6 +3179,21 @@ def detect_modules():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
+    # Esri Outbound Feed — registry-resident (modules/esrifeed.py), v10.1.76.
+    # Tile identity + probes come from the descriptor, not an inline block.
+    _ef_desc = mod_registry.MODULES.get('esrifeed')
+    if _ef_desc:
+        try:
+            _ef_state = _ef_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _ef_state = {}
+        modules['esrifeed'] = {'name': _ef_desc['name'],
+            'installed': bool(_ef_state.get('installed')),
+            'running': bool(_ef_state.get('running')),
+            'description': _ef_desc['description'], 'icon': _ef_desc['icon'],
+            'route': _ef_desc['route'], 'priority': _ef_desc['priority'],
+            'tokens': int(_ef_state.get('tokens') or 0)}
+
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
     netbird_running = False
@@ -28719,6 +28734,26 @@ def generate_caddyfile(settings=None):
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
+
+    # v10.1.76 — Esri Outbound Feed: the ONE public, token-authed route family.
+    # MUST be emitted BEFORE the catch-all `route {}` below. With Authentik installed
+    # that catch-all applies forward_auth, and a machine consumer cannot complete an
+    # SSO redirect — the feed would 302 into the login flow and die with an opaque
+    # cross-origin error. Directive ORDER here is the entire reason this works.
+    # Client X-Authentik-* is stripped exactly like every other console route (the
+    # v10.1.0 loopback-trust bypass); auth is the console's own @esri_token_required.
+    # Emitted only when the feed is actually deployed, so a box that never enabled it
+    # gains no public surface at all.
+    if os.path.exists(os.path.join(CONFIG_DIR, 'esrifeed.json')):
+        lines.append(f"    route /esri/* {{")
+        _emit_ak_header_strip("        ")
+        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+        lines.append(f"            transport http {{")
+        lines.append(f"                tls")
+        lines.append(f"                tls_insecure_skip_verify")
+        lines.append(f"            }}")
+        lines.append(f"        }}")
+        lines.append(f"    }}")
 
     def _emit_outpost_callback_rescue(root_url):
         # v10.1.28: the outpost's OAuth callback answers a bare 400 whenever the state in
@@ -80423,6 +80458,11 @@ _MODULE_CTX = {
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
+    # esrifeed seams (v10.1.76) — the cot DB reader, the private config dir the
+    # token store lives in (0600), and the audit writer for mint/revoke events.
+    '_pg_exec': _pg_exec,
+    'CONFIG_DIR': CONFIG_DIR,
+    'audit': audit,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
@@ -80431,6 +80471,141 @@ _MODULE_CTX = {
 _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
+
+
+# ── Esri Outbound Feed — the ONE public, token-authed route family (v10.1.76) ──
+# PLAN v10.1.76 §4-W5. This does NOT live in modules/esrifeed.py: init_registry()
+# wraps every registry view — generic AND extra_routes — in the same login_required
+# app.py uses, deliberately and with no opt-out (a v10.1.22 acceptance check). A
+# token-authed public route therefore cannot go through the registry.
+#
+# It is also deliberately NOT under /api/*, so the invariant "every /api/* route
+# carries login_required" stays literally true rather than gaining a carve-out.
+#
+# Auth: a 32-byte URL-safe secret in the PATH — the same shape Tablet Command hands
+# us (/esri/tc-file/<TOKEN>/FeatureServer). Stored as SHA-256 only, compared in
+# constant time. An unknown token returns 404, never 401, so the URL space cannot
+# be enumerated and a scanner cannot tell a bad token from a missing service.
+
+ESRI_FEED_FAIL_LOG = os.path.join(CONFIG_DIR, 'esrifeed-auth.log')
+
+
+def _esri_log_failure(reason):
+    """Record a rejected token for the fail2ban jail. The presented token is
+    NEVER written — only that an attempt was rejected, and from where."""
+    try:
+        with open(ESRI_FEED_FAIL_LOG, 'a') as f:
+            f.write('%s esrifeed: rejected token from %s (%s)\n'
+                    % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                       _client_ip(), reason))
+        os.chmod(ESRI_FEED_FAIL_LOG, 0o600)
+    except Exception:
+        pass
+
+
+def _esri_response(payload, status=200):
+    """JSON plus the CORS headers a browser-hosted Esri client needs.
+
+    The wildcard origin is deliberate and weakens nothing: the token in the path
+    is the authentication, and CORS governs which browser ORIGINS may READ a
+    response — not who may call the endpoint. Without it, ArcGIS Online's map
+    viewer and any web app fail with an opaque cross-origin error that looks like
+    an outage. Recorded in the module scan as a reasoned, accepted choice."""
+    resp = make_response(json.dumps(payload), status)
+    resp.headers['Content-Type'] = 'application/json'
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+def _esri_not_found():
+    return _esri_response(
+        {'error': {'code': 404, 'message': 'Service not found', 'details': []}}, 404)
+
+
+def esri_token_required(fn):
+    """Resolve <token> to a feed entry or 404. EVERY view in the /esri/ family
+    carries this — there is no unauthenticated path into it."""
+    @wraps(fn)
+    def wrapper(token, *args, **kwargs):
+        if request.method == 'OPTIONS':
+            return _esri_response({})
+        mod = getattr(mod_registry, 'esrifeed', None)
+        if mod is None:
+            return _esri_not_found()
+        try:
+            entry = mod.resolve_token(_MODULE_CTX, token)
+        except Exception:
+            entry = None
+        if not entry:
+            _esri_log_failure('unknown or disabled token')
+            return _esri_not_found()
+        try:
+            mod.record_pull(_MODULE_CTX, entry['id'], _client_ip())
+        except Exception:
+            pass
+        return fn(entry, *args, **kwargs)
+    return wrapper
+
+
+def _esri_features(mod, entry):
+    """Channel NAMES -> int bit positions -> snapshot. A channel that no longer
+    resolves contributes nothing; it never widens scope to 'all channels'."""
+    bits, _missing = mod._resolve_bitpos(_MODULE_CTX, entry.get('channels'))
+    return mod.snapshot(_MODULE_CTX, bits,
+                        entry.get('stale_minutes') or mod.DEFAULT_STALE_MINUTES,
+                        entry.get('channels'))
+
+
+@app.route('/esri/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
+@esri_token_required
+def esri_feed_service(entry):
+    return _esri_response(mod_registry.esrifeed.service_json(entry))
+
+
+@app.route('/esri/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
+@esri_token_required
+def esri_feed_layer(entry, layer):
+    mod = mod_registry.esrifeed
+    if layer != 0:
+        return _esri_response(
+            {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
+    return _esri_response(mod.layer_json(entry, _esri_features(mod, entry)))
+
+
+@app.route('/esri/<token>/FeatureServer/<int:layer>/query',
+           methods=['GET', 'POST', 'OPTIONS'])
+@esri_token_required
+def esri_feed_query(entry, layer):
+    mod = mod_registry.esrifeed
+    if layer != 0:
+        return _esri_response(
+            {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
+    # Esri clients POST the query form as often as they GET it.
+    params = request.form.to_dict() if request.method == 'POST' else {}
+    params.update(request.args.to_dict())
+    feats = _esri_features(mod, entry)
+    audit('esrifeed_pull', 'token=%s label=%s channels=%s features=%d'
+          % (entry.get('id'), entry.get('label'),
+             ','.join(entry.get('channels') or []), len(feats)))
+    return _esri_response(mod.query_json(entry, feats, params))
+
+
+@app.route('/esrifeed')
+@login_required
+def esrifeed_page():
+    """Esri Outbound Feed console page (v10.1.76)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('esrifeed'):
+        abort(404)
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('esrifeed', {})
+    fqdn = (settings.get('fqdn') or settings.get('server_ip') or '').strip()
+    return render_template('esrifeed.html', settings=settings, modules=modules,
+                           esrifeed=state, fqdn=fqdn, version=VERSION)
 
 try:
     import threading as _threading_sh
