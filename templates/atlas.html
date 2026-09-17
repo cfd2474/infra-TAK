@@ -56,6 +56,16 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   -->
   <div class="card" id="deployCard" {% if not deploy_log and not deploy_running %}style="display:none"{% endif %}>
     <div class="card-title">Deploy log</div>
+    <!--
+      ⚠️ **Shown only while a deploy is actually running**, because `pollDeploy`
+      reloads on `d.complete && !d.error` and on nothing else. Left up beside a
+      *failed* deploy it would promise a refresh that never arrives, and an
+      operator would sit waiting on it instead of reading the error.
+    -->
+    <p class="note" id="deployNote"
+       style="margin:0 0 12px{% if not deploy_running %};display:none{% endif %}">
+      ⏳ Leave this page open — it refreshes itself once ATLAS has deployed.
+    </p>
     <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
   </div>
 
@@ -651,6 +661,17 @@ function setInstallCard(visible){
   if (card) card.style.display = visible ? '' : 'none';
 }
 
+// The promise that the page will reload by itself, which `pollDeploy` keeps
+// only on `d.complete && !d.error`.
+//
+// ⚠️ Taken down the moment a deploy stops running. A note saying "it refreshes
+// itself" above a deploy that has failed sends an operator off to wait for
+// something that is never coming, instead of reading the error under it.
+function setDeployNote(visible){
+  const note = document.getElementById('deployNote');
+  if (note) note.style.display = visible ? '' : 'none';
+}
+
 function startDeploy(){
   const btn = document.getElementById('deployBtn');
   const field = document.getElementById('storeGb');
@@ -665,10 +686,11 @@ function startDeploy(){
   }).then(r => r.json()).then(d => {
     // ⚠️ Hidden only once the deploy is actually accepted, never on the click.
     // Doing it up front blanks the card for a request the server then refuses.
-    if (d.error) { btn.disabled = false; setInstallCard(true); alert(d.error); return; }
+    if (d.error) { btn.disabled = false; setInstallCard(true); setDeployNote(false); alert(d.error); return; }
     setInstallCard(false);
+    setDeployNote(true);
     polling = true; pollDeploy();
-  }).catch(() => { btn.disabled = false; setInstallCard(true); });
+  }).catch(() => { btn.disabled = false; setInstallCard(true); setDeployNote(false); });
 }
 
 function renderLog(entries){
@@ -698,6 +720,10 @@ function pollDeploy(){
       if (e) e.style.display = '';
       // Back, so the size can be corrected and the deploy tried again.
       setInstallCard(true);
+      // ⚠️ And the promise of a refresh comes down: pollDeploy reloads on
+      // success only, so leaving it up would have an operator waiting here
+      // for something that is never coming.
+      setDeployNote(false);
       return;
     }
     setTimeout(pollDeploy, 2000);

@@ -171,6 +171,91 @@ def test_the_failure_banner_points_at_the_log_s_new_position(idle):
 
 
 # --------------------------------------------------------------------------- #
+# The note promising a refresh
+# --------------------------------------------------------------------------- #
+
+# ⚠️ **A promise the page has to keep.** `pollDeploy` reloads on
+# `d.complete && !d.error` and on nothing else, so the note belongs to a
+# *running* deploy only. Above a failed one it would send an operator off to
+# wait for something that is never coming, instead of reading the error under
+# it — which is worse than saying nothing at all.
+
+
+def test_the_note_is_at_the_top_of_the_deploy_log_card(deploying):
+    """Asked for at the top of the card: after the title, before the log.
+
+    ⚠️ Asserted as an ordering rather than by matching the markup between the
+    two. The first attempt looked for `</div>` immediately followed by the
+    log-box and matched nothing, because the note and its comment sit in
+    between — the regex encoded the layout it was supposed to be checking.
+    """
+    span = deploying[deploying.index('id="deployCard"'):
+                     deploying.index('class="log-box" id="deployLog"')]
+
+    assert "card-title" in span, "the card has no title"
+    assert 'id="deployNote"' in span, "the note is not above the log"
+    assert span.index("card-title") < span.index('id="deployNote"'), (
+        "the note sits above the card's own title"
+    )
+
+
+def test_the_note_says_the_page_will_refresh(deploying):
+    note = re.search(r'id="deployNote"[^>]*>(.*?)</p>', deploying, re.S)
+
+    assert note, "there is no deploy note"
+    text = " ".join(note.group(1).split())
+    assert "refreshes itself" in text
+    assert "deployed" in text
+
+
+def test_the_note_is_shown_while_deploying(deploying):
+    attrs = re.search(r'id="deployNote"(.*?)>', deploying, re.S).group(1)
+
+    assert "display:none" not in attrs, "the note is hidden during a deploy"
+
+
+def test_the_note_is_absent_when_no_deploy_is_running(idle):
+    """⚠️ Including when the card itself is up showing a *finished* log."""
+    attrs = re.search(r'id="deployNote"(.*?)>', idle, re.S).group(1)
+
+    assert "display:none" in attrs
+
+
+def test_the_page_really_does_reload_on_success(idle):
+    """The note is only honest if this line exists. If the reload is ever
+    removed, the note becomes a lie and this test is what says so."""
+    body = function_body(idle, "pollDeploy")
+    success = re.search(r"if \(d\.complete && !d\.error\) \{([^}]*)\}", body)
+
+    assert success, "pollDeploy no longer has a success branch"
+    assert "location.reload()" in success.group(1)
+
+
+def test_a_failed_deploy_stops_promising_a_refresh(idle):
+    failed = re.search(r"if \(d\.error && !d\.running\) \{(.*?)\n    \}",
+                       function_body(idle, "pollDeploy"), re.S)
+
+    assert failed, "pollDeploy has no failure branch"
+    assert "setDeployNote(false)" in failed.group(1)
+
+
+def test_a_refused_deploy_stops_promising_a_refresh(idle):
+    refusal = re.search(r"if \(d\.error\) \{([^}]*)\}",
+                        function_body(idle, "startDeploy"))
+
+    assert refusal, "startDeploy has no refusal branch"
+    assert "setDeployNote(false)" in refusal.group(1)
+
+
+def test_an_accepted_deploy_puts_the_note_up(idle):
+    body = function_body(idle, "startDeploy")
+
+    assert "setDeployNote(true)" in body, (
+        "the note never appears for a deploy started from this page"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # The break-glass commands
 # --------------------------------------------------------------------------- #
 
