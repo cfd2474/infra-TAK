@@ -480,6 +480,192 @@ def instance_paths(ctx=None, inst=None):
     return d
 
 
+
+# --------------------------------------------------------------------------- #
+# The instance list (W216)
+# --------------------------------------------------------------------------- #
+
+
+def load_instances(ctx):
+    """Every ATLAS deployment on this box.
+
+    ⚠️ **A deployed box predates the list, and must not read as empty.** Every
+    existing installation was made before `atlas_instances` existed, so there is
+    no record of it anywhere — only `atlas_enabled` and a store on disk. Returning
+    `[]` there would tell the console nothing is installed, offer a *plain*
+    deployment that is already deployed, and let a second one be created on top
+    of the first.
+
+    So an enabled deployment with no list is synthesised as the plain instance,
+    sized from the store that is actually on disk. The synthesised record is not
+    written back: it is derived on every read, so it stays true if the store is
+    resized, and nothing is persisted about a deployment the operator has not
+    touched since upgrading.
+    """
+    settings = ctx['load_settings']() if ctx else {}
+    stored = settings.get(atlas_instances.INSTANCES_KEY)
+    if stored:
+        return [dict(i) for i in stored]
+
+    if not settings.get(f'{KEY}_enabled'):
+        return []
+
+    size_gb = 0
+    try:
+        size_gb = round(os.stat(STORE_IMAGE).st_size / atlas_instances.GIB)
+    except (OSError, ValueError):
+        pass
+    return [atlas_instances.make(None, atlas_instances.MODE_FIXED,
+                                 size_gb, atlas_instances.BASE_PORT)]
+
+
+def save_instances(ctx, instances):
+    """Persist the list. ⚠️ Replaces rather than merges, because removing an
+    instance has to be expressible."""
+    settings = ctx['load_settings']()
+    settings[atlas_instances.INSTANCES_KEY] = [dict(i) for i in instances]
+    ctx['save_settings'](settings)
+    return instances
+
+
+def add_instance(ctx, agency_specific, slug, mode, size_gb):
+    """Validate and record a new deployment. `(instance, error)`.
+
+    ⚠️ Records it **before** anything is built, so the slug is claimed and a
+    second request for the same one is refused while the first is still
+    deploying. A half-built instance with no record is the shape of leak W212
+    was about.
+    """
+    instances = load_instances(ctx)
+
+    if agency_specific:
+        slug, err = atlas_instances.validate_slug(slug, instances)
+        if err:
+            return None, err
+    else:
+        if not atlas_instances.may_deploy_plain(instances):
+            return None, ('This box already has a non-agency ATLAS. Further '
+                          'deployments have to be agency-specific.')
+        slug = None
+
+    mode, err = atlas_instances.validate_mode(mode)
+    if err:
+        return None, err
+
+    ok, err = fits_here(ctx, size_gb, instances)
+    if not ok:
+        return None, err
+
+    inst = atlas_instances.make(
+        slug, mode, size_gb,
+        atlas_instances.next_port(instances, taken=_ports_in_use()),
+    )
+    save_instances(ctx, instances + [inst])
+    return inst, None
+
+
+def drop_instance(ctx, slug):
+    """Forget a deployment. Returns the remaining list."""
+    remaining = [i for i in load_instances(ctx)
+                 if (i.get('slug') or None) != (slug or None)]
+    return save_instances(ctx, remaining)
+
+
+def _ports_in_use():
+    """Loopback ports this box is already listening on.
+
+    ⚠️ Best effort, and deliberately additive to the model's own list: a port
+    held by something outside ATLAS is invisible to the instance model, and
+    handing it out produces a deploy that fails at bind time with nothing on the
+    page to explain why.
+    """
+    rc, out = _run_root(['ss', '-ltn'])
+    if rc != 0:
+        return ()
+    found = set()
+    for line in (out or '').splitlines():
+        for field in line.split():
+            if ':' in field:
+                tail = field.rsplit(':', 1)[-1]
+                if tail.isdigit():
+                    found.add(int(tail))
+    return tuple(sorted(found))
+
+
+def capacity_facts(ctx, size_gb=None):
+    """What the deploy screen needs to say how much room is left.
+
+    ⚠️ **Names the binding constraint.** On the box measured, disk allowed four
+    or five more instances and memory about twelve; an operator shown only the
+    larger figure would plan for twice what fits.
+    """
+    instances = load_instances(ctx)
+    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
+    reserved = atlas_instances.reserved_bytes(instances)
+    # Everything on the disk that is not an ATLAS reservation.
+    non_atlas = max(0, total - free - reserved)
+    budget = atlas_instances.budget_bytes(total, non_atlas, floor)
+    committed = atlas_instances.committed_bytes(instances)
+
+    ram_total, ram_available = _memory_bytes()
+    by_ram = atlas_instances.instances_that_ram_allows(
+        ram_available, 4 * atlas_instances.GIB)
+    by_disk = atlas_instances.instances_that_fit(
+        size_gb or 50, instances, budget) if (size_gb or 50) else 0
+    which, how_many = atlas_instances.binding_constraint(by_disk, by_ram)
+
+    gb = atlas_instances.GIB
+    return {
+        'instances': len(instances),
+        'budget_gb': round(budget / gb, 1),
+        'committed_gb': round(committed / gb, 1),
+        'remaining_gb': round(max(0, budget - committed) / gb, 1),
+        'reserved_gb': round(reserved / gb, 1),
+        'floor_gb': atlas_instances.DEFAULT_FLOOR_GB,
+        'disk_free_gb': round(free / gb, 1),
+        'ram_total_gb': round(ram_total / gb, 1),
+        'ram_available_gb': round(ram_available / gb, 1),
+        'per_instance_peak_gb': round(
+            atlas_instances.INSTANCE_RAM_PEAK_BYTES / gb, 2),
+        'by_disk': by_disk,
+        'by_ram': by_ram,
+        'binding': which,
+        'room_for': how_many,
+        'may_deploy_plain': atlas_instances.may_deploy_plain(instances),
+    }
+
+
+def fits_here(ctx, size_gb, instances=None):
+    """`(ok, error)` for one requested size against this box's budget."""
+    instances = load_instances(ctx) if instances is None else instances
+    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
+    reserved = atlas_instances.reserved_bytes(instances)
+    non_atlas = max(0, total - free - reserved)
+    budget = atlas_instances.budget_bytes(total, non_atlas, floor)
+    return atlas_instances.fits(size_gb, instances, budget)
+
+
+def _memory_bytes():
+    """`(total, available)` from /proc/meminfo, or `(0, 0)`.
+
+    ⚠️ `MemAvailable`, not `MemFree`. Free memory on a box running eight stacks
+    is near zero because the page cache holds the rest, and planning against it
+    would refuse every instance the box could comfortably run.
+    """
+    try:
+        with open('/proc/meminfo') as fh:
+            fields = {}
+            for line in fh:
+                name, _, rest = line.partition(':')
+                digits = rest.strip().split(' ')[0]
+                if digits.isdigit():
+                    fields[name] = int(digits) * 1024
+        return fields.get('MemTotal', 0), fields.get('MemAvailable', 0)
+    except (OSError, ValueError):
+        return 0, 0
+
 def _store_mount(ctx, inst=None):
     return instance_paths(ctx, inst)['mount']
 

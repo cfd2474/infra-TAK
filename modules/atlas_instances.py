@@ -230,3 +230,100 @@ def derive(instance, fqdn=None):
         'mode': (instance or {}).get('mode') or MODE_FIXED,
         'size_gb': (instance or {}).get('size_gb'),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Capacity: what this box can still take
+# --------------------------------------------------------------------------- #
+
+GIB = 1024 ** 3
+
+#: Measured on the development box (2026-09-17): an idle instance with no devices
+#: enrolled held 846 MiB and **peaked at 1.27 GiB** while the repository indexes
+#: were parsed.
+#:
+#: ⚠️ Planning uses the peak, not the steady state. N instances restarting
+#: together spike together, and the steady figure would promise room that a
+#: simultaneous restart would not find. Devices add on top of both, so this is a
+#: floor.
+INSTANCE_RAM_PEAK_BYTES = int(1.27 * GIB)
+
+#: The protected floor: disk that never belongs to ATLAS, for the other InfraTAK
+#: modules to grow into. Operator decision, 2026-09-17.
+#:
+#: ⚠️ This sizes **module data growth**, which measured ~3.5 GB in total on the
+#: box. It cannot bound image and build-cache accumulation — 42 GB in
+#: `/var/lib/containerd`, which grows with every release build — because a
+#: reservation cannot bound something unbounded. That needs a prune policy, not
+#: a bigger floor.
+DEFAULT_FLOOR_GB = 25
+
+
+def budget_bytes(disk_total, non_atlas_used, floor_bytes):
+    """The most ATLAS may ever hold on this box, all instances together."""
+    return max(0, disk_total - non_atlas_used - floor_bytes)
+
+
+def committed_bytes(instances):
+    """What the existing instances already account for.
+
+    ⚠️ **Both modes count.** A fixed instance has taken its space; a dynamic one
+    has only a ceiling. Counting only the fixed ones would let the budget be
+    exhausted by ceilings nobody had allowed for — and the operator's rule is
+    that a request exceeding the budget is *refused*, which needs a figure that
+    includes what has already been promised.
+    """
+    return sum(int((i.get('size_gb') or 0) * GIB) for i in instances or ())
+
+
+def reserved_bytes(instances):
+    """Only what is actually held on disk — the fixed instances.
+
+    The difference from :func:`committed_bytes` is the whole point of dynamic
+    mode: space inside a dynamic instance's ceiling is still available to the
+    rest of the box until that agency writes to it.
+    """
+    return sum(int((i.get('size_gb') or 0) * GIB)
+               for i in instances or () if i.get('mode') == MODE_FIXED)
+
+
+def fits(requested_gb, instances, budget):
+    """`(ok, error)` — whether another instance of this size may be created."""
+    requested = int((requested_gb or 0) * GIB)
+    if requested <= 0:
+        return False, 'Choose a size for this deployment.'
+    used = committed_bytes(instances)
+    if used + requested > budget:
+        spare = max(0, budget - used)
+        return False, (
+            f'That would take ATLAS past its budget. '
+            f'{spare / GIB:.0f} GB of {budget / GIB:.0f} GB is still uncommitted.'
+        )
+    return True, None
+
+
+def instances_that_fit(size_gb, instances, budget):
+    """How many more of this size the budget allows. For the deploy screen."""
+    each = int((size_gb or 0) * GIB)
+    if each <= 0:
+        return 0
+    return max(0, (budget - committed_bytes(instances)) // each)
+
+
+def instances_that_ram_allows(ram_available, reserve_bytes, per_instance=None):
+    """How many more instances memory allows, at the measured peak."""
+    each = per_instance or INSTANCE_RAM_PEAK_BYTES
+    return max(0, (max(0, ram_available - reserve_bytes)) // each)
+
+
+def binding_constraint(by_disk, by_ram):
+    """Which limit bites first, and how many more instances that allows.
+
+    ⚠️ Returned as a pair so the page can *name* it. On the box measured, disk
+    allowed four or five more and memory about twelve — and an operator reading
+    only the larger number would plan for twice what fits. Naming the binding
+    constraint is the difference between a dashboard and a number.
+    """
+    if by_disk <= by_ram:
+        return 'disk', by_disk
+    return 'memory', by_ram
