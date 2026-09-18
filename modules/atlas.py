@@ -1251,8 +1251,8 @@ def _bind_pg_volume(pgdir, plog, volume=None):
     return None
 
 
-def _bridge_gateway():
-    """The address Caddy appears as from inside the container.
+def _bridge_gateway(project='takmdm'):
+    """The address Caddy appears as from inside this deployment's container.
 
     Caddy runs on the host and reaches the application through Docker's bridge,
     so the peer the application sees is the network's gateway — 172.24.0.1 on the
@@ -1266,11 +1266,17 @@ def _bridge_gateway():
     ⚠️ Asked of the *network*, not of a running container: on a first install
     the network exists before the application does, and on a redeploy the
     container may be down.
+
+    ⚠️ **Per deployment.** `takmdm_default` was hardcoded, so an agency always
+    took the fallback and never narrowed — the S-1 mitigation quietly not
+    applying to exactly the deployments a box gains from here on. Not a lockout,
+    which is why nothing would have reported it.
     """
+    network = '%s_default' % project
     try:
         r = subprocess.run(
             ['docker', 'network', 'inspect', '-f',
-             '{{range .IPAM.Config}}{{.Subnet}}{{end}}', 'takmdm_default'],
+             '{{range .IPAM.Config}}{{.Subnet}}{{end}}', network],
             capture_output=True, text=True, timeout=30,
         )
         subnet = (r.stdout or '').strip()
@@ -1461,7 +1467,7 @@ def _caddyfile_injects_proxy_auth():
     return False
 
 
-def _set_trusted_proxies(dirpath, plog):
+def _set_trusted_proxies(dirpath, plog, project='takmdm'):
     """Make `.env` name the addresses the admin interface answers. Returns True
     when it changed, so the caller knows the container needs recreating.
 
@@ -1483,7 +1489,7 @@ def _set_trusted_proxies(dirpath, plog):
     except OSError:
         return False
 
-    detected = _bridge_gateway()
+    detected = _bridge_gateway(project)
 
     if 'TAKMDM_TRUSTED_PROXIES' not in body:
         with open(env_path, 'a') as f:
@@ -1507,11 +1513,63 @@ def _set_trusted_proxies(dirpath, plog):
 
 
 #: Settings keys recording whether Authentik still restricts the ATLAS app.
+#: ⚠️ These stay the *plain* deployment's keys, unchanged, because they are what
+#: every deployed box already has on disk. `access_keys` derives the rest.
 ACCESS_KEY = KEY + '_access_restricted'
 ACCESS_CHECKED_KEY = KEY + '_access_checked_at'
 
 
-def _record_access_state(ctx, restricted, plog=None):
+def access_keys(inst=None):
+    """Where one deployment's access-control answer is recorded.
+
+    ⚠️ **One key for N deployments would be a lie that reads as reassurance.**
+    Each deployment has its own Authentik application and its own policy
+    binding, so "restricted" is a per-deployment fact. Sharing the key would let
+    a correctly restricted agency overwrite a *false* written moments earlier
+    for another one — and the tile would go green while an MDM console stayed
+    open to every authenticated user, which is exactly the failure H-1 exists
+    for.
+    """
+    prefix = atlas_instances.derive(inst)['settings_prefix']
+    return prefix + 'access_restricted', prefix + 'access_checked_at'
+
+
+def access_state(ctx, settings=None):
+    """The box-level answer across every deployment: True, False, or None.
+
+    ⚠️ **Any deployment being unrestricted makes the box unrestricted.** The
+    warning is about an MDM console reachable by anyone authenticated; a second,
+    correctly restricted deployment does not make the first one safe.
+
+    ⚠️ **Unknown is not restricted.** A deployment nobody has checked reports
+    None, and None must not average into True — that would report an access
+    control that has never been verified as verified.
+    """
+    s = settings if settings is not None else ctx['load_settings']()
+    found = load_instances(ctx)
+    if not found:
+        # A box from before the instance list: the plain keys are all there is.
+        return s.get(ACCESS_KEY)
+    values = [s.get(access_keys(i)[0]) for i in found]
+    if any(v is False for v in values):
+        return False
+    if values and all(v is True for v in values):
+        return True
+    return None
+
+
+def unrestricted_deployments(ctx, settings=None):
+    """The deployments known to be unrestricted, by name, for the warning.
+
+    Named rather than counted: on a box with five agencies, "one of them is
+    open" is not something an operator can act on.
+    """
+    s = settings if settings is not None else ctx['load_settings']()
+    return [atlas_instances.derive(i)['name'] for i in load_instances(ctx)
+            if s.get(access_keys(i)[0]) is False]
+
+
+def _record_access_state(ctx, restricted, plog=None, inst=None):
     """Remember whether the ATLAS application is bound to an access policy.
 
     ⚠️ **Stored rather than probed on demand.** `detect()` runs on every dashboard
@@ -1524,8 +1582,9 @@ def _record_access_state(ctx, restricted, plog=None):
     import time as _time
     try:
         s = ctx['load_settings']()
-        s[ACCESS_KEY] = bool(restricted)
-        s[ACCESS_CHECKED_KEY] = int(_time.time())
+        restricted_key, checked_key = access_keys(inst)
+        s[restricted_key] = bool(restricted)
+        s[checked_key] = int(_time.time())
         ctx['save_settings'](s)
     except Exception as exc:
         if plog:
@@ -1542,7 +1601,7 @@ def _record_access_state(ctx, restricted, plog=None):
     return restricted
 
 
-def _verify_access_control(ctx, plog=None):
+def _verify_access_control(ctx, plog=None, inst=None):
     """Re-run the binding check outside a deploy. Returns True/False/None.
 
     None means the question could not be asked — no Authentik, no token, no
@@ -1560,8 +1619,11 @@ def _verify_access_control(ctx, plog=None):
         ak_url = ctx['_get_authentik_api_url'](s)
         headers = {'Authorization': 'Bearer %s' % token,
                    'Content-Type': 'application/json'}
+        app_slug = atlas_instances.authentik_names(inst)['app_slug']
         return _record_access_state(
-            ctx, _restrict_to_admins(ak_url, headers, plog=plog), plog=plog)
+            ctx, _restrict_to_admins(ak_url, headers, plog=plog,
+                                     app_slug=app_slug),
+            plog=plog, inst=inst)
     except Exception as exc:
         if plog:
             plog('  ⚠ Could not verify access control: %s' % str(exc)[:80])
@@ -1786,20 +1848,64 @@ def detect(ctx):
     # dashboard poll from several threads and must answer in under a second; an
     # Authentik round-trip would make ATLAS's tile report Authentik's health.
     # False is only ever written by a check that actually ran (H-1).
-    restricted = s.get(ACCESS_KEY)
+    # ⚠️ Across every deployment, not just the plain one. A box running only
+    # an agency deployment wrote its answer under `atlas_<slug>_*`, so reading
+    # the plain key alone reported None — "never checked" — for a deployment
+    # that had just been checked.
+    restricted = access_state(ctx, s)
+    open_names = unrestricted_deployments(ctx, s) if restricted is False else []
 
     return {'installed': enabled, 'running': running,
             'version': _installed_version(ctx) if enabled else None,
             'access_restricted': restricted,
             'warning': (None if restricted is not False else
                         'Not access-restricted: every Authentik user can reach '
-                        'this console. Re-run Authentik → Reconfigure, then '
+                        + (', '.join(open_names) or 'this console') +
+                        '. Re-run Authentik → Reconfigure, then '
                         'redeploy ATLAS.')}
 
 
 # --------------------------------------------------------------------------- #
 # Deploy
 # --------------------------------------------------------------------------- #
+
+
+def deployment_identity(ctx, inst, settings):
+    """Every name and number a deploy configures itself with.
+
+    ⚠️ **One function, because the failure mode is a deploy that half-knows
+    which deployment it is.** `deploy` already resolved the instance for the
+    install directory, the store and the compose project — and then wrote the
+    *plain* deployment's hostname into `.env`, bound the plain deployment's
+    port, recorded the plain deployment's database password, and registered the
+    plain deployment's Authentik application. Each of those was a separate
+    constant, so each had to be found separately; here there is one place to be
+    wrong and one place to test.
+
+    ⚠️ **The host comes from `agency_host`, the same function `caddy_sites`
+    uses.** If these two ever disagreed, `.env` would carry a hostname Caddy has
+    no site for — and the provisioning QR minted from it would send every
+    enrolled tablet to a name that does not answer.
+    """
+    paths = instance_paths(ctx, inst)
+    plain_host = ctx['_get_service_domain'](settings, KEY) if ctx else None
+    host = atlas_instances.agency_host(plain_host, paths['slug'])
+    return {
+        'slug': paths['slug'],
+        'dir': paths['dir'],
+        'host': host,
+        'app_port': paths['port'],
+        'settings_prefix': paths['settings_prefix'],
+        'compose_project': paths['compose_project'],
+        # Empty rather than a half-formed URL: a box with no domain resolved
+        # cannot enrol devices, and `https://:8449` in a QR would fail on the
+        # tablet with nothing to point at.
+        'console_url': f'https://{host}' if host else '',
+        'device_url': f'https://{host}:{DEVICE_PORT}' if host else '',
+        'apk_url': (f'http://{host}/api/v1/provisioning/agent.apk'
+                    if host else ''),
+        'authentik': atlas_instances.authentik_names(inst),
+    }
 
 
 def deploy_validate(data):
@@ -1941,7 +2047,15 @@ def deploy(ctx, job, params):
     # chosen. Resolved from the recorded list rather than from the request, so a
     # deploy cannot build a deployment nobody registered.
     _inst = atlas_instances.by_slug(load_instances(ctx), params.get('slug'))
-    dirpath = instance_paths(ctx, _inst)['dir']
+    # ⚠️ Resolved once, before anything is written. Every value below was a
+    # module constant that quietly meant "the plain deployment". A deploy that
+    # builds in the right directory and then configures itself with another
+    # deployment's hostname, port and settings keys is not a deployment of
+    # anything — it is two half-deployments overwriting each other.
+    _me = deployment_identity(ctx, _inst, ctx['load_settings']())
+    dirpath = _me['dir']
+    _prefix = _me['settings_prefix']
+    _app_port = _me['app_port']
     try:
         settings = ctx['load_settings']()
 
@@ -2062,34 +2176,40 @@ def deploy(ctx, job, params):
         # database permanently unopenable. Writing it first costs nothing: an
         # abandoned deploy leaves a password for a database that may not exist,
         # which is harmless, and a resumed one reuses it, which is the point.
-        pg_password = settings.get(f'{KEY}_pg_password')
+        # ⚠️ Keyed to this deployment. Under the shared `atlas_pg_password` an
+        # agency deploy overwrote the plain deployment's record, and the next
+        # time anything needed it the database it belonged to was permanently
+        # unopenable — the exact failure the comment above describes, caused by
+        # a second deployment rather than a second attempt.
+        pg_password = settings.get(f'{_prefix}pg_password')
         if not pg_password:
             pg_password = secrets.token_urlsafe(24)
             s_early = ctx['load_settings']()
-            s_early[f'{KEY}_pg_password'] = pg_password
+            s_early[f'{_prefix}pg_password'] = pg_password
             ctx['save_settings'](s_early)
-        fqdn = ctx['_get_service_domain'](ctx['load_settings'](), KEY)
+        fqdn = _me['host']
 
         if not fqdn:
             plog('  ⚠ No domain resolved for this box.')
             plog('    The console will still work through Caddy, but devices')
             plog('    cannot be enrolled without a hostname to put in the QR.')
 
-        device_url = f'https://{fqdn}:{DEVICE_PORT}' if fqdn else ''
-        console_url = f'https://{fqdn}' if fqdn else ''
-        apk_url = f'http://{fqdn}/api/v1/provisioning/agent.apk' if fqdn else ''
         ctx['_write_priv'](os.path.join(dirpath, '.env'), _ENV_TEMPLATE.format(
-            trusted_proxies=_bridge_gateway(),
+            trusted_proxies=_bridge_gateway(_me['compose_project']),
             pg_password=pg_password,
-            device_url=device_url,
-            apk_url=apk_url,
-            console_url=console_url,
+            device_url=_me['device_url'],
+            apk_url=_me['apk_url'],
+            console_url=_me['console_url'],
         ), perm=0o600)
+        # ⚠️ The allocated port, not `APP_PORT`. Two deployments both binding
+        # 127.0.0.1:8760 would leave the second failing to start with a port
+        # conflict that says nothing about which deployment claimed it — and
+        # Caddy's upstream for the second one points at the first.
         ctx['_write_priv'](
             os.path.join(dirpath, 'docker-compose.override.yml'),
-            _COMPOSE_OVERRIDE.format(app_port=APP_PORT),
+            _COMPOSE_OVERRIDE.format(app_port=_app_port),
         )
-        plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{APP_PORT})')
+        plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{_app_port})')
 
         # The container runs unprivileged; the directories it writes are ours.
         # See APP_UID. Done here rather than after `up` because the very first
@@ -2122,7 +2242,7 @@ def deploy(ctx, job, params):
         # install starts on the broad fallback and is narrowed here, on the same
         # deploy, rather than staying wide until somebody happens to update
         # (SEC_AUDIT.md S-1).
-        if _set_trusted_proxies(dirpath, plog):
+        if _set_trusted_proxies(dirpath, plog, _me['compose_project']):
             r2 = _compose(ctx, 'up -d api', timeout=600, inst=_inst)
             if r2.returncode != 0:
                 plog('  ⚠ Could not restart with the narrowed range; it applies on '
@@ -2144,9 +2264,14 @@ def deploy(ctx, job, params):
         plog('')
         plog('━━━ Step 6/7: Registering the module ━━━')
         s = ctx['load_settings']()
+        # ⚠️ `atlas_enabled` stays unprefixed on purpose: it means "the ATLAS
+        # module is installed on this box", which is what `detect`, the tile and
+        # `caddy_sites` ask. *Which* deployments exist is `atlas_instances`.
+        # Prefixing it would have made an agency-only box report ATLAS absent
+        # and emit no vhost at all.
         s[f'{KEY}_enabled'] = True
-        s[f'{KEY}_pg_password'] = pg_password
-        s[f'{KEY}_commit_sha'] = commit
+        s[f'{_prefix}pg_password'] = pg_password
+        s[f'{_prefix}commit_sha'] = commit
         ctx['save_settings'](s)
         ctx['generate_caddyfile'](s)
         if ctx['_caddy_reload'](plog):
@@ -2197,7 +2322,8 @@ def deploy(ctx, job, params):
             # Without an application the outpost has nothing to authorise, so
             # Caddy's forward_auth never sets the identity headers ATLAS reads
             # and the console answers 401 to everyone, permanently.
-            ensure_authentik_app(ctx, fqdn, token, plog=plog, settings=s)
+            ensure_authentik_app(ctx, fqdn, token, plog=plog, settings=s,
+                                 inst=_inst)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -2210,7 +2336,7 @@ def deploy(ctx, job, params):
             # tunnel exactly as the console-by-IP row was resolved.
             plog('  ⚠ Authentik not configured — the console vhost is NOT published.')
             plog('    Reach it over an SSH tunnel:')
-            plog(f'      ssh -L 8760:127.0.0.1:{APP_PORT} <this host>')
+            plog(f'      ssh -L {_app_port}:127.0.0.1:{_app_port} <this host>')
 
         plog('')
         plog('✓ ATLAS deployed.')
@@ -2323,7 +2449,7 @@ def sync_device_ca_for_caddy(inst=None):
         return None
 
 
-def _restrict_to_admins(ak_url, ak_headers, plog=None):
+def _restrict_to_admins(ak_url, ak_headers, plog=None, app_slug='atlas'):
     """Bind "Allow authentik Admins" to the ATLAS application. Returns True when
     the application is restricted, False when it is NOT.
 
@@ -2353,7 +2479,11 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None):
 
     policy_name = 'Allow authentik Admins'
     try:
-        app_pk = _get('core/applications/atlas/')['pk']
+        # ⚠️ The deployment's own application. Hardcoding `atlas` bound the
+        # policy to the *plain* application and then reported success, leaving
+        # the agency console — remote wipe, factory reset, policy push — bound
+        # to nothing at all while the log said it was restricted.
+        app_pk = _get('core/applications/%s/' % app_slug)['pk']
 
         policy_pk = None
         for p in _get('policies/all/?page_size=200').get('results', []):
@@ -2388,7 +2518,7 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None):
         return False
 
 
-def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None, inst=None):
     """Create the ATLAS MDM proxy provider + application in Authentik.
 
     Same pattern as the TAK Video Restreamer: Caddy's forward_auth protects
@@ -2409,6 +2539,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
             plog(msg)
     import urllib.request as _urlreq
     import urllib.error
+    import urllib.parse as _urlparse
     _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     _ak_url = ctx['_get_authentik_api_url'](settings) if settings else 'http://127.0.0.1:9090'
 
@@ -2445,11 +2576,18 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
             _host_name = ctx['_get_service_domain'](settings, KEY)
         else:
             _host_name = 'atlas.' + fqdn
+        # ⚠️ Qualified for the deployment being registered. Without this an
+        # agency's provider carried the plain deployment's external_host, so
+        # Authentik issued its cookie for a hostname the agency console is not
+        # served at and the sign-in loop never terminated.
+        _host_name = atlas_instances.agency_host(
+            _host_name, (inst or {}).get('slug'))
         _atlas_host = 'https://' + _host_name
+        _names = atlas_instances.authentik_names(inst)
         _cookie = f'.{fqdn.split(":")[0]}'
         try:
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
-                data=json.dumps({'name': 'ATLAS MDM Proxy', 'authorization_flow': flow_pk,
+                data=json.dumps({'name': _names['provider'], 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _atlas_host, 'mode': 'forward_single',
                     'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
@@ -2459,9 +2597,17 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
             log("  ✓ Proxy provider created")
         except Exception as e:
             if hasattr(e, 'code') and e.code == 400:
-                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=ATLAS+MDM', headers=_ak_headers)
+                # ⚠️ Matched by exact name, not `results[0]`. `search` is a
+                # substring match, so once an agency exists a search for
+                # "ATLAS MDM" returns every deployment's provider in whatever
+                # order Authentik chose — and taking the first would hand one
+                # deployment another's provider, then PATCH its external_host to
+                # the wrong hostname.
+                _q = _urlparse.quote(_names['provider'])
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search={_q}', headers=_ak_headers)
                 resp = _urlreq.urlopen(req, timeout=10)
-                results = json.loads(resp.read().decode())['results']
+                results = [r for r in json.loads(resp.read().decode())['results']
+                           if r.get('name') == _names['provider']]
                 if results:
                     provider_pk = results[0]['pk']
                     try:
@@ -2478,33 +2624,39 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
         if provider_pk:
             try:
                 req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                    data=json.dumps({'name': 'ATLAS MDM', 'slug': 'atlas',
+                    data=json.dumps({'name': _names['app_name'],
+                        'slug': _names['app_slug'],
                         'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                     headers=_ak_headers, method='POST')
                 _urlreq.urlopen(req, timeout=10)
-                log("  ✓ Application 'ATLAS MDM' created")
+                log("  \u2713 Application '%s' created" % _names['app_name'])
             except Exception as e:
                 if hasattr(e, 'code') and e.code == 400:
                     try:
-                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/atlas/',
+                        req = _urlreq.Request(
+                            '%s/api/v3/core/applications/%s/' % (_ak_url, _names['app_slug']),
                             data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
                         pass
-                    log("  ✓ Application 'ATLAS MDM' updated")
+                    log("  \u2713 Application '%s' updated" % _names['app_name'])
                 else:
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
-            ctx['_authentik_application_open_in_new_tab'](_ak_url, _ak_headers, 'atlas', plog=log)
+            ctx['_authentik_application_open_in_new_tab'](
+                _ak_url, _ak_headers, _names['app_slug'], plog=log)
             # ⚠️ The answer is recorded, not discarded (SEC_AUDIT.md H-1). ATLAS
             # runs with an empty admin group — it trusts Authentik to decide who is
             # an administrator — so this binding *is* the access control. It was
             # once found absent on a live box, and nothing noticed. Now the result
             # is stored where the tile and the next update can see it.
             _record_access_state(
-                ctx, _restrict_to_admins(_ak_url, _ak_headers, plog=log), plog=log)
+                ctx,
+                _restrict_to_admins(_ak_url, _ak_headers, plog=log,
+                                    app_slug=_names['app_slug']),
+                plog=log, inst=inst)
         else:
             log("  ⚠ Could not create or find the ATLAS proxy provider")
     except Exception as e:

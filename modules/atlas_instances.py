@@ -259,6 +259,39 @@ def agency_host(plain_host, slug):
     return f'{head}.{slug}.{rest}'
 
 
+def authentik_names(instance):
+    """The Authentik objects this deployment owns, and nobody else's.
+
+    ⚠️ **Sharing these is a tenancy break, not a cosmetic one.** The provider
+    name, the application slug and the policy binding were all constants —
+    `ATLAS MDM Proxy`, `atlas`, `ATLAS MDM`. Deploying an agency would therefore
+    have *repointed the existing deployment's application* at the agency's
+    hostname, signing every plain-deployment administrator into the agency
+    console and nobody into their own.
+
+    ⚠️ **The plain deployment keeps the exact strings already in Authentik on
+    every deployed box.** A rename here would orphan the live application: the
+    deploy would create a second one, the outpost would hold both, and the
+    policy binding would follow the new one while Caddy's forward_auth still
+    pointed at the old.
+    """
+    slug = (instance or {}).get('slug') or None
+    if slug is None:
+        return {
+            'provider': 'ATLAS MDM Proxy',
+            'app_slug': 'atlas',
+            'app_name': 'ATLAS MDM',
+        }
+    return {
+        'provider': f'ATLAS MDM Proxy ({slug})',
+        # ⚠️ `derive` owns this name, because the Caddy CA directory and the
+        # install directory use the same one. Two places to be wrong is one too
+        # many.
+        'app_slug': derive(instance)['authentik_slug'],
+        'app_name': f'ATLAS MDM ({slug})',
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Capacity: what this box can still take
 # --------------------------------------------------------------------------- #

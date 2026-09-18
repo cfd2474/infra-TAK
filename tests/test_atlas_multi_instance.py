@@ -323,8 +323,73 @@ def test_every_compose_call_in_deploy_names_its_instance():
 
 
 def test_deploy_resolves_the_instance_from_the_recorded_list():
-    """So a deploy cannot build a deployment nobody registered."""
+    """So a deploy cannot build a deployment nobody registered.
+
+    ⚠️ The paths now arrive through `deployment_identity`, which is where the
+    hostname, port and settings prefix are decided too. Asking for
+    `instance_paths` by name here is what this test used to do, and it failed
+    the moment that indirection appeared — a test of the spelling, not of the
+    behaviour.
+    """
     source = _function_source('deploy')
 
     assert 'load_instances(ctx)' in source
-    assert 'instance_paths(ctx, _inst)' in source
+    assert 'deployment_identity(ctx, _inst' in source
+
+
+def test_every_plain_defaulted_call_in_deploy_names_its_deployment():
+    """⚠️ **The same half-threading, one layer down.** `_bridge_gateway` and
+    `_set_trusted_proxies` both default to the plain deployment's Docker
+    network, so an agency silently took the RFC1918 fallback and never narrowed
+    — the S-1 mitigation not applying to exactly the deployments a box gains
+    from here on.
+
+    ⚠️ **Not a lockout, which is why nothing reported it.** The fallback still
+    refuses a request from a public address, so the deploy succeeded, the
+    console worked, and the control was simply wider than it should be. A
+    behavioural test would have to run `deploy` end to end against Docker; this
+    asks the one question that distinguishes the two cases.
+    """
+    import re
+
+    source = _function_source('deploy')
+
+    for fn in ('_bridge_gateway', '_set_trusted_proxies'):
+        calls = re.findall(r'%s\((?:[^()]|\([^()]*\))*\)' % fn, source)
+        assert calls, 'deploy no longer calls %s' % fn
+        for call in calls:
+            flat = ' '.join(call.split())
+            assert '_me[' in flat, \
+                'this call still takes the plain default: %s' % flat
+
+
+def test_deploy_writes_no_setting_under_a_hardcoded_plain_key():
+    """⚠️ Every generated value a deploy records belongs to *that* deployment.
+    `atlas_pg_password` shared between two of them makes the second database
+    permanently unopenable, and the failure appears as
+    `FATAL: password authentication failed` long after the deploy said it
+    succeeded.
+
+    `atlas_enabled` is the one exception and is asserted rather than excluded:
+    it means "the ATLAS module is installed on this box", which is what
+    `detect`, the tile and `caddy_sites` ask. Prefixing it would have made an
+    agency-only box report ATLAS absent and emit no vhost at all.
+    """
+    import re
+
+    source = _function_source('deploy')
+    writes = re.findall(r"s(?:_early)?\[f?'\{(\w+)\}(\w+)'\]", source)
+
+    assert writes, 'deploy no longer records anything'
+    # ⚠️ Asserted positively as well as negatively. Prefixing `atlas_enabled`
+    # satisfies every "not the plain key" rule below and is still wrong: an
+    # agency-only box would report ATLAS absent, `caddy_sites` would emit no
+    # vhost, and the console would offer to install what is already running.
+    assert ('KEY', '_enabled') in writes,         'deploy no longer records that ATLAS is installed on this box'
+    for var, key in writes:
+        if var == 'KEY':
+            assert key == '_enabled', \
+                "deploy writes the plain 'atlas%s' for every deployment" % key
+        else:
+            assert var == '_prefix', \
+                'settings are written under %r, not the deployment prefix' % var
