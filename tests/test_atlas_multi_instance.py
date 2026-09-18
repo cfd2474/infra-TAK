@@ -498,3 +498,28 @@ def test_deploy_writes_no_setting_under_a_hardcoded_plain_key():
         else:
             assert var == '_prefix', \
                 'settings are written under %r, not the deployment prefix' % var
+
+
+def test_the_store_is_idempotent_over_a_postgres_owned_pgdata(box, tmp_path, monkeypatch):
+    """⚠️ **The bug that would have failed the *second* deploy.**
+
+    Postgres runs as root, chowns its data directory to uid 70 and sets 0700
+    itself — measured on the box, `drwx------ 70 70` after one start. An
+    `os.chmod` here works on a fresh deployment, where the console still owns
+    the directory, and is `EPERM` on every re-deploy and every update after
+    that. `ensure_store` runs on all of them.
+    """
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+    pgdata = tmp_path / 'atlas-agencya' / 'store' / 'pgdata'
+
+    # Stand in for "root owns this now": any chmod/chown from here raises.
+    def refuse(*a, **k):
+        raise PermissionError(13, 'Operation not permitted')
+
+    monkeypatch.setattr(atlas.os, 'chmod', refuse)
+    monkeypatch.setattr(atlas.os, 'chown', refuse, raising=False)
+
+    err = atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+
+    assert err is None, err
+    assert pgdata.is_dir()

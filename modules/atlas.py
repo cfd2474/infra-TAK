@@ -1311,10 +1311,12 @@ def ensure_store(ctx, size_bytes, plog, mode=None, inst=None):
     # instead — the same thing the api container already does — needs no
     # privilege and no broker change: the directory is owned by the only user
     # that touches it. See `_COMPOSE_OVERRIDE`.
-    try:
-        os.chmod(pgdir, 0o700)
-    except OSError as exc:
-        return 'could not set permissions on %s: %s' % (pgdir, exc)
+    # ⚠️ **Not chmod'd either, and that would have failed on the *second*
+    # deploy.** Postgres runs as root, chowns its data directory to uid 70 and
+    # sets 0700 itself — measured: after one start the directory is
+    # `drwx------ 70 70`. A `chmod` here works on a fresh deployment, where
+    # the console still owns the directory, and is `EPERM` on every re-deploy
+    # and every update afterwards. Creating it is the whole job.
 
     err = _bind_pg_volume(pgdir, plog, volume=paths['pg_volume'])
     if err:
