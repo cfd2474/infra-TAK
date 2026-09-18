@@ -72,9 +72,17 @@ SNAPSHOT_CACHE_TTL = 15            # seconds; N tokens on one channel set = 1 qu
 MAX_RECORD_COUNT = 2000
 GROUPS_BITMAP_LEN = 32768          # TAK's cot_router.groups width
 
-# ATAK/TAK EUD platforms we export. Anything else connected to TAK Server is a
-# feed, a service or a plugin and is deliberately out of scope.
-EUD_PLATFORMS = ('ATAK', 'ITAK', 'WINTAK', 'TAK-CIV', 'ATAK-CIV', 'ATAK-MIL')
+# TAK end-user-device platforms we export (prefix match on <takv platform>, upper-cased).
+# Anything else connected to TAK Server is a feed, a service or a plugin and is
+# deliberately out of scope. v10.1.79: the list was ATAK/iTAK/WinTAK only, which silently
+# dropped every tracker: CORAZ had 5 devices reporting platform="OpenTAK-Tracker-Android"
+# (cot_type a-f-G-U-C, same as ATAK) and 3 ATAK-CIV, and ArcGIS showed 3 (2026-09-18).
+# TAK Aware ("TAKAware-CIV") was likewise dropped on test6/test12. Trackers ARE end-user
+# devices; that is the whole point of carrying one.
+EUD_PLATFORMS = ('ATAK', 'ITAK', 'WINTAK', 'TAK-CIV', 'ATAK-CIV', 'ATAK-MIL',
+                 'OPENTAK',                       # OpenTAK-Tracker-Android / -iOS
+                 'TAKAWARE',                      # TAKAware-CIV
+                 'TAK TRACKER', 'TAK-TRACKER', 'TAKTRACKER')   # TAK Product Center tracker
 
 # CoT writes 9999999.0 into hae/ce/le when the value is UNKNOWN — it is a sentinel,
 # not a measurement. Passing it through put a unit at 9,999,999 m in ArcGIS (observed
