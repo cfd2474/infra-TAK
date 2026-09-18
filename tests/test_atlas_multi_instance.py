@@ -189,16 +189,35 @@ def test_creating_the_plain_store_never_names_an_agency(box, tmp_path):
     assert not (tmp_path / 'atlas-agencya').exists()
 
 
-def test_the_database_directory_is_given_to_the_postgres_uid(box, tmp_path):
-    """⚠️ **The one chown left, and it goes through the shim.** Postgres runs
-    as uid 70 in its container and refuses to start unless it owns its data
-    directory. `os.chown` is EPERM for a non-root console, so this is the
-    brokered binary -- which is on the allowlist."""
+def test_the_database_directory_is_not_chowned_at_all(box, tmp_path):
+    """⚠️ **The fix that the first fix needed.**
+
+    `postgres:16-alpine` is uid 70 and will not start unless it owns its data
+    directory, so this used to chown `pgdata` to 70 through the shimmed
+    binary. Measured on the converted box: the `chown` shim only routes paths
+    under `/etc /opt /usr /var /run /boot /swapfile`, so a path in the
+    console's own home falls through to `/usr/bin/chown` and fails with
+    *"Operation not permitted"*. The deploy stopped there.
+
+    Widening the shim to broker chowns anywhere under `/home` is a large
+    grant for a small need; running the database as the console's own uid
+    needs no privilege at all.
+    """
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
 
-    ran = box.text()
-    assert 'chown 70:70' in ran, ran
-    assert posix(tmp_path / 'atlas-agencya' / 'store' / 'pgdata') in ran
+    assert 'chown' not in box.text(), box.text()
+
+
+def test_the_override_runs_both_containers_as_the_console(tmp_path):
+    """⚠️ Both services, not just the api one. The database was the service
+    that actually needed the ownership, and it was the one left out."""
+    body = atlas._COMPOSE_OVERRIDE.format(app_port=8760, app_uid=997, app_gid=997)
+
+    assert body.count('user: "997:997"') == 2, body
+    api = body.index('api:')
+    db = body.index('db:')
+    assert 'user:' in body[api:db], 'the api service has no user'
+    assert 'user:' in body[db:], 'the db service has no user'
 
 
 def test_nothing_reaches_for_a_loop_device_or_a_mount(box):

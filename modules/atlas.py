@@ -1249,18 +1249,24 @@ def ensure_store(ctx, size_bytes, plog, mode=None, inst=None):
         plog('    Nothing stops this deployment growing past it.')
 
     pgdir = posixpath.join(store, 'pgdata')
-    # ⚠️ **Postgres runs as uid 70 inside its container and must own this.**
-    # The only chown left, and it goes through the shimmed `chown` rather than
-    # `os.chown`, which is `EPERM` for a non-root console. The other three
-    # chowns are gone: the api container now runs as the console's own uid, so
-    # `pki/`, `artifacts/` and `cache/` are owned by whoever created them.
-    rc, out = _run_root(['chown', '%d:%d' % (STORE_PG_UID, STORE_PG_GID), pgdir])
-    if rc != 0:
-        return ('could not give %s to the database user (uid %d): %s'
-                % (pgdir, STORE_PG_UID, out.strip()[:200]))
-    rc, out = _run_root(['chmod', '700', pgdir])
-    if rc != 0:
-        return 'could not set permissions on %s: %s' % (pgdir, out.strip()[:200])
+    # ⚠️ **No chown at all, and the first attempt to keep one was wrong.**
+    #
+    # `postgres:16-alpine` runs as uid 70 and refuses to start unless it owns
+    # its data directory, so this chowned `pgdata` to 70 through the shimmed
+    # `chown`. That failed on the box: the shim only routes paths under
+    # `/etc /opt /usr /var /run /boot /swapfile`, so a path in the console's
+    # own home falls straight through to `/usr/bin/chown` and the console
+    # cannot give a directory away. *"Operation not permitted"*, measured.
+    #
+    # Widening the shim to broker chowns anywhere under `/home` is a large
+    # grant for a small need. Running the database as the console's own uid
+    # instead — the same thing the api container already does — needs no
+    # privilege and no broker change: the directory is owned by the only user
+    # that touches it. See `_COMPOSE_OVERRIDE`.
+    try:
+        os.chmod(pgdir, 0o700)
+    except OSError as exc:
+        return 'could not set permissions on %s: %s' % (pgdir, exc)
 
     err = _bind_pg_volume(pgdir, plog, volume=paths['pg_volume'])
     if err:
@@ -4171,6 +4177,15 @@ services:
     # by whoever created them, and the chowns disappear rather than moving to
     # the broker. `user:` overrides the image's USER; the numeric form is
     # required, because the container has no passwd entry for this uid.
+    user: "{app_uid}:{app_gid}"
+
+  # ⚠️ **The database runs as the console's uid too.** `postgres:16-alpine`
+  # is uid 70 and will not start unless it owns its data directory — which
+  # used to mean chowning that directory to 70 from the host. The console
+  # cannot do that for a path in its own home (the broker's `chown` shim only
+  # routes system paths), and widening the shim to cover `/home` would be a
+  # large grant for a small need. Running as the owner is the smaller answer.
+  db:
     user: "{app_uid}:{app_gid}"
 
   # No self-signed server certificate. Caddy holds a publicly-issued one, and a
