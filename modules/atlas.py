@@ -29,6 +29,7 @@ from glob import glob as _glob
 # them with `os.path.join` uses the separator of whichever machine this code
 # runs on, which is invisible only because production happens to match.
 import posixpath
+import re
 import secrets
 import shutil
 import subprocess
@@ -58,7 +59,7 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.48.0'
+ATLAS_TAG = 'v1.48.1'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -75,7 +76,7 @@ ATLAS_TAG = 'v1.48.0'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = '68d1fdbd4671b2419a446d6387a27b5e6813a041'
+ATLAS_SHA = '769a2889d0c46d9735fbb6bc5213022d1bdd0a46'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -587,6 +588,54 @@ def add_instance(ctx, agency_specific, slug, mode, size_gb,
     return inst, None
 
 
+def env_keys_written():
+    """The `TAKMDM_*` names this module writes into a deployment's `.env`.
+
+    Read out of the template rather than listed, so a setting added there cannot
+    be forgotten here.
+    """
+    return sorted(set(re.findall(r'^(TAKMDM_[A-Z0-9_]+)=', _ENV_TEMPLATE,
+                                 re.MULTILINE)))
+
+
+def env_keys_compose_passes(dirpath):
+    """The `TAKMDM_*` names the checkout's compose file passes to the container.
+
+    None when the file cannot be read — "we could not look" is not "nothing is
+    declared", and reporting the second would raise a false alarm on every
+    deploy that happened to race the clone.
+    """
+    try:
+        with open(os.path.join(dirpath, 'docker-compose.yml'),
+                  encoding='utf-8') as handle:
+            body = handle.read()
+    except OSError:
+        return None
+    return sorted(set(re.findall(r'^\s+(TAKMDM_[A-Z0-9_]+):', body,
+                                 re.MULTILINE)))
+
+
+def env_keys_that_reach_nothing(dirpath):
+    """Settings this module writes that the release will silently ignore.
+
+    ⚠️ **The fourth occurrence of one failure, so this is a measurement rather
+    than another reminder.** ATLAS's compose file has no `env_file`, so a
+    `TAKMDM_*` in `.env` reaches the container only where compose names it. It
+    has now happened with `TAKMDM_INCLUDE_SERVER_CA` (provisioning went on
+    pinning a CA it should not have), `TAKMDM_TRUSTED_PROXIES` (SEC_AUDIT S-1's
+    mitigation shipped inert for a release), and `TAKMDM_AGENCY_NAME` — the last
+    one *with* a warning comment and a test in the product repository, both of
+    which were in place and neither of which could see this repository.
+
+    The two files only exist together on the box, after the clone. That is the
+    one moment the question can actually be answered, so it is answered there.
+    """
+    passed = env_keys_compose_passes(dirpath)
+    if passed is None:
+        return []
+    return [key for key in env_keys_written() if key not in passed]
+
+
 def write_env_value(env_path, key, value):
     """Set one `KEY=value` line in a `.env`, adding it if it is absent.
 
@@ -653,14 +702,20 @@ def set_agency_name(ctx, inst, raw_name):
     write_env_value(env_path, 'TAKMDM_AGENCY_NAME', name)
     steps.append('Written to the deployment configuration')
 
-    # ⚠️ A restart, because the application reads its settings once at startup.
-    # Skipping it would record the name, write the file, report success — and
-    # show the old footer until something else happened to restart the
-    # container, which could be weeks.
-    r = _compose(ctx, 'restart api', timeout=180, inst=inst)
+    # ⚠️ **`up -d`, not `restart`.** Measured on the box: the name was in
+    # `.env`, the record and the log all said it had been applied, and
+    # `printenv` inside the container showed nothing. Compose interpolates
+    # `${TAKMDM_AGENCY_NAME}` when it *renders* the configuration and bakes the
+    # result in at container **create** time; `restart` stops and starts the
+    # same container, so a changed `.env` value never reaches it. `up -d`
+    # re-renders, sees the difference and recreates.
+    #
+    # ⚠️ The CA ceremony's `restart api` is correct as it stands — that reloads
+    # files from a volume, not an interpolated environment.
+    r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
     if r.returncode != 0:
-        return steps, compose_error(r, 'docker compose restart')
-    steps.append('%s restarted — the footer shows it now'
+        return steps, compose_error(r, 'docker compose up')
+    steps.append('%s recreated — the footer shows it now'
                  % atlas_instances.derive(inst)['name'])
     return steps, None
 
@@ -2520,6 +2575,16 @@ def deploy(ctx, job, params):
             _COMPOSE_OVERRIDE.format(app_port=_app_port),
         )
         plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{_app_port})')
+        # ⚠️ Checked against the release that was just checked out, because a
+        # setting compose does not name reaches nothing and says nothing. Not
+        # fatal: the deployment works, minus whatever that setting did, and
+        # failing the deploy over it would be worse than naming it.
+        _inert = env_keys_that_reach_nothing(dirpath)
+        if _inert:
+            plog('  ⚠ This release does not read: ' + ', '.join(_inert))
+            plog('    They are in .env and its docker-compose.yml does not name')
+            plog('    them, so the application will never see them. Whatever')
+            plog('    they configure is not configured.')
 
         # The container runs unprivileged; the directories it writes are ours.
         # See APP_UID. Done here rather than after `up` because the very first

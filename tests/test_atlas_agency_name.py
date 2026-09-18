@@ -174,8 +174,8 @@ def test_the_pin_points_at_the_release_that_renders_it():
     """⚠️ The name reaching `.env` does nothing until the deployment runs a
     release that knows the setting. A fresh install lands on the pin, so the pin
     has to be that release or the feature ships invisible."""
-    assert atlas.ATLAS_TAG == 'v1.48.0'
-    assert atlas.ATLAS_SHA == '68d1fdbd4671b2419a446d6387a27b5e6813a041'
+    assert atlas.ATLAS_TAG == 'v1.48.1'
+    assert atlas.ATLAS_SHA == '769a2889d0c46d9735fbb6bc5213022d1bdd0a46'
 
 
 # --------------------------------------------------------------------------- #
@@ -277,15 +277,21 @@ def test_it_reaches_the_deployment_s_configuration(built):
         (d / '.env').read_text(encoding='utf-8')
 
 
-def test_the_deployment_restarts_to_pick_it_up(built):
-    """⚠️ The application reads its settings once at startup. Recording the
-    name, writing the file and reporting success would show the old footer until
-    something else happened to restart the container — which could be weeks."""
+def test_the_deployment_is_recreated_to_pick_it_up(built):
+    """⚠️ **`up -d`, not `restart`. Measured on the box.** The name was in
+    `.env`, the record and the log both said it had been applied, and `printenv`
+    inside the container showed nothing.
+
+    Compose interpolates `${TAKMDM_AGENCY_NAME}` when it *renders* the
+    configuration and bakes the result in at container **create** time.
+    `restart` stops and starts the same container, so a changed `.env` value
+    never reaches it. `up -d` re-renders, sees the difference and recreates.
+    """
     ctx, inst, _d, _saved, ran = built
 
     atlas.set_agency_name(ctx, inst, 'Corona Fire Department')
 
-    assert ran == [('restart api', 'corona')]
+    assert ran == [('up -d api', 'corona')]
 
 
 def test_it_restarts_that_deployment_and_not_another(built):
@@ -474,3 +480,83 @@ def test_a_record_made_before_the_field_existed_still_reports_a_name(
     row = atlas.instances_payload(ctx)['instances'][0]
 
     assert row['agency_name'] == ''
+
+
+# --------------------------------------------------------------------------- #
+# A setting the release cannot read (W219)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **The fourth occurrence of one failure.** ATLAS's `docker-compose.yml` has
+# no `env_file`, so a `TAKMDM_*` in `.env` reaches the container only where
+# compose names it. It has happened with `TAKMDM_INCLUDE_SERVER_CA`
+# (provisioning went on pinning a CA it should not have), with
+# `TAKMDM_TRUSTED_PROXIES` (SEC_AUDIT S-1's mitigation shipped inert for a
+# release), and with `TAKMDM_AGENCY_NAME` — that one *with* a warning comment
+# and a test in the product repository, both in place, neither able to see this
+# repository.
+#
+# The two files only exist together on the box, after the clone. That is the one
+# moment the question can be answered, so it is answered there.
+
+
+def test_every_key_the_template_writes_is_reported():
+    """Read out of the template, so a setting added there cannot be forgotten
+    here."""
+    written = atlas.env_keys_written()
+
+    assert 'TAKMDM_AGENCY_NAME' in written
+    assert 'TAKMDM_TRUSTED_PROXIES' in written
+    assert all(k.startswith('TAKMDM_') for k in written), written
+
+
+def _checkout(tmp_path, declared):
+    d = tmp_path / 'atlas-corona'
+    d.mkdir(parents=True, exist_ok=True)
+    body = ['services:', '  api:', '    environment:']
+    body += ['      %s: ${%s-}' % (k, k) for k in declared]
+    (d / 'docker-compose.yml').write_text(chr(10).join(body) + chr(10),
+                                          encoding='utf-8')
+    return str(d)
+
+
+def test_a_release_that_names_everything_reports_nothing(tmp_path):
+    path = _checkout(tmp_path, atlas.env_keys_written())
+
+    assert atlas.env_keys_that_reach_nothing(path) == []
+
+
+def test_a_setting_compose_does_not_name_is_reported(tmp_path):
+    """⚠️ The exact bug. The value is correct in every file an operator would
+    look at, and the application never sees it."""
+    declared = [k for k in atlas.env_keys_written() if k != 'TAKMDM_AGENCY_NAME']
+    path = _checkout(tmp_path, declared)
+
+    assert atlas.env_keys_that_reach_nothing(path) == ['TAKMDM_AGENCY_NAME']
+
+
+def test_an_unreadable_compose_file_raises_no_alarm(tmp_path):
+    """⚠️ "We could not look" is not "nothing is declared". Reporting the second
+    would put a false warning in the log of every deploy that raced the clone."""
+    assert atlas.env_keys_that_reach_nothing(str(tmp_path / 'nowhere')) == []
+    assert atlas.env_keys_compose_passes(str(tmp_path / 'nowhere')) is None
+
+
+def test_a_release_that_names_more_than_we_write_is_fine(tmp_path):
+    """The product has settings the module does not write — defaults it sets
+    itself. Only the other direction is a fault."""
+    path = _checkout(tmp_path, atlas.env_keys_written() + ['TAKMDM_SOMETHING_ELSE'])
+
+    assert atlas.env_keys_that_reach_nothing(path) == []
+
+
+def test_the_deploy_log_says_so():
+    """⚠️ In the deploy log, where an operator will actually see it. Not fatal:
+    the deployment works, minus whatever that setting did, and failing the
+    deploy over it would be worse than naming it."""
+    source = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
+    start = source.index(chr(10) + 'def deploy(')
+    end = source.index(chr(10) + 'def ', start + 1)
+    body = source[start:end]
+
+    assert 'env_keys_that_reach_nothing(dirpath)' in body
+    assert 'does not read' in body
