@@ -978,7 +978,26 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'version', 'running_version', 'agency_name',
-                   'paths')
+                   'latest', 'update_available', 'paths')
+
+
+def update_available_for(installed, latest):
+    """Whether this deployment has a newer release to move to.
+
+    ⚠️ **Computed here, not in the browser.** The comparison is on a tuple of
+    integers, never on the string: `0.10.0` sorts before `0.9.0`
+    alphabetically, which would stop offering updates at the tenth release of
+    any series and do it silently. `_parse_version` already gets that right and
+    is tested; a second implementation in JavaScript would be a second chance to
+    get it wrong.
+
+    ⚠️ **False when either version is unknown.** An unreachable GitHub leaves
+    `latest` empty, and a badge is a claim — "nothing to do here" is not
+    something a failed check has earned. Absence of a badge means "no newer
+    release established", which is the honest reading of both cases.
+    """
+    here, there = _parse_version(installed), _parse_version(latest)
+    return bool(here and there and there > here)
 
 
 def instances_payload(ctx, size_gb=None):
@@ -999,6 +1018,10 @@ def instances_payload(ctx, size_gb=None):
     *this* function's output.
     """
     projects = compose_projects_present(ctx)
+    # ⚠️ Asked once for the whole box, not once per deployment. It is a GitHub
+    # call behind a 15-minute cache, and the allowance is 60 an hour per IP — a
+    # box with five agencies polling this route would spend it on one page.
+    latest = _latest_version(use_cache=True)
     return {
         'instances': [
             dict(inst,
@@ -1008,6 +1031,9 @@ def instances_payload(ctx, size_gb=None):
                  # agencies a box has. The checkout's version is what the row
                  # shows; the drift table asks the containers.
                  **instance_status(ctx, inst, projects),
+                 latest=latest,
+                 update_available=update_available_for(
+                     _installed_version(ctx, inst), latest),
                  paths={k: instance_paths(ctx, inst)[k]
                         for k in ('dir', 'vhost', 'compose_project')})
             for inst in load_instances(ctx)

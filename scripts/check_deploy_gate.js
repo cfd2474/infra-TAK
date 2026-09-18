@@ -861,6 +861,79 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
     h.el("removeError").textContent);
 }
 
+// --- which deployments are behind, at a glance ----------------------------- //
+//
+// ⚠️ The server decides whether a deployment is behind; this only draws it.
+// Comparing versions here would be a second implementation of a comparison that
+// has to be on integers — `0.10.0` sorts before `0.9.0` as a string, which would
+// stop showing the badge at the tenth release of any series, silently.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, update_available: true,
+                           latest: "1.49.0" }],
+             capacity: { ...CAPACITY } });
+  const row = h.el("instanceRows").children[0];
+
+  check("a deployment that is behind carries a badge",
+    labels(row).includes("v1.49.0 available"), JSON.stringify(labels(row)));
+  // The badge answers "to what", not only "yes" — an operator comparing two
+  // rows needs the target, not a dot.
+  check("naming the release it points at",
+    labels(row).some((t) => t.includes("1.49.0")), JSON.stringify(labels(row)));
+  check("and its own version is still shown",
+    labels(row).includes("running  v1.48.0"), JSON.stringify(labels(row)));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, update_available: false,
+                           latest: "1.48.0" }],
+             capacity: { ...CAPACITY } });
+
+  check("a current deployment carries none",
+    !labels(h.el("instanceRows").children[0]).some((t) => t.includes("available")),
+    JSON.stringify(labels(h.el("instanceRows").children[0])));
+}
+
+{
+  // ⚠️ An unreachable GitHub leaves `update_available` false and `latest`
+  // null. No badge is the honest reading: "no newer release established"
+  // covers both "you are current" and "the check could not run".
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, update_available: false, latest: null }],
+             capacity: { ...CAPACITY } });
+
+  check("a check that could not run claims nothing",
+    !labels(h.el("instanceRows").children[0]).some((t) => t.includes("available")),
+    JSON.stringify(labels(h.el("instanceRows").children[0])));
+}
+
+{
+  // The point of the whole thing: several deployments, and you can see which.
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [
+      { ...RUNNING, update_available: true, latest: "1.49.0" },
+      { ...STOPPED, update_available: false, latest: "1.49.0" },
+    ], capacity: { ...CAPACITY } });
+  const rows = h.el("instanceRows").children;
+
+  check("with several deployments only the stale ones are marked",
+    labels(rows[0]).includes("v1.49.0 available")
+    && !labels(rows[1]).some((t) => t.includes("available")),
+    JSON.stringify([labels(rows[0]), labels(rows[1])]));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...UNFINISHED, update_available: true,
+                           latest: "1.49.0" }],
+             capacity: { ...CAPACITY } });
+
+  check("an unfinished deployment has no row to badge",
+    h.el("instanceRows").children.length === 0);
+}
+
 console.log(fails === 0
   ? "\n  all deployment-form checks passed"
   : "\n  " + fails + " check(s) failed");

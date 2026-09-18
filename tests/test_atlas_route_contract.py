@@ -151,3 +151,76 @@ def test_a_size_asked_about_reaches_the_capacity_calculation(ctx, monkeypatch):
     atlas.instances_payload(ctx, size_gb=50.0)
 
     assert seen['size'] == 50.0
+
+
+# --------------------------------------------------------------------------- #
+# Which deployments are behind (W222)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_deployment_on_an_older_release_is_behind():
+    assert atlas.update_available_for('1.48.1', '1.49.0') is True
+
+
+def test_a_deployment_on_the_newest_is_not():
+    assert atlas.update_available_for('1.49.0', '1.49.0') is False
+
+
+def test_a_deployment_ahead_of_the_newest_is_not():
+    """A checkout on an unreleased build is not "behind"; offering to move it
+    backwards would be worse than saying nothing."""
+    assert atlas.update_available_for('1.50.0', '1.49.0') is False
+
+
+def test_the_comparison_is_on_numbers_not_text():
+    """⚠️ **The one that would fail silently.** `0.10.0` sorts *before* `0.9.0`
+    as a string, so a text comparison stops offering updates at the tenth
+    release of any series — and says nothing about it."""
+    assert atlas.update_available_for('0.9.0', '0.10.0') is True
+    assert atlas.update_available_for('1.9.0', '1.10.0') is True
+
+
+def test_an_unreachable_github_claims_nothing():
+    """⚠️ A missing badge means "no newer release established", which covers
+    both "you are current" and "the check could not run". Rendering the second
+    as the first would be a reassurance nothing earned."""
+    assert atlas.update_available_for('1.48.1', None) is False
+    assert atlas.update_available_for('1.48.1', '') is False
+
+
+def test_a_deployment_with_no_version_claims_nothing():
+    """An unfinished deployment has no version to be behind."""
+    assert atlas.update_available_for(None, '1.49.0') is False
+
+
+def test_a_version_that_is_not_three_numbers_claims_nothing():
+    assert atlas.update_available_for('nightly', '1.49.0') is False
+
+
+def test_the_row_carries_the_badge_and_what_it_points_at(ctx, monkeypatch):
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.49.0')
+
+    row = atlas.instances_payload(ctx)['instances'][0]
+
+    assert row['version'] == '1.47.3'
+    assert row['latest'] == '1.49.0'
+    assert row['update_available'] is True
+
+
+def test_a_current_deployment_carries_no_badge(ctx, monkeypatch):
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.47.3')
+
+    assert atlas.instances_payload(ctx)['instances'][0]['update_available'] is False
+
+
+def test_the_newest_release_is_asked_for_once_not_once_per_row(ctx, monkeypatch):
+    """⚠️ A GitHub call behind a 15-minute cache, and the allowance is 60 an
+    hour per IP. A box with five agencies polling this route would spend it on
+    one page."""
+    calls = []
+    monkeypatch.setattr(atlas, '_latest_version',
+                        lambda use_cache=True: calls.append(1) or '1.49.0')
+
+    atlas.instances_payload(ctx)
+
+    assert len(calls) == 1
