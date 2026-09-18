@@ -3041,6 +3041,31 @@ def caddy_base():
     return '/var/lib/caddy'
 
 
+def _read_maybe_priv(path, ctx=None):
+    """Text at `path`, or None. Tries as the console, then asks the broker.
+
+    ⚠️ **Any filesystem question about a container-owned path is
+    unanswerable by the console**, and that includes `os.path.exists`. `pki/`
+    is `drwx------` under the application's uid, so the console cannot even
+    traverse it: `exists()` answers False about a file that is plainly there.
+    Four separate failures tonight were this same shape — read, chown,
+    delete, and then an existence probe standing in front of a read that had
+    already been fixed.
+    """
+    try:
+        with open(path, 'r') as handle:
+            return handle.read().strip()
+    except OSError:
+        pass
+    reader = (ctx or {}).get('_read_priv')
+    if reader is None:
+        return None
+    try:
+        return (reader(path) or '').strip()
+    except Exception:
+        return None
+
+
 def device_ca_path(inst=None):
     """Where Caddy reads this deployment's device CA. Pure — touches nothing.
 
@@ -3088,10 +3113,15 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
     if not atlas_instances.derive(inst)['slug']:
         candidates += ['/root/atlas', os.path.expanduser('~/atlas')]
     for base_dir in candidates:
-        src = os.path.join(base_dir, 'pki', 'ca.crt')
-        if os.path.exists(src):
+        # ⚠️ Asked by *reading*, not by `os.path.exists` — see
+        # [_read_maybe_priv]. The probe used to be an `exists()` that the
+        # console cannot answer for a directory the application owns, so this
+        # returned None about a certificate sitting right there.
+        if _read_maybe_priv(os.path.join(base_dir, 'pki', 'ca.crt'), ctx):
             break
     else:
+        print('[' + KEY + '] no device CA found in: '
+              + ', '.join(candidates), flush=True)
         return None
 
     # ⚠️ Root **plus every intermediate**, not just `ca.crt` (ATLAS W172).
@@ -3118,7 +3148,6 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
     # never leave the install directory: verification takes the public half,
     # and a key readable by a web server is a fleet's identity one file-read
     # away.
-    reader = (ctx or {}).get('_read_priv')
     # ⚠️ **KNOWN GAP: `retired/` cannot be listed by the console.** The glob
     # below runs as the console, and `pki/` is `drwx------` owned by the
     # application's uid — so it returns nothing, silently, and a renewed CA
@@ -3133,19 +3162,16 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
     for candidate in ([os.path.join(pki_dir, 'ca.crt'),
                        os.path.join(pki_dir, 'issuing.crt')] +
                       sorted(_glob(os.path.join(pki_dir, 'retired', '*.crt')))):
-        text = None
-        try:
-            with open(candidate, 'r') as fh:
-                text = fh.read().strip()
-        except OSError:
-            if reader is not None:
-                try:
-                    text = (reader(candidate) or '').strip()
-                except Exception:
-                    text = None
+        text = _read_maybe_priv(candidate, ctx)
         if text and text not in bundle_parts:
             bundle_parts.append(text)
     if not bundle_parts:
+        # ⚠️ Never silent. This function feeds a *fatal* check in `deploy`,
+        # and it had three separate `return None` paths that said nothing —
+        # so the deploy stopped with a message naming the destination and no
+        # hint of which step had actually failed.
+        print('[' + KEY + '] device CA at ' + pki_dir + ' could not be read',
+              flush=True)
         return None
     try:
         # ⚠️ One directory per deployment. A shared `atlas/device-ca.crt`
