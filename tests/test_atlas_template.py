@@ -282,34 +282,43 @@ def test_an_accepted_deploy_puts_the_note_up(idle):
 # --------------------------------------------------------------------------- #
 
 
-def test_the_recovery_commands_keep_their_line_break(installed):
-    """⚠️ **The bug.** Collapsed, this reads
-    `sed -i '...' /root/atlas/.env cd /root/atlas && ...`, and `sed` treats
-    `cd` as a file to edit. Two commands have to stay two commands."""
+def test_the_break_glass_card_is_gone(installed):
+    """Removed at the operator's request (W224).
+
+    ⚠️ **It was already wrong.** Every command in it was hardcoded to
+    `/root/atlas` and `takmdm-api-1` — the plain deployment. On a box whose
+    deployments are `atlas-corona` and `atlas-test`, `sed` would have edited a
+    file that does not exist and `docker logs` named a container that does not
+    exist. Recovery instructions that fail silently are worse than none: they
+    are read during an outage, by someone who then believes they have tried the
+    fix.
+    """
+    assert "locked out of ATLAS" not in installed
+    # ⚠️ The command blocks, not the whole page. `.cmd`'s own CSS comment
+    # still recounts the `sed` bug as the reason the rule exists — which is
+    # history worth keeping, and would make a page-wide search fail for the
+    # wrong reason.
     blocks = re.findall(r'<div class="cmd"[^>]*>(.*?)</div>', installed, re.S)
 
-    assert blocks, "no command blocks on the page"
-    two_part = [b for b in blocks if "sed -i" in b]
-    assert two_part, "the sed recovery commands are gone"
-    for block in two_part:
-        assert "\n" in block, f"collapsed into one line: {block!r}"
-        assert block.splitlines()[1].startswith("cd /root/atlas"), (
-            "the second command is not on its own line"
-        )
+    assert not [b for b in blocks if "sed -i" in b], blocks
 
 
-def test_the_commands_are_rendered_with_a_whitespace_preserving_rule(installed):
+def test_cmd_blocks_are_rendered_with_a_whitespace_preserving_rule(installed):
     """A newline in the source is only two lines on screen if the CSS says so.
-    The rule and the markup have to agree, and the rule is what was missing."""
+
+    ⚠️ Still load-bearing after the break-glass card went: the capacity panel
+    and the uninstall dialog's list of deployments are both `.cmd`, and both are
+    several lines that mean nothing run together.
+    """
     rule = re.search(r'\.cmd\{([^}]*)\}', installed)
 
     assert rule, ".cmd is not defined"
     assert "white-space:pre-wrap" in rule.group(1)
 
 
-def test_the_commands_are_not_given_a_log_sized_box(installed):
+def test_cmd_blocks_are_not_given_a_log_sized_box(installed):
     """⚠️ The empty space in the screenshot: `.log-box` is `height:340px`,
-    which is right for a stream and absurd for one line of `sed`.
+    which is right for a stream and absurd for a three-line list.
 
     ⚠️ Anchored to a property boundary, because `"height:" not in rule` is
     satisfied by `line-height:1.55` — which it was, on the first run. Sixth
