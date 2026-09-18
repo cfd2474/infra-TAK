@@ -206,6 +206,29 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
         <p class="note" id="slugPreview" style="margin:6px 0 0"></p>
       </div>
 
+      <!--
+        ⚠️ **The slug is not the name.** `corona` is what goes in a hostname, a
+        systemd unit and a Docker volume; "Corona Fire Department" is what the
+        agency calls itself, and it is what an administrator needs to see in the
+        footer of that deployment's own console to know which fleet they are
+        about to push a policy to.
+      -->
+      <div style="margin-bottom:16px">
+        <label for="agencyName"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency name
+        </label>
+        <input type="text" id="agencyName" maxlength="60"
+               placeholder="Corona Fire Department"
+               oninput="previewSlug()"
+               style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" style="margin:6px 0 0">
+          Shown in the footer of this deployment&rsquo;s own console, above the
+          version. Free text &mdash; spaces, capitals and punctuation are all
+          fine. Optional, and it can be changed later.
+        </p>
+      </div>
+
       <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
       <button class="btn btn-primary" id="createInstanceBtn" onclick="openInstanceConfirm()">
         Review &amp; deploy
@@ -612,6 +635,28 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
   ⚠️ The name is typed, not clicked. A red button beside five rows is one
   mis-click away from the wrong agency, and there is no undo.
 -->
+<div class="modal-overlay" id="nameModal">
+  <div class="modal">
+    <h3 id="nameTitle">Name this deployment</h3>
+    <p class="note" id="nameWhat"></p>
+    <input type="text" id="nameField" maxlength="60"
+           placeholder="Corona Fire Department">
+    <p class="note" style="margin-top:8px">
+      Shown in the footer of that deployment&rsquo;s own console, above the
+      version. Leave it blank to remove the name.
+    </p>
+    <p class="note" style="margin-top:8px">
+      ⚠️ The deployment restarts to pick this up &mdash; a few seconds during
+      which its console is unavailable. Enrolled tablets are unaffected.
+    </p>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeNameDeployment()">Cancel</button>
+      <button class="btn btn-primary" id="nameGo" onclick="doNameDeployment()">Save</button>
+    </div>
+    <div id="nameError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="instanceRemoveModal">
   <div class="modal">
     <h3 id="removeTitle">Remove deployment</h3>
@@ -838,6 +883,16 @@ function instanceRow(i){
   name.textContent = i.slug || 'general';
   row.appendChild(name);
 
+  // ⚠️ The agency's own name, when it has one. The slug is what the machine
+  // uses; this is what the operator calls them, and on a box with four
+  // agencies it is the only label that distinguishes them at a glance.
+  if (i.agency_name){
+    const agency = document.createElement('span');
+    agency.textContent = i.agency_name;
+    agency.style.cssText = 'margin-right:8px';
+    row.appendChild(agency);
+  }
+
   // ⚠️ `hostFor` again, so the link an operator clicks is built by the same
   // rule Caddy serves and `.env` records. A second rule here is how the page
   // comes to link somewhere nothing answers.
@@ -854,6 +909,11 @@ function instanceRow(i){
   state.textContent = stateLabel(i);
   row.appendChild(state);
 
+  // ⚠️ Changeable after the fact. `deploy` is the only thing that writes
+  // `.env`, so without this a deployment could only be named by tearing it down
+  // and building it again — and every deployment that exists today has no name.
+  row.appendChild(rowButton(i.agency_name ? 'Rename' : 'Name', 'btn-secondary',
+                            function(){ openNameDeployment(i); }));
   row.appendChild(rowButton('Update', 'btn-primary',
                             function(){ startUpdate(i.slug); }));
   row.appendChild(rowButton(i.running ? 'Restart' : 'Start', 'btn-secondary',
@@ -887,6 +947,54 @@ function controlInstance(i, action){
       if (d.error) { alert(d.error); return; }
       setTimeout(function(){ location.reload(); }, 1200);
     }).catch(function(){});
+}
+
+let nameTarget = null;
+
+function openNameDeployment(i){
+  nameTarget = i;
+  const shown = (i && i.slug) || 'general';
+  const title = document.getElementById('nameTitle');
+  const what = document.getElementById('nameWhat');
+  const field = document.getElementById('nameField');
+  const err = document.getElementById('nameError');
+  if (title) title.textContent = (i.agency_name ? 'Rename ' : 'Name ') + shown;
+  if (what) what.textContent = 'Which agency ' + hostFor(i.slug) + ' serves.';
+  // ⚠️ Seeded with what is set, so a rename is an edit rather than a retype —
+  // and an operator correcting one character does not have to get the other
+  // fifty right from memory.
+  if (field) field.value = i.agency_name || '';
+  if (err) err.style.display = 'none';
+  document.getElementById('nameModal').classList.add('open');
+}
+
+function closeNameDeployment(){
+  document.getElementById('nameModal').classList.remove('open');
+  nameTarget = null;
+}
+
+function doNameDeployment(){
+  if (!nameTarget) return;
+  const slug = nameTarget.slug || 'atlas';
+  const field = document.getElementById('nameField');
+  const go = document.getElementById('nameGo');
+  const err = document.getElementById('nameError');
+  if (go) go.disabled = true;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/name',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({agency_name: field ? field.value : ''})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (go) go.disabled = false;
+      if (!d.success){
+        if (err){ err.textContent = d.error || 'Could not set the name.';
+                  err.style.display = ''; }
+        return;
+      }
+      closeNameDeployment();
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){ if (go) go.disabled = false; });
 }
 
 let removeTarget = null;
@@ -1002,6 +1110,14 @@ function hostFor(slug){
   return tpl ? tpl.replace('{slug}', slug) : 'atlas.' + slug + '.<your-domain>';
 }
 
+function typedAgencyName(){
+  // ⚠️ Read through one function, so the confirmation summarises exactly what
+  // the request will carry. Two readings of the same field is how a modal comes
+  // to repeat back something the server was never sent.
+  const field = document.getElementById('agencyName');
+  return field ? field.value.trim() : '';
+}
+
 function currentMode(){
   const fixed = document.querySelector('input[name="sizeMode"][value="fixed"]');
   return fixed && fixed.checked ? 'fixed' : 'dynamic';
@@ -1099,8 +1215,13 @@ function openInstanceConfirm(){
   const slug = typedSlug();
   const mode = currentMode();
   const size = document.getElementById('instanceSize');
+  const name = typedAgencyName();
   const rows = [
     '  agency      ' + (slug || 'none — the box\u2019s general ATLAS'),
+    // ⚠️ Repeated back because it is free text nobody validates for
+    // spelling. The slug is checked against rules; the name is checked by
+    // the operator reading it, and this is the only place they get to.
+    '  name        ' + (name || 'not set'),
     '  hostname    ' + hostFor(slug),
     '  type        ' + mode,
     '  storage     ' + (mode === 'fixed'
@@ -1109,8 +1230,8 @@ function openInstanceConfirm(){
   ];
   document.getElementById('instanceConfirmSummary').textContent = rows.join('\n');
   document.getElementById('instanceConfirmNote').textContent = mode === 'fixed'
-    ? 'Free disk drops by this much straight away, and neither the type nor the slug can be changed afterwards.'
-    : 'Nothing is taken from the box now. Neither the type nor the slug can be changed afterwards.';
+    ? 'Free disk drops by this much straight away, and neither the type nor the slug can be changed afterwards. The name can.'
+    : 'Nothing is taken from the box now. Neither the type nor the slug can be changed afterwards. The name can.';
   document.getElementById('instanceModal').classList.add('open');
 }
 
@@ -1161,6 +1282,7 @@ function createInstance(){
     body: JSON.stringify({
       agency_specific: !!slug,
       slug: slug || null,
+      agency_name: typedAgencyName(),
       mode: mode,
       size_gb: (mode === 'fixed' && size && size.value) ? Number(size.value) : null
     })

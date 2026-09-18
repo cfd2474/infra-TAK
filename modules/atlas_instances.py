@@ -67,9 +67,47 @@ KNOWN_TAKEN_PORTS = frozenset({5000, 5080, 5090, 8080, 8443, 8449, 9443, 3100, 8
 # --------------------------------------------------------------------------- #
 
 
-def make(slug, mode, size_gb, port):
-    """One instance record. `slug` is None for the non-agency deployment."""
-    return {'slug': slug, 'mode': mode, 'size_gb': size_gb, 'port': port}
+#: The longest agency name that still reads as one in a footer.
+#:
+#: ⚠️ Not a database limit — the footer is. A 400-character "name" would wrap
+#: across the bottom of every page and push the version off screen, which is the
+#: one thing the footer had to keep saying.
+AGENCY_NAME_MAX = 60
+
+
+def validate_agency_name(raw):
+    """`(name, error)`. The name shown in the deployment's own footer.
+
+    ⚠️ **Free text on purpose.** This is *"Corona Fire Department"*, not a slug:
+    spaces, capitals, ampersands and apostrophes are all ordinary in the name of
+    an agency, and forcing it through the slug rules would produce something
+    nobody calls themselves.
+
+    ⚠️ **Control characters are refused rather than stripped.** A name that
+    silently loses a character is a name the operator will not recognise, and
+    anything that arrives here containing a newline came from something other
+    than the field — which is worth refusing loudly.
+    """
+    name = (raw or '').strip()
+    if not name:
+        return '', None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return None, 'An agency name cannot contain line breaks or control characters.'
+    if len(name) > AGENCY_NAME_MAX:
+        return None, ('An agency name can be at most %d characters — this one '
+                      'is %d.' % (AGENCY_NAME_MAX, len(name)))
+    return name, None
+
+
+def make(slug, mode, size_gb, port, agency_name=''):
+    """One instance record. `slug` is None for the non-agency deployment.
+
+    ⚠️ `agency_name` defaults to empty and is *not* derived from the slug. The
+    whole reason the field exists is that `corona` is not
+    "Corona Fire Department".
+    """
+    return {'slug': slug, 'mode': mode, 'size_gb': size_gb, 'port': port,
+            'agency_name': agency_name or ''}
 
 
 def plain(instances):

@@ -124,13 +124,15 @@ function harness(capacity) {
     + "ctx.render = renderInstances;"
     + "ctx.onMode = onModeChanged; ctx.preview = previewSlug;"
     + "ctx.open = openInstanceConfirm; ctx.close = closeInstanceConfirm;"
-    + "ctx.openRemove = openRemove; ctx.removeGate = refreshRemoveGate;");
+    + "ctx.openRemove = openRemove; ctx.removeGate = refreshRemoveGate;"
+    + "ctx.openName = openNameDeployment;");
 
   return {
     el,
     problem: ctx.problem, open: ctx.open, close: ctx.close,
     render: ctx.render,
     openRemove: ctx.openRemove,
+    openName: ctx.openName,
     typeConfirm(v) { el("removeConfirm").value = v; ctx.removeGate(); },
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
@@ -140,6 +142,7 @@ function harness(capacity) {
     size(v) { el("instanceSize").value = v; ctx.gate(); },
     building(on) { global.polling = !!on; },
     slug(v) { el("agencySlug").value = v; ctx.preview(); },
+    agencyName(v) { el("agencyName").value = v; ctx.preview(); },
   };
 }
 
@@ -612,6 +615,102 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
     && labels(h.el("retryRow")).includes("Finish deploying gone")
     && labels(h.el("retryRow")).includes("Remove gone"),
     JSON.stringify(labels(h.el("retryRow"))));
+}
+
+// --- the agency name, beside the slug -------------------------------------- //
+//
+// ⚠️ **The slug is not the name.** `corona` goes into a hostname, a systemd
+// unit, a Compose project and a Docker volume; "Corona Fire Department" is what
+// the agency calls itself and what an administrator reads in that deployment's
+// own footer before pushing a policy. One cannot be derived from the other.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.pick("dynamic");
+  h.slug("corona");
+  h.agencyName("Corona Fire Department");
+  h.open();
+  const summary = h.el("instanceConfirmSummary").textContent;
+
+  check("the confirmation repeats the agency name back",
+    summary.includes("Corona Fire Department"), summary);
+  check("beside the slug it is not derived from",
+    summary.includes("corona") && summary.includes("Corona Fire Department"),
+    summary);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.pick("dynamic");
+  h.slug("corona");
+  h.open();
+
+  check("no name is summarised as 'not set', not as blank",
+    h.el("instanceConfirmSummary").textContent.includes("not set"),
+    h.el("instanceConfirmSummary").textContent);
+}
+
+{
+  // ⚠️ A name is optional. Requiring one would block a deploy over a label
+  // the operator can add in ten seconds afterwards.
+  const h = harness({ ...CAPACITY });
+  h.pick("dynamic");
+  h.slug("corona");
+  h.agencyName("");
+  check("a deployment without a name is still allowed",
+    h.problem() === null, String(h.problem()));
+}
+
+// --- naming a deployment that already exists -------------------------------- //
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, agency_name: "" }],
+             capacity: { ...CAPACITY } });
+  const row = h.el("instanceRows").children[0];
+
+  check("an unnamed deployment offers to be named",
+    labels(row).includes("Name"), JSON.stringify(labels(row)));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, agency_name: "Corona Fire Department" }],
+             capacity: { ...CAPACITY } });
+  const row = h.el("instanceRows").children[0];
+
+  check("a named deployment shows its agency",
+    labels(row).includes("Corona Fire Department"), JSON.stringify(labels(row)));
+  check("and offers to be renamed rather than named",
+    labels(row).includes("Rename") && !labels(row).includes("Name"),
+    JSON.stringify(labels(row)));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openName({ slug: "corona", agency_name: "Corona Fire Department" });
+
+  check("the rename dialog names the deployment",
+    h.el("nameTitle").textContent === "Rename corona",
+    h.el("nameTitle").textContent);
+  check("and the hostname it serves",
+    h.el("nameWhat").textContent.includes("atlas.corona.leckliter.net"),
+    h.el("nameWhat").textContent);
+  // ⚠️ Seeded, so correcting one character does not mean retyping fifty
+  // from memory.
+  check("the field starts from what is set",
+    h.el("nameField").value === "Corona Fire Department",
+    h.el("nameField").value);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openName({ slug: "redlands", agency_name: "" });
+
+  check("naming an unnamed deployment starts empty",
+    h.el("nameField").value === "");
+  check("and says so in the title",
+    h.el("nameTitle").textContent === "Name redlands",
+    h.el("nameTitle").textContent);
 }
 
 console.log(fails === 0

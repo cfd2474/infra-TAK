@@ -58,7 +58,7 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.47.3'
+ATLAS_TAG = 'v1.48.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -75,7 +75,7 @@ ATLAS_TAG = 'v1.47.3'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = '8b730f769e26fcfc44f5f6247fa0d36c4fcd41ef'
+ATLAS_SHA = '68d1fdbd4671b2419a446d6387a27b5e6813a041'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -535,7 +535,8 @@ def save_instances(ctx, instances):
     return instances
 
 
-def add_instance(ctx, agency_specific, slug, mode, size_gb):
+def add_instance(ctx, agency_specific, slug, mode, size_gb,
+                 agency_name=''):
     """Validate and record a new deployment. `(instance, error)`.
 
     ⚠️ Records it **before** anything is built, so the slug is claimed and a
@@ -559,6 +560,10 @@ def add_instance(ctx, agency_specific, slug, mode, size_gb):
     if err:
         return None, err
 
+    agency_name, err = atlas_instances.validate_agency_name(agency_name)
+    if err:
+        return None, err
+
     if mode == atlas_instances.MODE_DYNAMIC:
         # ⚠️ Not asked for, by design: a dynamic deployment shares whatever is
         # left rather than claiming a slice of it, so its ceiling *is* the pool.
@@ -576,9 +581,88 @@ def add_instance(ctx, agency_specific, slug, mode, size_gb):
     inst = atlas_instances.make(
         slug, mode, size_gb,
         atlas_instances.next_port(instances, taken=_ports_in_use()),
+        agency_name=agency_name,
     )
     save_instances(ctx, instances + [inst])
     return inst, None
+
+
+def write_env_value(env_path, key, value):
+    """Set one `KEY=value` line in a `.env`, adding it if it is absent.
+
+    Returns True when the file changed.
+
+    ⚠️ **Appends when the key is missing**, because a deployment made before
+    the key existed has an `.env` without it — and `deploy` is the only thing
+    that rewrites the file wholesale, so without this the only way to add a
+    setting to a running deployment would be to deploy it again.
+
+    ⚠️ Rewrites the *line*, not a substring. A value containing the key's own
+    name, or a comment mentioning it, must not be what gets replaced.
+    """
+    try:
+        with open(env_path, 'r', encoding='utf-8') as handle:
+            body = handle.read()
+    except OSError:
+        return False
+    line = '%s=%s' % (key, value)
+    out, replaced = [], False
+    for existing in body.splitlines():
+        if existing.startswith(key + '='):
+            out.append(line)
+            replaced = True
+        else:
+            out.append(existing)
+    if not replaced:
+        out.append(line)
+    new_body = chr(10).join(out) + chr(10)
+    if new_body == body:
+        return False
+    with open(env_path, 'w', encoding='utf-8') as handle:
+        handle.write(new_body)
+    return True
+
+
+def set_agency_name(ctx, inst, raw_name):
+    """Name a deployment that is already built. `(steps, error)`.
+
+    ⚠️ **This exists because `deploy` is the only thing that writes `.env`.**
+    `config.py` says it out loud — *"the InfraTAK module rewrites `.env` on
+    deploy but not on update"* — so without this the name could only be set by
+    tearing a deployment down and building it again, and the feature would ship
+    unusable on every deployment that already exists.
+    """
+    name, err = atlas_instances.validate_agency_name(raw_name)
+    if err:
+        return [], err
+
+    paths = instance_paths(ctx, inst)
+    env_path = os.path.join(paths['dir'], '.env')
+    if not os.path.exists(env_path):
+        return [], 'That deployment has no configuration on disk yet.'
+
+    steps = []
+    remaining = []
+    for other in load_instances(ctx):
+        if (other.get('slug') or None) == (inst or {}).get('slug'):
+            other = dict(other, agency_name=name)
+        remaining.append(other)
+    save_instances(ctx, remaining)
+    steps.append('Recorded' if name else 'Name cleared')
+
+    write_env_value(env_path, 'TAKMDM_AGENCY_NAME', name)
+    steps.append('Written to the deployment configuration')
+
+    # ⚠️ A restart, because the application reads its settings once at startup.
+    # Skipping it would record the name, write the file, report success — and
+    # show the old footer until something else happened to restart the
+    # container, which could be weeks.
+    r = _compose(ctx, 'restart api', timeout=180, inst=inst)
+    if r.returncode != 0:
+        return steps, compose_error(r, 'docker compose restart')
+    steps.append('%s restarted — the footer shows it now'
+                 % atlas_instances.derive(inst)['name'])
+    return steps, None
 
 
 def drop_instance(ctx, slug):
@@ -811,6 +895,10 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
         # ⚠️ Both versions, when asked. They agree on a healthy deployment;
         # when they do not, the running one is the truth and the difference is a
         # rebuild that did not take.
+        # ⚠️ From the record. The deployment's own `.env` has it too, but the
+        # record is what the page edits and what survives a container that is
+        # not running.
+        'agency_name': inst.get('agency_name') or '',
         'version': _installed_version(ctx, inst),
         'running_version': (_running_version(ctx, inst)
                             if running and probe_version else None),
@@ -825,7 +913,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
 #: say so. A name in this list is a promise the route keeps and the page may
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
-                   'running', 'version', 'running_version', 'paths')
+                   'running', 'version', 'running_version', 'agency_name',
+                   'paths')
 
 
 def instances_payload(ctx, size_gb=None):
@@ -2113,6 +2202,10 @@ def deployment_identity(ctx, inst, settings):
         'app_port': paths['port'],
         'settings_prefix': paths['settings_prefix'],
         'compose_project': paths['compose_project'],
+        # ⚠️ From the *record*, not from `derive`: this is operator text the
+        # console stores, not a name the module can compute. `derive` knows
+        # `atlas-corona`; only the record knows "Corona Fire Department".
+        'agency_name': (inst or {}).get('agency_name') or '',
         # Empty rather than a half-formed URL: a box with no domain resolved
         # cannot enrol devices, and `https://:8449` in a QR would fail on the
         # tablet with nothing to point at.
@@ -2416,6 +2509,7 @@ def deploy(ctx, job, params):
             device_url=_me['device_url'],
             apk_url=_me['apk_url'],
             console_url=_me['console_url'],
+            agency_name=_me['agency_name'],
         ), perm=0o600)
         # ⚠️ The allocated port, not `APP_PORT`. Two deployments both binding
         # 127.0.0.1:8760 would leave the second failing to start with a port
@@ -3619,6 +3713,16 @@ TAKMDM_AGENT_APK_URL={apk_url}
 # The console's public origin, for the cross-origin check.
 TAKMDM_CONSOLE_ORIGIN={console_url}
 
+# Who this deployment serves, shown in the footer of every page of its console.
+#
+# One box can run several ATLAS deployments side by side, one per agency, and
+# once you are signed in they are identical — the hostname is not on screen.
+# An administrator supporting two of them needs to know which console is in
+# front of them before they push a policy or wipe a tablet.
+#
+# Blank is the ordinary case for a single-agency box and renders nothing.
+TAKMDM_AGENCY_NAME={agency_name}
+
 # Authentik terminates administrator sign-in and forwards the identity.
 TAKMDM_ADMIN_AUTH_MODE=forward_auth
 
@@ -3974,6 +4078,7 @@ def register(ctx):
             data.get('slug'),
             data.get('mode'),
             data.get('size_gb'),
+            data.get('agency_name'),
         )
         if err:
             return jsonify({'success': False, 'error': err}), 400
@@ -4159,6 +4264,21 @@ def register(ctx):
             'entries': list(slot['log']),
         })
 
+    def instance_name_view(slug):
+        """Name a deployment that already exists, or clear its name."""
+        from flask import request as _rq
+
+        inst = _addressed(slug)
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        data = _rq.get_json(silent=True) or {}
+        steps, err = set_agency_name(ctx, inst, data.get('agency_name'))
+        if err:
+            return jsonify({'success': False, 'error': err,
+                            'steps': steps}), 400
+        return jsonify({'success': True, 'steps': steps})
+
     def instance_control_view(slug):
         """Start, stop or restart one deployment.
 
@@ -4223,6 +4343,8 @@ def register(ctx):
              'endpoint': f'{KEY}_update_all_status', 'view': update_all_status_view},
             {'url': f'/api/{KEY}/instances/<slug>/control', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_control', 'view': instance_control_view},
+            {'url': f'/api/{KEY}/instances/<slug>/name', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_name', 'view': instance_name_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_remove', 'view': instance_remove_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
