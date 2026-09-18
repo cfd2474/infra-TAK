@@ -752,3 +752,14 @@ def test_a_finished_removal_reloads_the_page(idle):
     done = body[body.index("'done'"):]
 
     assert "location.reload()" in done, done[:200]
+
+
+def test_the_agency_name_field_has_no_placeholder(idle):
+    """⚠️ Operator decision, 2026-09-18. A greyed-out example in an agency-name
+    field reads as a value that is already there — and a field that is optional
+    *and* looks filled in is one an operator walks past. The prose below it says
+    what it is for."""
+    field = attrs_of(idle, "agencyName")
+
+    assert field is not None
+    assert "placeholder" not in field, field

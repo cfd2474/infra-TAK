@@ -218,8 +218,13 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
                style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
           Agency name
         </label>
+        <!--
+          ⚠️ No placeholder, by operator decision. A greyed-out example in an
+          agency-name field reads as a value that is already there — and a
+          field that is *optional* and looks filled in is one an operator walks
+          past. The prose below says what it is for.
+        -->
         <input type="text" id="agencyName" maxlength="60"
-               placeholder="Corona Fire Department"
                oninput="previewSlug()"
                style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
         <p class="note" style="margin:6px 0 0">
