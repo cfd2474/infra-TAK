@@ -726,17 +726,30 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
 <div class="modal-overlay" id="uninstallModal">
   <div class="modal">
     <h3>Uninstall ATLAS</h3>
+    <!--
+      ⚠️ **It removes every deployment, and the prose used to hide that.** This
+      text was written when a box ran one ATLAS: "the database volume", "the
+      device CA", "the ATLAS application" — all singular. On a box with three
+      agencies the same button destroys three fleets, and an operator reading
+      this would reasonably believe otherwise. The list is filled from the
+      deployments actually on the box, so it cannot drift from them.
+    -->
     <p class="note">
-      Removes ATLAS completely: containers, images, the database volume, the
-      install directory, the Caddy vhosts, the firewall rule, and the ATLAS
-      application in Authentik. Installing again rebuilds all of it from
-      scratch.
+      Removes ATLAS completely: every deployment on this box, with its
+      containers, images, database volume, reserved store, install directory,
+      Caddy vhosts and its own Authentik application. Installing again rebuilds
+      all of it from scratch.
     </p>
+    <div id="uninstallScope" hidden class="cmd" style="margin-top:10px"></div>
     <p class="note" style="margin-top:10px;color:var(--red)">
-      ⚠️ <strong>This destroys the device CA and the database.</strong> Every
-      enrolled tablet's identity is signed by that CA. Once it is gone they
-      cannot be re-adopted — each needs a factory reset, in person. There is no
-      undo and no backup taken.
+      ⚠️ <strong>This destroys every device CA and every database.</strong>
+      Each enrolled tablet's identity is signed by its own deployment's CA. Once
+      those are gone the tablets cannot be re-adopted — each needs a factory
+      reset, in person. There is no undo and no backup taken.
+    </p>
+    <p class="note" style="margin-top:10px" id="uninstallOneInstead" hidden>
+      To remove a single deployment and leave the others running, use
+      <strong>Remove</strong> on its row instead.
     </p>
     <input type="password" id="uninstallPw" placeholder="Console password">
     <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end" id="uninstallButtons">
@@ -780,11 +793,17 @@ let polling = false;
 
 let capacityState = null;
 
+//: The deployments the page last heard about. ⚠️ Kept so the uninstall dialog
+//: can name what it is about to destroy without a second request — and so it
+//: cannot name a list that disagrees with the one on screen above it.
+let lastInstances = [];
+
 function renderInstances(data){
   const list = document.getElementById('instanceList');
   const panel = document.getElementById('capacityPanel');
   if (!list) return;
   capacityState = data.capacity || {};
+  lastInstances = data.instances || [];
 
   const rows = (data.instances || []).map(i => {
     const name = i.slug ? i.slug : 'general (no slug)';
@@ -1524,7 +1543,25 @@ function loadLogs(){
   });
 }
 
-function openUninstall(){ document.getElementById('uninstallModal').classList.add('open'); }
+function openUninstall(){
+  // ⚠️ Named, not counted. "3 deployments" is a number an operator can misread
+  // as "3 of something else"; "corona, test, redlands" is the thing they will
+  // recognise, and the thing they will notice is missing if it is wrong.
+  const scope = document.getElementById('uninstallScope');
+  const one = document.getElementById('uninstallOneInstead');
+  const names = lastInstances.map(i => (i.agency_name || i.slug || 'general'));
+  if (scope){
+    scope.hidden = names.length === 0;
+    scope.textContent = names.length
+      ? 'This will destroy ' + names.length + ' deployment'
+        + (names.length === 1 ? '' : 's') + ':' + String.fromCharCode(10)
+        + names.map(n => '  ' + n).join(String.fromCharCode(10))
+      : '';
+  }
+  // Only worth offering when there is another one to leave running.
+  if (one) one.hidden = names.length < 2;
+  document.getElementById('uninstallModal').classList.add('open');
+}
 function closeUninstall(){ document.getElementById('uninstallModal').classList.remove('open'); }
 
 async function doUninstall(){

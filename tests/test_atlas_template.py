@@ -811,3 +811,52 @@ def test_the_agency_name_field_has_no_placeholder(idle):
 
     assert field is not None
     assert "placeholder" not in field, field
+
+
+# --------------------------------------------------------------------------- #
+# What uninstall actually removes (W223)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ It removes **every** deployment — `uninstall` iterates `load_instances` and
+# runs the full teardown on each. The dialog's prose said otherwise: "the
+# database volume", "the device CA", "the ATLAS application", all singular,
+# written when a box ran one ATLAS. Operator asked what the button did, which is
+# the clearest evidence the wording was not carrying it.
+
+
+def test_the_uninstall_dialog_says_every_deployment(idle):
+    modal = idle[idle.index('id="uninstallModal"'):][:1800]
+
+    assert "every deployment on this box" in modal, modal[:400]
+
+
+def test_it_warns_about_every_certificate_authority_not_one(idle):
+    """⚠️ Each deployment has its own CA and its own fleet. "the device CA"
+    understates the blast radius by however many agencies the box runs."""
+    modal = idle[idle.index('id="uninstallModal"'):][:1800]
+
+    assert "every device CA and every database" in modal, modal[:600]
+
+
+def test_it_has_somewhere_to_list_them(idle):
+    assert attrs_of(idle, "uninstallScope") is not None
+    assert "hidden" in (attrs_of(idle, "uninstallScope") or "")
+
+
+def test_it_points_at_the_per_deployment_alternative(idle):
+    """An operator who wanted to remove one agency should not discover that by
+    removing all of them."""
+    assert attrs_of(idle, "uninstallOneInstead") is not None
+    assert "leave the others running" in idle
+
+
+def test_the_module_really_does_remove_them_all():
+    """⚠️ The prose is only worth fixing if it is true. Asserted against the
+    function, so a change to either has to face the other."""
+    source = (ROOT / "modules" / "atlas.py").read_text(encoding="utf-8")
+    start = source.index(chr(10) + "def uninstall(")
+    end = source.index(chr(10) + "def ", start + 1)
+    body = source[start:end]
+
+    assert "for inst in found:" in body
+    assert "remove_instance(ctx, inst)" in body

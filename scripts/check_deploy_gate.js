@@ -33,7 +33,10 @@ const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
 // ⚠️ Starts at `renderInstances` so the button wording is driven too: it
 // is the one rule that depends on how many deployments came back.
 const start = scripts.indexOf("function renderInstances");
-const end = scripts.indexOf("function refreshCapacity");
+// ⚠️ Past `openUninstall`, which is the one dialog that destroys every
+// deployment on the box — and the one whose prose said otherwise until an
+// operator asked what it did. `closeUninstall` is the next definition after it.
+const end = scripts.indexOf("function closeUninstall");
 if (start < 0 || end < 0) {
   console.log("  FAIL the deployment form's script is not on the page in the shape expected");
   process.exit(1);
@@ -131,7 +134,8 @@ function harness(capacity) {
     + "ctx.openRemove = openRemove; ctx.removeGate = refreshRemoveGate;"
     + "ctx.openName = openNameDeployment;"
     + "ctx.doRemove = doRemove; ctx.askAgain = removeAskAgain;"
-    + "ctx.renderRemoval = renderRemoval;");
+    + "ctx.renderRemoval = renderRemoval;"
+    + "ctx.openUninstall = openUninstall;");
 
   return {
     el,
@@ -142,6 +146,7 @@ function harness(capacity) {
     doRemove: ctx.doRemove,
     askAgain: ctx.askAgain,
     renderRemoval: ctx.renderRemoval,
+    openUninstall: ctx.openUninstall,
     typeConfirm(v) { el("removeConfirm").value = v; ctx.removeGate(); },
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
@@ -932,6 +937,59 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
 
   check("an unfinished deployment has no row to badge",
     h.el("instanceRows").children.length === 0);
+}
+
+// --- uninstall says how much it destroys ----------------------------------- //
+//
+// ⚠️ It removes **every** deployment, and the prose hid that. The text was
+// written when a box ran one ATLAS — "the database volume", "the device CA",
+// "the ATLAS application", all singular. On a box with three agencies the same
+// button destroys three fleets. Operator asked what it did, which is the
+// clearest evidence the wording was not carrying it.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [
+      { ...RUNNING, agency_name: "Corona Fire" },
+      { ...STOPPED, agency_name: "Test Agency" },
+    ], capacity: { ...CAPACITY } });
+  h.openUninstall();
+  const scope = h.el("uninstallScope").textContent;
+
+  check("the uninstall dialog counts the deployments",
+    scope.includes("destroy 2 deployments"), scope);
+  check("and names them",
+    scope.includes("Corona Fire") && scope.includes("Test Agency"), scope);
+  check("the list is shown", h.el("uninstallScope").hidden === false);
+  // ⚠️ Only worth offering when there is another one to leave running.
+  check("and it points at the per-deployment Remove instead",
+    h.el("uninstallOneInstead").hidden === false);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ ...RUNNING, agency_name: "" }],
+             capacity: { ...CAPACITY } });
+  h.openUninstall();
+  const scope = h.el("uninstallScope").textContent;
+
+  check("one deployment is not called two",
+    scope.includes("destroy 1 deployment") && !scope.includes("deployments"),
+    scope);
+  check("an unnamed deployment is listed by its slug",
+    scope.includes("corona"), scope);
+  // Nothing else survives it, so there is no alternative to point at.
+  check("with one deployment no alternative is offered",
+    h.el("uninstallOneInstead").hidden === true);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [], capacity: { ...CAPACITY } });
+  h.openUninstall();
+
+  check("a box with nothing deployed lists nothing",
+    h.el("uninstallScope").hidden === true);
 }
 
 console.log(fails === 0
