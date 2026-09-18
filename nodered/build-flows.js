@@ -5358,10 +5358,21 @@ const FN_PP_POLL_V2 = [
   "if (!Array.isArray(_cfgs)) { try { _cfgs = JSON.parse(_cfgs); } catch(e) { _cfgs = []; } }",
   "var cfg = _cfgs.find(function(c){ return c.configName === _cn; }) || {};",
   "if (!cfg.activated) return null;",
-  "var intervalMs = Math.max(15, Number(cfg.pollIntervalSec) || 120) * 1000;",
+  "var intervalMs = Math.max(15, Number(cfg.pollIntervalSec) || 60) * 1000;",
   "var lastKey = 'pp_last_fetch___FEED_ID__';",
   "var lastFetch = global.get(lastKey) || 0;",
-  "if ((Date.now() - lastFetch) < intervalMs) return null;",
+  // The inject fires on a FIXED period, but pp_last_fetch is stamped at the END of the
+  // previous fetch->build->stream cycle (see FN_PP_BUILD). Elapsed was therefore always
+  // short by that cycle's duration, every other tick failed this test, and the real poll
+  // rate was exactly HALF the configured one -- a 15s config measured as 30s actual on
+  // test6 2026-09-18. The stale deadline (pollSec + 15) then coincided with the refresh
+  // instead of leading it, so a marker could expire on the device just as its replacement
+  // arrived. Allow a tolerance so a fixed-period inject lands on the tick it was scheduled
+  // for. The default above is 60 to match effPollSec in FN_PP_BUILD: they were 120 and 60,
+  // so an unset pollIntervalSec polled every 120s while marking CoT stale after 75s --
+  // permanently expired between polls.
+  "var tolMs = Math.min(5000, Math.floor(intervalMs / 4));",
+  "if ((Date.now() - lastFetch) < (intervalMs - tolMs)) return null;",
   "msg._ppCfg = cfg;",
   "return msg;"
 ].join('\n');
