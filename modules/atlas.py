@@ -59,7 +59,7 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.49.0'
+ATLAS_TAG = 'v1.50.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -76,7 +76,7 @@ ATLAS_TAG = 'v1.49.0'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
+ATLAS_SHA = 'fff55004efbe09fb62f120639a4c518ff5e3c554'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
