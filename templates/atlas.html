@@ -105,7 +105,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
 
     <button class="btn btn-primary" id="addInstanceBtn"
             onclick="openAddInstance()" style="margin-top:16px">
-      Deploy additional instance
+      Deploy instance
     </button>
 
     <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
@@ -645,6 +645,15 @@ function renderInstances(data){
   list.textContent = rows.length
     ? 'Deployments on this box:\n' + rows.join('\n')
     : 'No ATLAS deployment on this box yet.';
+
+  // ⚠️ "Deploy additional instance" on a box with none is a contradiction,
+  // so the wording follows the count. The markup ships the empty-box form, so
+  // a fresh box reads correctly on first paint rather than flashing the wrong
+  // one while the capacity fetch is in flight.
+  const add = document.getElementById('addInstanceBtn');
+  if (add) add.textContent = rows.length
+    ? 'Deploy additional instance'
+    : 'Deploy instance';
 
   // ⚠️ The question disappears from the server's own predicate, never from a
   // count made here — the page and the validator must not be able to disagree.

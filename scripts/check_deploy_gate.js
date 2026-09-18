@@ -30,7 +30,9 @@ const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .replace(/\{%[\s\S]*?%\}/g, "")
   .replace(/\{\{[\s\S]*?\}\}/g, "null");
 
-const start = scripts.indexOf("function currentMode");
+// ⚠️ Starts at `renderInstances` so the button wording is driven too: it
+// is the one rule that depends on how many deployments came back.
+const start = scripts.indexOf("function renderInstances");
 const end = scripts.indexOf("function refreshCapacity");
 if (start < 0 || end < 0) {
   console.log("  FAIL the deployment form's script is not on the page in the shape expected");
@@ -94,12 +96,14 @@ function harness(capacity) {
   // eslint-disable-next-line no-eval
   eval(source
     + "\n;ctx.problem = addInstanceProblem; ctx.gate = refreshAddGate;"
+    + "ctx.render = renderInstances;"
     + "ctx.onMode = onModeChanged; ctx.preview = previewSlug;"
     + "ctx.open = openInstanceConfirm; ctx.close = closeInstanceConfirm;");
 
   return {
     el,
     problem: ctx.problem, open: ctx.open, close: ctx.close,
+    render: ctx.render,
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
       radios.fixed.checked = mode === "fixed";
@@ -245,6 +249,26 @@ function harness(capacity) {
   const summary = h.el("instanceConfirmSummary").textContent;
   check("a general dynamic deployment summarises as sharing the pool",
     summary.includes("shares the") && summary.includes("general ATLAS"), summary);
+}
+
+// --- the button says what it can actually do -------------------------------- //
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [], capacity: { ...CAPACITY } });
+  check("with nothing deployed the button says 'Deploy instance'",
+    h.el("addInstanceBtn").textContent === "Deploy instance",
+    h.el("addInstanceBtn").textContent);
+
+  h.render({ instances: [{ slug: null, mode: "dynamic", size_gb: 50 }],
+             capacity: { ...CAPACITY, may_deploy_plain: false } });
+  check("once one exists it says 'Deploy additional instance'",
+    h.el("addInstanceBtn").textContent === "Deploy additional instance",
+    h.el("addInstanceBtn").textContent);
+
+  h.render({ instances: [], capacity: { ...CAPACITY } });
+  check("and it goes back when the last one is removed",
+    h.el("addInstanceBtn").textContent === "Deploy instance",
+    h.el("addInstanceBtn").textContent);
 }
 
 console.log(fails === 0

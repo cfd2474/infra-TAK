@@ -570,3 +570,25 @@ def test_exactly_one_sizing_mode_is_preselected(installed):
     checked = re.findall(r'name="sizeMode" value="(\w+)" checked', installed)
 
     assert checked == ["dynamic"]
+
+
+def test_the_button_does_not_offer_to_add_to_nothing(installed):
+    """⚠️ "Deploy additional instance" on a box with none is a contradiction.
+
+    The markup ships the empty-box wording so a fresh box reads correctly on
+    first paint, and `renderInstances` corrects it once the count is known —
+    rather than the other way round, which would flash the wrong word at exactly
+    the operator who has never deployed anything.
+    """
+    button = installed[installed.index('id="addInstanceBtn"'):][:260]
+
+    assert 'Deploy instance' in button
+    assert 'Deploy additional instance' not in button
+
+
+def test_the_wording_follows_the_count(installed):
+    body = function_body(installed, 'renderInstances')
+
+    assert "rows.length" in body
+    assert "'Deploy additional instance'" in body
+    assert "'Deploy instance'" in body
