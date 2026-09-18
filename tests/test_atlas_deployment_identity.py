@@ -119,9 +119,14 @@ def test_the_env_host_is_the_host_caddy_serves(monkeypatch, tmp_path, ctx, slug)
     hostname with no site — and the failure would surface days later, on
     hardware, as "the tablet cannot check in"."""
     monkeypatch.setattr(atlas, 'sync_device_ca_for_caddy', lambda inst=None: None)
-    inst = None if slug is None else ai.make(slug, ai.MODE_DYNAMIC, 50, 8761)
-    settings = {'atlas_enabled': True,
-                ai.INSTANCES_KEY: [i for i in [inst] if i]}
+    inst = (ai.make(None, ai.MODE_FIXED, 100, 8760) if slug is None
+            else ai.make(slug, ai.MODE_DYNAMIC, 50, 8761))
+    # ⚠️ Recorded explicitly. This used to leave the list empty for the plain
+    # case and lean on `load_instances` synthesising one — the migration path
+    # for boxes that predate the list. An empty list now means *no* deployment,
+    # which is what removing the last one leaves behind, so a test that relied
+    # on the old conflation was describing a box that cannot exist.
+    settings = {'atlas_enabled': True, ai.INSTANCES_KEY: [inst]}
 
     me = atlas.deployment_identity(ctx, inst, settings)
     sites = atlas.caddy_sites(settings, PLAIN_HOST)

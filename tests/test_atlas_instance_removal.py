@@ -684,3 +684,101 @@ def test_an_agency_s_trust_pool_is_looked_for_under_its_own_name(monkeypatch):
 
     assert seen
     assert all(os.path.basename(p) == 'atlas-corona' for p in seen), seen
+
+
+# --------------------------------------------------------------------------- #
+# When a removal must wait
+# --------------------------------------------------------------------------- #
+
+
+def test_a_quiet_box_allows_a_removal():
+    assert atlas.removal_refusal({'slug': 'corona'}) is None
+
+
+def test_a_removal_will_not_run_during_a_deploy():
+    """⚠️ **Measured on the box, 2026-09-18.** A removal started while a deploy
+    was at step 4, ran `docker compose down -v` over the containers the deploy
+    had just created, and the deploy failed three seconds later. An unfinished
+    deployment is exactly what a deploy *in progress* looks like, so the page's
+    retry row sat beside a running build offering to delete it."""
+    refusal = atlas.removal_refusal({'slug': 'corona'}, deploy_running=True)
+
+    assert refusal and 'being built' in refusal
+
+
+def test_any_deploy_blocks_any_removal():
+    """⚠️ The registry runs deploy under the module's own job key whatever is
+    being built, so one slot covers the box. Refusing too widely costs a wait;
+    refusing too narrowly costs a deployment."""
+    assert atlas.removal_refusal(None, deploy_running=True)
+    assert atlas.removal_refusal({'slug': 'redlands'}, deploy_running=True)
+
+
+def test_a_removal_will_not_run_during_that_deployment_s_update():
+    atlas._update_slot({'slug': 'corona'})['running'] = True
+
+    refusal = atlas.removal_refusal({'slug': 'corona'})
+
+    assert refusal and 'update' in refusal
+
+
+def test_another_deployment_s_update_does_not_block_this_removal():
+    """They share no containers and no checkout. Blocking here would make a box
+    with five agencies unmanageable whenever any one of them was updating."""
+    atlas._update_slot({'slug': 'redlands'})['running'] = True
+
+    assert atlas.removal_refusal({'slug': 'corona'}) is None
+
+
+def test_update_all_blocks_every_removal():
+    """It walks every deployment in turn, so any of them may be the one being
+    rebuilt at the moment the button is pressed."""
+    atlas._update_all_status['running'] = True
+    try:
+        assert atlas.removal_refusal({'slug': 'corona'})
+    finally:
+        atlas._update_all_status['running'] = False
+
+
+def test_a_removal_will_not_run_twice():
+    atlas._removal_slot({'slug': 'corona'})['running'] = True
+
+    refusal = atlas.removal_refusal({'slug': 'corona'})
+
+    assert refusal and 'already being removed' in refusal
+
+
+# --------------------------------------------------------------------------- #
+# What an empty list means
+# --------------------------------------------------------------------------- #
+
+
+def test_removing_the_last_deployment_leaves_none(box, actions):
+    """⚠️ **The phantom.** `if stored:` treated an empty list and a missing key
+    as the same thing, so removing the last deployment — which leaves `[]` and
+    `atlas_enabled` still true, because the module is still installed — fell
+    through to the migration branch and synthesised a plain deployment that does
+    not exist. The page would list it, refuse a new general ATLAS as a duplicate
+    of it, and offer to update a directory that is not there."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    ctx = _make_box(box, [inst])
+
+    atlas.remove_instance(ctx, inst)
+
+    assert ctx.settings.get('atlas_enabled') is True
+    assert atlas.load_instances(ctx) == []
+
+
+def test_a_box_that_predates_the_list_still_migrates(monkeypatch, tmp_path):
+    """⚠️ And the branch that empty list must not trigger is still reachable by
+    the box it was written for: installed before `atlas_instances` existed, so
+    the key is *absent* rather than empty."""
+    image = tmp_path / 'store.img'
+    image.write_bytes(bytes(1024))
+    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(image))
+    ctx = {'load_settings': lambda: {'atlas_enabled': True}}
+
+    found = atlas.load_instances(ctx)
+
+    assert len(found) == 1
+    assert found[0]['slug'] is None

@@ -715,7 +715,7 @@ function renderInstances(data){
   const unfinished = (data.instances || []).filter(i => !i.built);
   const retry = document.getElementById('retryRow');
   if (retry){
-    retry.hidden = unfinished.length === 0;
+    retry.hidden = unfinished.length === 0 || polling;
     retry.innerHTML = '';
     unfinished.forEach(i => {
       const b = document.createElement('button');
@@ -723,16 +723,23 @@ function renderInstances(data){
       b.style.marginRight = '8px';
       b.textContent = 'Finish deploying ' + (i.slug || 'the general ATLAS');
       b.onclick = () => startDeployFor(i);
-      retry.appendChild(b);
+      // ⚠️ A second "finish" during a build starts the same deploy twice. The
+      // registry's job slot refuses it, but a button that silently does
+      // nothing reads as a broken page.
+      if (!polling) retry.appendChild(b);
       // ⚠️ **Abandoning it has to be possible too.** "Forget" refuses once a
       // directory exists on disk — which is exactly what a deploy that cloned
       // and then failed leaves behind — so without this the only way out of a
       // failed deploy was to finish it. The slug stays claimed either way, and
       // an operator who has changed their mind is left with a name they cannot
       // reuse and a store they cannot reclaim.
-      retry.appendChild(rowButton('Remove ' + (i.slug || 'the general ATLAS'),
-                                  'btn-danger',
-                                  function(){ openRemove(i); }));
+      // ⚠️ Same rule, and this is the one that was actually pressed: an
+      // unfinished deployment is exactly what a deploy *in progress* looks
+      // like, so this button sat beside a running build offering to delete it.
+      if (!polling)
+        retry.appendChild(rowButton('Remove ' + (i.slug || 'the general ATLAS'),
+                                    'btn-danger',
+                                    function(){ openRemove(i); }));
     });
   }
   list.textContent = rows.length
@@ -857,8 +864,14 @@ function instanceRow(i){
   if (i.running)
     row.appendChild(rowButton('Stop', 'btn-secondary',
                               function(){ controlInstance(i, 'stop'); }));
-  row.appendChild(rowButton('Remove', 'btn-danger',
-                            function(){ openRemove(i); }));
+  // ⚠️ **Not while something is being built.** Measured on the box
+  // 2026-09-18: a removal started during a deploy ran `docker compose down -v`
+  // over the containers the deploy had just created, and the deploy failed
+  // three seconds later. The server refuses this too — this is so the button
+  // is not there to be pressed in the first place.
+  if (!polling)
+    row.appendChild(rowButton('Remove', 'btn-danger',
+                              function(){ openRemove(i); }));
   return row;
 }
 

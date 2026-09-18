@@ -39,7 +39,7 @@ import subprocess
 # would have waited for the worst possible moment to surface.
 import time
 
-from . import register_module, job_log
+from . import register_module, job_log, job_state
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
@@ -504,7 +504,14 @@ def load_instances(ctx):
     """
     settings = ctx['load_settings']() if ctx else {}
     stored = settings.get(atlas_instances.INSTANCES_KEY)
-    if stored:
+    # ⚠️ **An empty list is an answer; a missing key is not.** `if stored:` made
+    # them the same, so removing the *last* deployment — which leaves `[]` and
+    # `atlas_enabled` still true, because the module is still installed — fell
+    # through to the migration branch below and synthesised a plain deployment
+    # that does not exist. The page would then list a phantom, refuse a new
+    # general ATLAS as a duplicate of it, and offer to update a directory that
+    # is not there.
+    if stored is not None:
         return [dict(i) for i in stored]
 
     if not settings.get(f'{KEY}_enabled'):
@@ -1844,6 +1851,32 @@ def _compose_argv(ctx, *action, inst=None):
     return argv + list(action)
 
 
+def compose_error(result, what='docker compose'):
+    """What a failed compose run actually said, or an honest admission.
+
+    ⚠️ **`stderr` alone loses the error.** Measured on the box 2026-09-18: a
+    deploy failed at step 4 and logged `docker compose up failed:` with nothing
+    after the colon, because compose had written the reason to **stdout** and
+    the message only read `stderr`. An operator was left with a failure that
+    explained nothing, and so was the next person to look at the journal.
+
+    ⚠️ The exit code is always included. When both streams are empty — compose
+    killed from outside, for instance — the code is the only fact there is, and
+    "said nothing" is worth saying out loud rather than rendering as a blank.
+    """
+    rc = getattr(result, 'returncode', None)
+    # stderr first: compose puts progress on stdout and diagnostics on stderr
+    # when it has both, so the diagnostic is the more useful tail.
+    for stream in ((result.stderr or ''), (result.stdout or '')):
+        text = stream.strip()
+        if text:
+            return '%s failed (exit %s):\n%s' % (what, rc, text[-1500:])
+    return ('%s failed (exit %s) and wrote nothing to either stream. That '
+            'usually means it was stopped from outside — check whether the '
+            'deployment was removed or the console restarted while it ran.'
+            % (what, rc))
+
+
 def _compose(ctx, action, timeout=180, inst=None):
     """Run `docker compose <action>` in the install directory, via the broker.
 
@@ -2297,7 +2330,7 @@ def deploy(ctx, job, params):
         # the only thing that should be terminating TLS.
         r = _compose(ctx, 'up -d --build api', timeout=1800, inst=_inst)
         if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed:\n{(r.stderr or "")[-500:]}')
+            raise RuntimeError(compose_error(r, 'docker compose up'))
         plog('✓ Containers built and started')
 
         # ⚠️ Only now can the bridge subnet be read — `docker compose up` is what
@@ -2771,6 +2804,34 @@ def _removal_slot(inst=None):
         atlas_instances.derive(inst)['job_key'], _new_slot())
 
 
+def removal_refusal(inst, deploy_running=False):
+    """Why this deployment must not be torn down right now, or None.
+
+    ⚠️ **Every one of these is a job that would be fighting over the same
+    containers and the same checkout.** The deploy case is not hypothetical:
+    measured on the box 2026-09-18, a removal started while a deploy was at
+    step 4, ran `docker compose down -v` over the containers the deploy had just
+    created, and the deploy failed three seconds later — with an empty message,
+    because it read only `stderr`. Two jobs each reporting honestly about a box
+    they were destroying for each other.
+
+    A function rather than four `if`s in the route, because the route needs
+    Flask to exist and this needs to be provable without it.
+    """
+    if _removal_slot(inst)['running']:
+        return 'That deployment is already being removed'
+    if _update_slot(inst)['running'] or _update_all_status['running']:
+        return 'An update is running — wait for it to finish'
+    if deploy_running:
+        # ⚠️ Any deploy, not this deployment's: the registry runs deploy under
+        # the module's own job key whatever is being built, so one slot covers
+        # the box. Refusing too widely here costs a wait; refusing too narrowly
+        # costs a deployment.
+        return ('A deployment is being built right now. Wait for it to finish '
+                'or fail before removing anything.')
+    return None
+
+
 def _run_removal(ctx, inst):
     """Tear one deployment down, in a thread, with a log the page can read.
 
@@ -3041,7 +3102,7 @@ def _run_update(ctx, inst=None):
         # device CA with it, and every enrolled tablet would need a factory reset.
         r = _compose(ctx, 'up -d --build api', timeout=1800, inst=inst)
         if r.returncode != 0:
-            raise RuntimeError('docker compose up failed: ' + (r.stderr or '')[-500:])
+            raise RuntimeError(compose_error(r, 'docker compose up'))
         plog('✓ Containers rebuilt — database and device CA untouched')
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
@@ -3919,17 +3980,9 @@ def register(ctx):
                 'error': 'Type %r to confirm removing this deployment.'
                          % expected,
             }), 400
-        if _removal_slot(inst)['running']:
-            return jsonify({'success': False,
-                            'error': 'That deployment is already being '
-                                     'removed'}), 409
-        # ⚠️ Refused during an update. The two would fight over the same
-        # checkout and containers, and an update that succeeded against files
-        # a removal had already deleted would report success over nothing.
-        if _update_slot(inst)['running'] or _update_all_status['running']:
-            return jsonify({'success': False,
-                            'error': 'An update is running — wait for it to '
-                                     'finish'}), 409
+        refusal = removal_refusal(inst, job_state(KEY).get('running'))
+        if refusal:
+            return jsonify({'success': False, 'error': refusal}), 409
         threading.Thread(target=_run_removal, args=(ctx, inst),
                          daemon=True).start()
         return jsonify({'success': True})

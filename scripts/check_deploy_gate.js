@@ -111,6 +111,11 @@ function harness(capacity) {
   // The page declares `capacityState` above this slice, so the extracted
   // functions resolve it up the scope chain to here.
   global.capacityState = capacity;
+  // ⚠️ And `polling`, which is true while a deploy is being built. The page
+  // hides every destructive control behind it, so a harness without it throws
+  // `polling is not defined` — which is the harness doing its job: the page
+  // grew a dependency and said so.
+  global.polling = false;
 
   const ctx = {};
   // eslint-disable-next-line no-eval
@@ -133,6 +138,7 @@ function harness(capacity) {
       ctx.onMode();
     },
     size(v) { el("instanceSize").value = v; ctx.gate(); },
+    building(on) { global.polling = !!on; },
     slug(v) { el("agencySlug").value = v; ctx.preview(); },
   };
 }
@@ -562,6 +568,50 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
     h.el("removeGo").disabled === true
     && h.el("removeConfirm").value === "",
     h.el("removeConfirm").value);
+}
+
+// --- nothing destructive while a deployment is being built ----------------- //
+//
+// ⚠️ **Measured, not imagined.** On the box, 2026-09-18: a removal started
+// while a deploy was at step 4, ran `docker compose down -v` over the containers
+// the deploy had just created, and the deploy failed three seconds later with an
+// empty message. An unfinished deployment is exactly what a deploy *in progress*
+// looks like, so the retry row sat beside a running build offering to delete it.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.building(true);
+  h.render({ instances: [RUNNING], capacity: { ...CAPACITY } });
+
+  check("a running deployment cannot be removed mid-build",
+    !labels(h.el("instanceRows").children[0]).includes("Remove"),
+    JSON.stringify(labels(h.el("instanceRows").children[0])));
+  check("but it can still be updated and restarted",
+    labels(h.el("instanceRows").children[0]).includes("Update"));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.building(true);
+  h.render({ instances: [UNFINISHED], capacity: { ...CAPACITY } });
+
+  check("the retry row stands down while a build is running",
+    h.el("retryRow").hidden === true);
+  check("offering neither finish nor remove",
+    h.el("retryRow").children.length === 0,
+    JSON.stringify(labels(h.el("retryRow"))));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.building(false);
+  h.render({ instances: [UNFINISHED], capacity: { ...CAPACITY } });
+
+  check("and comes back once the build is over",
+    h.el("retryRow").hidden === false
+    && labels(h.el("retryRow")).includes("Finish deploying gone")
+    && labels(h.el("retryRow")).includes("Remove gone"),
+    JSON.stringify(labels(h.el("retryRow"))));
 }
 
 console.log(fails === 0
