@@ -2261,6 +2261,17 @@ def deployment_identity(ctx, inst, settings):
     host = atlas_instances.agency_host(plain_host, paths['slug'])
     return {
         'slug': paths['slug'],
+        # ⚠️ **`_run_update` logs with this, and it was not here.** Every update
+        # of every deployment raised `KeyError: 'name'` on its second log line —
+        # and then again inside the `except` handler's own `plog`, so the job
+        # died without even recording the failure. It had never once run since
+        # chunk 8 introduced the reference.
+        #
+        # ⚠️ Nothing caught it. `_run_update` has no behavioural test; the
+        # chunk 7 guards check that it *passes* `inst=` everywhere, which a
+        # missing dict key is invisible to. `test_atlas_identity_keys` now
+        # checks every `_me[...]` read against what this actually returns.
+        'name': paths['name'],
         'dir': paths['dir'],
         'host': host,
         'app_port': paths['port'],

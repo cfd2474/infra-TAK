@@ -63,6 +63,22 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     A failure keeps it deliberately: that log is the only account of what went
     wrong, and it has to survive the refresh an operator reaches for first.
   -->
+  <!--
+    ⚠️ **At the top, beside the deploy log, for the same reason.** An update is
+    minutes of build output and an operator watches it; three cards down it was
+    off screen at the moment it started, and the only sign anything was
+    happening was a button that had stopped responding. Operator asked for it
+    here after watching an update fail with the card below the fold.
+
+    Hidden until something writes to it — `pollUpdate`, `pollUpdateAll` and the
+    removal poll all reveal it and set its title, so the card says which of the
+    three it is showing.
+  -->
+  <div class="card" id="updateCard" hidden>
+    <div class="card-title" id="updateLogTitle">Update log</div>
+    <div class="log-box" id="updateLog"></div>
+  </div>
+
   <div class="card" id="deployCard" {% if not deploy_running and not deploy_error %}style="display:none"{% endif %}>
     <div class="card-title">Deploy log</div>
     <!--
@@ -398,11 +414,6 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     </div>
 
     <div id="caBlocks"></div>
-  </div>
-
-  <div class="card" id="updateCard" hidden>
-    <div class="card-title" id="updateLogTitle">Update log</div>
-    <div class="log-box" id="updateLog"></div>
   </div>
 
   <div class="card">

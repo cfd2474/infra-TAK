@@ -43,7 +43,34 @@ def render(**ctx):
 
 
 def card_titles(html):
-    return re.findall(r'class="card-title">([^<]+)<', html)
+    """Every card's title, in page order.
+
+    ⚠️ **`[^>]*` is not decoration.** Without it this matched only titles whose
+    element carries no attributes, so the "Update log" card — whose title has an
+    `id` so the poll can retitle it — was invisible to every card-order
+    assertion in this file. Moving that card to the top changed nothing any test
+    could see.
+    """
+    return re.findall(r'class="card-title"[^>]*>([^<]+)<', html)
+
+
+def visible_cards(html):
+    """The cards an operator can actually see, in page order.
+
+    A card hidden by `hidden` or `display:none` is on the page and not on the
+    screen, and "first card" is a claim about the screen.
+    """
+    out = []
+    for match in re.finditer(r'<div class="card"([^>]*)>', html):
+        attrs = match.group(1)
+        rest = html[match.end():]
+        title = re.search(r'class="card-title"[^>]*>([^<]+)<', rest)
+        if not title:
+            continue
+        if ' hidden' in attrs or 'display:none' in attrs:
+            continue
+        out.append(title.group(1))
+    return out
 
 
 def attrs_of(html, element_id):
@@ -73,10 +100,31 @@ def installed():
 # --------------------------------------------------------------------------- #
 
 
-def test_the_deploy_log_is_the_first_card(idle):
+def test_the_deploy_log_is_the_first_card_an_operator_sees(deploying):
     """⚠️ It used to be last, below two cards of prose — so the one thing worth
-    watching for five to ten minutes was off-screen when it started moving."""
-    assert card_titles(idle)[0] == "Deploy log"
+    watching for five to ten minutes was off-screen when it started moving.
+
+    Asserted against the *visible* cards: the update-log card sits above it in
+    the markup and is hidden during a deploy, which is the whole arrangement.
+    """
+    assert visible_cards(deploying)[0] == "Deploy log"
+
+
+def test_both_log_cards_sit_above_the_deployments(idle):
+    """⚠️ The same reason, for the other long job. An update is minutes of build
+    output; three cards down it was off screen at the moment it started, and the
+    only sign anything was happening was a button that had stopped responding.
+    """
+    titles = card_titles(idle)
+
+    assert titles.index("Update log") < titles.index("ATLAS deployments")
+    assert titles.index("Deploy log") < titles.index("ATLAS deployments")
+
+
+def test_the_update_log_card_starts_hidden(idle):
+    """It is revealed by whichever poll writes to it, which also sets its title
+    — so the card says which of update, update-all or removal it is showing."""
+    assert "hidden" in (attrs_of(idle, "updateCard") or "")
 
 
 def test_the_deploy_log_is_above_install(deploying):
