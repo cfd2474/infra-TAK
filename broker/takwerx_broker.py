@@ -133,6 +133,16 @@ TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
 MODULE_DIR_NAMES = (
     'tak-video-restreamer', 'webodm', 'netbird', 'cesium-tiles',
     'TAK-Portal', 'CloudTAK', 'node-red', 'authentik', 'eud-remote-assist',
+    # ATLAS MDM. Its deployments are `atlas` for the plain one and
+    # `atlas-<slug>` per agency, so the prefix covers every instance.
+    #
+    # This is the whole broker change ATLAS needs. The module used to want
+    # losetup, umount, resize2fs, e2fsck, truncate and systemd-escape for a
+    # loop-mounted store; that design is gone (W230) for the reason the
+    # review gave -- a filesystem image the console can write and root mounts
+    # is an escalation primitive -- so it now runs only binaries already on
+    # EXEC_ALLOW.
+    'atlas',
 )
 ROOT_MODULE_DIRS = tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
 # Allowlist module dirs under EVERY plausible console home (the resolved home AND
