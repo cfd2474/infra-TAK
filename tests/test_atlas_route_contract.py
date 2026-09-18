@@ -198,7 +198,7 @@ def test_a_version_that_is_not_three_numbers_claims_nothing():
 
 
 def test_the_row_carries_the_badge_and_what_it_points_at(ctx, monkeypatch):
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.49.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.49.0')
 
     row = atlas.instances_payload(ctx)['instances'][0]
 
@@ -208,7 +208,7 @@ def test_the_row_carries_the_badge_and_what_it_points_at(ctx, monkeypatch):
 
 
 def test_a_current_deployment_carries_no_badge(ctx, monkeypatch):
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.47.3')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.47.3')
 
     assert atlas.instances_payload(ctx)['instances'][0]['update_available'] is False
 
@@ -219,7 +219,7 @@ def test_the_newest_release_is_asked_for_once_not_once_per_row(ctx, monkeypatch)
     one page."""
     calls = []
     monkeypatch.setattr(atlas, '_latest_version',
-                        lambda use_cache=True: calls.append(1) or '1.49.0')
+                        lambda use_cache=True, channel=None: calls.append(1) or '1.49.0')
 
     atlas.instances_payload(ctx)
 

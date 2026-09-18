@@ -39,6 +39,20 @@
 .url-row:last-child{border-bottom:none}
 .note{font-size:12px;color:var(--text-dim);line-height:1.7}
 textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--border);border-radius:8px;color:#94a3b8;font-family:'JetBrains Mono',monospace;font-size:11px;padding:10px}
+/* The release-channel switch (W228). Two buttons rather than a toggle: a
+   toggle has an implied "off", and neither channel is off — a box is always
+   following one of them. Each carries the version it currently offers, because
+   the choice an operator is making is between two numbers, not two words. */
+.chan-row{display:flex;gap:10px;flex-wrap:wrap}
+.chan{flex:1;min-width:230px;text-align:left;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg-deep);color:var(--text-secondary);cursor:pointer;font-family:inherit}
+.chan:hover{border-color:var(--border-hover)}
+.chan.on{border-color:var(--cyan);background:rgba(34,211,238,.07);color:var(--text-primary)}
+.chan:disabled{cursor:progress;opacity:.6}
+.chan-name{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
+.chan-ver{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);margin-top:3px}
+.chan-ver.unknown{color:var(--text-dim)}
+.chan-blurb{font-size:11px;color:var(--text-dim);line-height:1.6;margin-top:7px}
+.chan-warn{font-size:11px;color:var(--yellow);line-height:1.6;margin-top:7px}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
 .modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
@@ -119,6 +133,29 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     deployment created here would not exist as a module until a restart, and
     "Deploy additional instance" has to work without one.
   -->
+  <!--
+    Release channel (W228).
+
+    ⚠️ **First card in the idle state, which is what "at the top" means
+    here.** The update and deploy logs sit above it in the markup and are both
+    hidden unless something is running — and when an update *is* running its
+    log must stay at the very top, which is the whole reason it was moved
+    there. So this is the top card whenever there is nothing to watch, and
+    yields to the log when there is.
+
+    ⚠️ **Both channels show their version, not just the selected one.** The
+    decision is between two numbers; a card showing only the current one would
+    make an operator flip the switch to find out what the other offers, which
+    on a box mid-rollout is a question they cannot un-ask.
+  -->
+  <div class="card" id="channelCard">
+    <div class="card-title">Release channel</div>
+    <div class="chan-row" id="channelRow">
+      <div class="note">Asking GitHub what each channel offers&hellip;</div>
+    </div>
+    <p class="note" id="channelNote" style="margin:14px 0 0"></p>
+  </div>
+
   <div class="card" id="instancesCard">
     <div class="card-title">ATLAS deployments</div>
 
@@ -1844,6 +1881,119 @@ function showRenewSteps(steps){
   box.textContent = steps.join('\\n');
   document.getElementById('renewDone').hidden = false;
 }
+
+// ---- Release channel (W228) -------------------------------------------------
+//
+// Which branch of the public mirror this box takes updates from. `main` is
+// promoted-and-tested; `dev` is the newest release.
+//
+// ⚠️ **Switching changes nothing on disk and starts nothing.** It decides
+// which version the *next* update targets. The operator still presses Update
+// and still watches the log — a toggle that silently began rebuilding every
+// deployment on the box would be a very surprising thing to click.
+
+function renderChannels(d) {
+  const row = document.getElementById('channelRow');
+  const note = document.getElementById('channelNote');
+  row.textContent = '';
+
+  for (const c of (d.channels || [])) {
+    const btn = document.createElement('button');
+    btn.className = 'chan' + (c.key === d.channel ? ' on' : '');
+    btn.type = 'button';
+    btn.onclick = () => setChannel(c.key);
+
+    const name = document.createElement('div');
+    name.className = 'chan-name';
+    name.textContent = c.label || c.key;
+    if (c.key === d.channel) {
+      const tick = document.createElement('span');
+      tick.className = 'badge-new';
+      tick.textContent = 'following';
+      name.appendChild(tick);
+    }
+    btn.appendChild(name);
+
+    const ver = document.createElement('div');
+    // ⚠️ Unknown is said, never guessed as "up to date". A rate-limited or
+    // offline box, or a mirror with no such branch, lands here — and "offers
+    // nothing" read as "nothing new" is how a box sits a release behind with
+    // a page that looks healthy.
+    ver.className = 'chan-ver' + (c.version ? '' : ' unknown');
+    ver.textContent = c.version ? ('offers ' + c.version)
+                                : 'offers — could not ask GitHub';
+    btn.appendChild(ver);
+
+    const blurb = document.createElement('div');
+    blurb.className = 'chan-blurb';
+    blurb.textContent = c.blurb || '';
+    btn.appendChild(blurb);
+
+    if ((c.ahead || []).length) {
+      // ⚠️ The downgrade warning, and it belongs on the button rather than in
+      // a footnote. Update refuses to move a deployment backwards, so on this
+      // channel that button would do nothing and look broken.
+      const warn = document.createElement('div');
+      warn.className = 'chan-warn';
+      warn.textContent = '⚠ Already newer than this channel: '
+        + c.ahead.join(', ') + '. Update will not move '
+        + (c.ahead.length > 1 ? 'them' : 'it') + ' back.';
+      btn.appendChild(warn);
+    }
+    row.appendChild(btn);
+  }
+
+  const parts = [];
+  if (d.install_tag) {
+    // ⚠️ Said plainly, because it is the one place the channel does not apply.
+    // A dev-channel operator deploying a new agency gets the pinned release and
+    // an immediate update prompt; without this line that reads as a bug.
+    parts.push('A new deployment always installs ' + d.install_tag
+      + ' — the pin is a verified commit, where a channel is a branch that '
+      + 'moves — and is then offered this channel’s release.');
+  }
+  note.textContent = parts.join(' ');
+}
+
+async function loadChannel() {
+  try {
+    const r = await fetch('/api/atlas/channel');
+    renderChannels(await r.json());
+  } catch (e) {
+    document.getElementById('channelRow').textContent =
+      'Could not read the channel: ' + e;
+  }
+}
+
+async function setChannel(key) {
+  const buttons = document.querySelectorAll('#channelRow .chan');
+  buttons.forEach(b => { b.disabled = true; });
+  try {
+    const r = await fetch('/api/atlas/channel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({channel: key}),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      document.getElementById('channelNote').textContent =
+        d.error || 'Could not switch channel';
+      buttons.forEach(b => { b.disabled = false; });
+      return;
+    }
+    renderChannels(d);
+    // The update badge and the drift table both read the channel, so they are
+    // stale the instant it changes.
+    if (typeof loadInstances === 'function') loadInstances();
+    if (typeof loadLatest === 'function') loadLatest();
+  } catch (e) {
+    document.getElementById('channelNote').textContent =
+      'Could not switch channel: ' + e;
+    buttons.forEach(b => { b.disabled = false; });
+  }
+}
+
+loadChannel();
 
 // ⚠️ Guarded like loadLogs/loadLatest above. On a box where ATLAS is not
 // installed this would docker-exec a container that does not exist and paint an

@@ -420,7 +420,7 @@ def _checkout(base, name, version, built=True):
 def deployed(monkeypatch, tmp_path):
     _BUILT.clear()
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, 'compose_projects_present',
                         lambda ctx=None: set(_BUILT))
     return tmp_path

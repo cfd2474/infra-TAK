@@ -461,7 +461,7 @@ def test_an_unfinished_deployment_is_not_drift(monkeypatch, tmp_path):
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas', '1.47.3'), ('atlas-corona', '1.48.0')],
               projects=['takmdm'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
 
     drift = atlas.version_drift(ctx)
 
@@ -476,7 +476,7 @@ def test_two_finished_deployments_on_different_releases_are_drift(monkeypatch,
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas', '1.47.3'), ('atlas-corona', '1.48.0')],
               projects=['takmdm', 'takmdm-corona'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
 
     assert atlas.version_drift(ctx)['drifted'] is True
 
@@ -508,7 +508,7 @@ def test_the_drift_table_does_ask(monkeypatch, tmp_path):
               [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas-corona', '1.48.0')],
               projects=['takmdm-corona'], running=['takmdm-corona'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: '1.47.3')
 
     rows = atlas.version_drift(ctx)['instances']
@@ -550,7 +550,7 @@ def test_the_badge_answers_for_the_deployment_furthest_behind(monkeypatch,
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas', '1.48.0'), ('atlas-corona', '1.47.3')],
               projects=['takmdm', 'takmdm-corona'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: None)
 
     info = atlas.get_version_info(ctx)
@@ -564,7 +564,7 @@ def test_a_single_deployment_reports_exactly_what_it_did_before(monkeypatch,
     ctx = box(monkeypatch, tmp_path,
               [ai.make(None, ai.MODE_FIXED, 100, 8760)],
               checkouts=[('atlas', '1.48.0')], projects=['takmdm'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: None)
 
     info = atlas.get_version_info(ctx)
@@ -580,7 +580,7 @@ def test_an_agency_only_box_reports_the_agency_s_version(monkeypatch, tmp_path):
               [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas-corona', '1.47.3')],
               projects=['takmdm-corona'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: None)
 
     assert atlas.get_version_info(ctx)['version'] == '1.47.3'
@@ -596,7 +596,7 @@ def test_an_unreadable_version_is_treated_as_the_oldest(monkeypatch, tmp_path):
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas', '1.48.0')],
               projects=['takmdm', 'takmdm-corona'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: None)
 
     info = atlas.get_version_info(ctx)
@@ -616,7 +616,7 @@ def test_the_badge_asks_one_container_not_every_one(monkeypatch, tmp_path):
               checkouts=[('atlas', '1.48.0'), ('atlas-corona', '1.47.3'),
                          ('atlas-redlands', '1.48.0')],
               projects=['takmdm', 'takmdm-corona', 'takmdm-redlands'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     asked = []
     monkeypatch.setattr(atlas, '_running_version',
                         lambda c=None, i=None: asked.append(
@@ -637,7 +637,7 @@ def test_an_unfinished_deployment_does_not_drag_the_badge_back(monkeypatch,
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
               checkouts=[('atlas', '1.48.0'), ('atlas-corona', '1.47.3')],
               projects=['takmdm'])
-    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True, channel=None: '1.48.0')
     monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: None)
 
     info = atlas.get_version_info(ctx)

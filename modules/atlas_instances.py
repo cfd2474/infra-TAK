@@ -315,7 +315,13 @@ def agency_host(plain_host, slug):
 #: ⚠️ `atlas_enabled` means "the module is installed here" and `atlas_instances`
 #: is the registry itself. Taking either with one deployment would make the
 #: remaining ones invisible.
-BOX_SETTINGS_KEYS = frozenset({'atlas_enabled', 'atlas_domain', INSTANCES_KEY})
+#:
+#: ⚠️ `atlas_channel` is the box's release channel (W228). Removing one
+#: deployment must not take it: the remaining ones would silently fall back
+#: to `main` and stop being offered the release they are actually running,
+#: which reads as "no update available" on a box that is mid-rollout.
+BOX_SETTINGS_KEYS = frozenset({
+    'atlas_enabled', 'atlas_domain', 'atlas_channel', INSTANCES_KEY})
 
 
 def owned_settings_keys(instance, keys, instances=()):

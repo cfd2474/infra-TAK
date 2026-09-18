@@ -59,7 +59,34 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.50.0'
+
+# ── Release channels (W228) ──────────────────────────────────────────────────
+#
+# The mirror carries two branches. A release is published to `dev`; the
+# operator promotes it to `main` once tested. A box follows one of them.
+#
+# ⚠️ **A channel is `VERSION` at that branch tip, not "tags on that branch".**
+# Every commit on the mirror is a *root* commit — one orphan per release, no
+# ancestry at all — so nothing is reachable from `main` except `main` itself
+# and tag reachability would resolve to nothing on either channel.
+#
+# ⚠️ **Only the resolution is per-channel; the fetch is not.** An update
+# still fetches and checks out `v<version>`, and a tag exists whichever branch
+# points at it. So the machinery every release so far has exercised is
+# untouched: the channel decides which number, and nothing else.
+CHANNELS = ('main', 'dev')
+DEFAULT_CHANNEL = 'main'
+#: Where the box's choice is kept. In `BOX_SETTINGS_KEYS`, so removing one
+#: deployment cannot take the whole box's channel with it.
+CHANNEL_KEY = 'atlas_channel'
+
+#: What each channel is for, in the operator's words, on the card.
+CHANNEL_BLURB = {
+    'main': 'Tested releases. What a deployment should normally run.',
+    'dev': 'The newest release, before it has been promoted. Expect to find '
+           'the problems here.',
+}
+ATLAS_TAG = 'v1.49.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -76,7 +103,7 @@ ATLAS_TAG = 'v1.50.0'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = 'fff55004efbe09fb62f120639a4c518ff5e3c554'
+ATLAS_SHA = 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -916,7 +943,11 @@ def version_drift(ctx):
         'instances': rows,
         'versions': versions,
         'drifted': len(versions) > 1,
-        'available': _latest_version(use_cache=True),
+        # ⚠️ Per channel. A box following `main` must not be shown `dev`'s
+        # number here, or the drift table would report every deployment as
+        # behind a release its channel does not offer.
+        'available': _latest_version(use_cache=True, channel=_channel_of(ctx)),
+        'channel': _channel_of(ctx),
     }
 
 
@@ -1021,7 +1052,7 @@ def instances_payload(ctx, size_gb=None):
     # ⚠️ Asked once for the whole box, not once per deployment. It is a GitHub
     # call behind a 15-minute cache, and the allowance is 60 an hour per IP — a
     # box with five agencies polling this route would spend it on one page.
-    latest = _latest_version(use_cache=True)
+    latest = _latest_version(use_cache=True, channel=_channel_of(ctx))
     return {
         'instances': [
             dict(inst,
@@ -3363,10 +3394,15 @@ def _run_removal(ctx, inst):
         plog('ERROR: ' + str(exc))
         slot.update({'running': False, 'complete': False, 'error': True})
 
-#: Cheap cache for the upstream tag check. GitHub allows 60 unauthenticated
+#: Cheap cache for the upstream version check. GitHub allows 60 unauthenticated
 #: requests an hour per IP and the console polls this for a badge; without a
 #: cache a busy box spends its whole allowance and the badge silently blanks.
-_latest_cache = {'value': None, 'at': 0.0}
+#:
+#: ⚠️ **Keyed by channel.** One shared slot would serve `dev`'s number to a
+#: box that had just switched to `main` for up to the TTL — fifteen minutes of
+#: an update badge offering a release that channel does not carry, which is
+#: exactly the confusion the switch exists to remove.
+_latest_cache = {}
 _LATEST_TTL = 900
 
 
@@ -3388,34 +3424,76 @@ def _parse_version(text):
         return None
 
 
-def _latest_version(use_cache=True):
-    """The newest release tag upstream, or None when it cannot be established.
+def _channel_of(ctx=None, settings=None):
+    """The release channel this box follows. `main` unless told otherwise.
+
+    ⚠️ **An unrecognised value reads as the default, not as itself.** The
+    setting is a plain string in the box's settings file; a typo, or a channel
+    a newer module knew about and this one does not, must not become a branch
+    name that gets pasted into a URL. Stable is the safe reading.
+    """
+    if settings is None:
+        if ctx is None:
+            return DEFAULT_CHANNEL
+        try:
+            settings = ctx['load_settings']()
+        except Exception:
+            return DEFAULT_CHANNEL
+    value = ((settings or {}).get(CHANNEL_KEY) or '').strip().lower()
+    return value if value in CHANNELS else DEFAULT_CHANNEL
+
+
+def _latest_version(use_cache=True, channel=None):
+    """What `channel` currently offers, or None when it cannot be established.
 
     ⚠️ None means *unknown*, not *up to date*. A rate-limited or offline box
     must never be told it is current; it is told nothing, and the page says so.
+
+    ⚠️ **Read from `VERSION` at the branch tip, not from the tag list.** The
+    tag list is what this used to do, and it is branch-blind — every box would
+    be offered the newest tag in the repository whichever channel it followed,
+    so `main` would have meant nothing at all. Tag *reachability* is not an
+    alternative here: the mirror publishes one orphan commit per release, so no
+    tag is reachable from any branch but its own.
     """
     import urllib.request
 
+    channel = channel if channel in CHANNELS else DEFAULT_CHANNEL
     now = time.time()
-    if use_cache and _latest_cache['value'] and now - _latest_cache['at'] < _LATEST_TTL:
-        return _latest_cache['value']
+    slot = _latest_cache.setdefault(channel, {'value': None, 'at': 0.0})
+    if use_cache and slot['value'] and now - slot['at'] < _LATEST_TTL:
+        return slot['value']
     try:
         request = urllib.request.Request(
-            ATLAS_REPO_API + '/tags?per_page=50',
-            headers={'Accept': 'application/vnd.github+json',
+            ATLAS_REPO_API + '/contents/VERSION?ref=' + channel,
+            headers={'Accept': 'application/vnd.github.raw+json',
                      'User-Agent': 'infra-TAK-atlas-module'},
         )
         with urllib.request.urlopen(request, timeout=15) as response:
-            tags = json.loads(response.read().decode())
+            body = response.read().decode('utf-8', 'replace')
     except Exception:
-        return _latest_cache['value']
+        # Including a 404, which is what a mirror with no `dev` branch yet
+        # answers. Unknown, and the page says so — never "up to date".
+        return slot['value']
 
-    versions = [v for v in (_parse_version(t.get('name')) for t in tags) if v]
-    if not versions:
-        return _latest_cache['value']
-    newest = '.'.join(str(p) for p in max(versions))
-    _latest_cache.update({'value': newest, 'at': now})
-    return newest
+    text = body.strip()
+    if text.startswith('{'):
+        # ⚠️ The raw media type is a request, not a guarantee. A proxy that
+        # rewrites Accept, or an older GitHub Enterprise, answers with the JSON
+        # envelope instead; decoding it here costs three lines and saves a
+        # version string of "{"name":"VERSION"..." being parsed as garbage.
+        try:
+            import base64
+            payload = json.loads(text)
+            text = base64.b64decode(payload.get('content') or '').decode(
+                'utf-8', 'replace').strip()
+        except Exception:
+            return slot['value']
+
+    if not _parse_version(text):
+        return slot['value']
+    slot.update({'value': text, 'at': now})
+    return text
 
 
 def _running_version(ctx=None, inst=None):
@@ -3507,7 +3585,7 @@ def get_version_info(ctx):
     checked_out = _installed_version(ctx, _oldest)
     running = _running_version(ctx, _oldest)
     installed = running or checked_out
-    latest = _latest_version()
+    latest = _latest_version(channel=_channel_of(ctx))
     here, there = _parse_version(installed), _parse_version(latest)
 
     if there and not here:
@@ -3581,16 +3659,37 @@ def _run_update(ctx, inst=None):
         if not os.path.isdir(os.path.join(dirpath, '.git')):
             raise RuntimeError('ATLAS is not installed from a git checkout')
 
-        target = _latest_version(use_cache=False)
+        channel = _channel_of(ctx)
+        target = _latest_version(use_cache=False, channel=channel)
         if not target:
-            raise RuntimeError('Could not reach GitHub to find the newest release')
+            raise RuntimeError(
+                'Could not read VERSION on the ' + channel + ' branch — GitHub '
+                'is unreachable, rate-limited, or that branch does not exist')
         current = _installed_version(ctx, inst)
         plog(_me['name'] + ': installed ' + (current or 'unknown') +
-             ' → available ' + target)
+             ' → ' + channel + ' offers ' + target)
 
         here, there = _parse_version(current), _parse_version(target)
-        if here and there and there <= here:
-            plog('✓ Already on the newest release — nothing to do')
+        if here and there and there < here:
+            # ⚠️ **Behind, not equal — and this is a refusal, not a no-op.**
+            # It happens when a box switches from `dev` to `main`, or when a
+            # release is withdrawn by moving `main` back. Running older code
+            # against a database a newer release has already migrated is data
+            # loss, so the way back is a forward fix on the channel, never this
+            # button. Said plainly, because a button that looks like it did
+            # nothing is a button an operator presses again.
+            plog('✗ This deployment is on ' + (current or '?') + ', which is '
+                 'newer than what the ' + channel + ' channel offers (' +
+                 target + ').')
+            plog('  Refusing to downgrade: ' + target + ' would run against a '
+                 'database ' + (current or 'a newer release') + ' has migrated.')
+            plog('  Switch back to the channel it came from, or publish a '
+                 'forward fix.')
+            slot.update({'running': False, 'complete': True, 'error': False})
+            return
+        if here and there and there == here:
+            plog('✓ Already on the newest release for the ' + channel +
+                 ' channel — nothing to do')
             slot.update({'running': False, 'complete': True, 'error': False})
             return
 
@@ -4612,6 +4711,88 @@ def register(ctx):
                             'error': (r.stderr or '')[-300:]}), 500
         return jsonify({'success': True})
 
+    def _channel_payload():
+        """What the channel card renders. Both channels, and the risk.
+
+        ⚠️ **Both channels are resolved, not just the selected one.** An
+        operator deciding whether to switch needs to see what the other one
+        offers *before* switching; a card that showed only the current channel
+        would make them flip the switch to find out, which on a box mid-rollout
+        is a question they cannot un-ask.
+        """
+        settings = ctx['load_settings']()
+        current = _channel_of(ctx, settings)
+        offers = {c: _latest_version(use_cache=True, channel=c) for c in CHANNELS}
+
+        # Deployments already newer than what a channel offers. Switching to it
+        # will not move them: `_run_update` refuses to go backwards, because
+        # older code against a migrated database is data loss.
+        deployed = []
+        for inst in load_instances(ctx):
+            version = _installed_version(ctx, inst)
+            if version:
+                deployed.append(
+                    {'name': deployment_identity(ctx, inst, settings)['name'],
+                     'version': version})
+
+        def _ahead_of(channel):
+            there = _parse_version(offers.get(channel))
+            if not there:
+                return []
+            return [d for d in deployed
+                    if (_parse_version(d['version']) or (0, 0, 0)) > there]
+
+        return {
+            'success': True,
+            'channel': current,
+            # ⚠️ Fresh installs land here whichever channel is selected — the
+            # pin is a verified commit and the channel is a branch that moves.
+            # Said on the card, so a dev-channel operator is not surprised when
+            # a new agency deploys at the stable release and is immediately
+            # offered an update.
+            'install_tag': ATLAS_TAG,
+            'channels': [
+                {'key': c,
+                 'label': c.capitalize(),
+                 'blurb': CHANNEL_BLURB.get(c, ''),
+                 'version': offers.get(c),
+                 'ahead': [d['name'] for d in _ahead_of(c)]}
+                for c in CHANNELS
+            ],
+            'deployed': deployed,
+        }
+
+    def channel_view():
+        """Which release channel this box follows, and what each one offers."""
+        return jsonify(_channel_payload())
+
+    def channel_set_view():
+        """Follow a different release channel.
+
+        ⚠️ **Changes nothing on disk and starts nothing.** It decides which
+        version the *next* update targets. An operator still presses Update,
+        and still watches the log — a switch that silently began rebuilding
+        every deployment on the box would be a very surprising toggle.
+        """
+        from flask import request as _rq
+
+        wanted = ((_rq.get_json(silent=True) or {}).get('channel') or '').strip().lower()
+        if wanted not in CHANNELS:
+            return jsonify({
+                'success': False,
+                'error': 'unknown channel; expected one of ' + ', '.join(CHANNELS),
+            }), 400
+
+        settings = ctx['load_settings']()
+        settings[CHANNEL_KEY] = wanted
+        ctx['save_settings'](settings)
+        # ⚠️ Dropped, not left to expire. The cache is per channel so the new
+        # one is correct already, but a 15-minute-stale entry for the channel
+        # just switched *to* would show a number from before the switch and
+        # read as the switch not having worked.
+        _latest_cache.pop(wanted, None)
+        return jsonify(_channel_payload())
+
     register_module({
         'key': KEY,
         'name': 'ATLAS MDM',
@@ -4646,6 +4827,10 @@ def register(ctx):
              'endpoint': f'{KEY}_instance_forget', 'view': instance_forget_view},
             {'url': f'/api/{KEY}/store', 'methods': ['GET'],
              'endpoint': f'{KEY}_store', 'view': store_view},
+            {'url': f'/api/{KEY}/channel', 'methods': ['GET'],
+             'endpoint': f'{KEY}_channel', 'view': channel_view},
+            {'url': f'/api/{KEY}/channel', 'methods': ['POST'],
+             'endpoint': f'{KEY}_channel_set', 'view': channel_set_view},
             {'url': f'/api/{KEY}/update', 'methods': ['POST'],
              'endpoint': f'{KEY}_update', 'view': update_view},
             {'url': f'/api/{KEY}/update-all', 'methods': ['POST'],
