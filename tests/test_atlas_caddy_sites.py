@@ -36,10 +36,10 @@ def test_the_plain_deployment_keeps_the_host_it_has():
 
 def test_an_agency_qualifies_the_first_label():
     """⚠️ Inserted after the service label, not prepended to the whole name —
-    `atlas.agency-a.<fqdn>`, not `agency-a.atlas.<fqdn>`. The first label says
+    `atlas.agencya.<fqdn>`, not `agencya.atlas.<fqdn>`. The first label says
     what the service is; the agency qualifies it."""
-    assert ai.agency_host('atlas.leckliter.net', 'agency-a') == \
-        'atlas.agency-a.leckliter.net'
+    assert ai.agency_host('atlas.leckliter.net', 'agencya') == \
+        'atlas.agencya.leckliter.net'
 
 
 def test_a_custom_console_domain_is_qualified_the_same_way():
@@ -109,7 +109,7 @@ def two_deployments(monkeypatch, tmp_path):
         'atlas_enabled': True,
         ai.INSTANCES_KEY: [
             ai.make(None, ai.MODE_FIXED, 100, 8760),
-            ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+            ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761),
         ],
     }
 
@@ -118,7 +118,7 @@ def test_each_deployment_gets_its_own_site(two_deployments):
     sites = atlas.caddy_sites(two_deployments, 'atlas.leckliter.net')
 
     assert [s['host'] for s in sites] == [
-        'atlas.leckliter.net', 'atlas.agency-a.leckliter.net']
+        'atlas.leckliter.net', 'atlas.agencya.leckliter.net']
 
 
 def test_each_deployment_has_its_own_upstream_port(two_deployments):
@@ -140,7 +140,7 @@ def test_each_deployment_has_its_own_device_ca(two_deployments):
     paths = [s['ca_path'] for s in sites]
 
     assert paths == ['/var/lib/caddy/atlas/device-ca.crt',
-                     '/var/lib/caddy/atlas-agency-a/device-ca.crt']
+                     '/var/lib/caddy/atlas-agencya/device-ca.crt']
     assert len(set(paths)) == 2
 
 
@@ -171,7 +171,7 @@ def test_a_deployment_without_a_ca_reports_none(monkeypatch, tmp_path):
 def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     """⚠️ A shared `atlas/device-ca.crt` would have the last deployment to run
     overwrite every other agency's trust pool."""
-    src = tmp_path / 'atlas-agency-a' / 'pki'
+    src = tmp_path / 'atlas-agencya' / 'pki'
     src.mkdir(parents=True)
     (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----\nx\n'
                                 '-----END CERTIFICATE-----', encoding='utf-8')
@@ -189,8 +189,8 @@ def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
                         lambda path, **k: landed.setdefault('dir', path))
 
     try:
-        atlas.sync_device_ca_for_caddy(ai.make('agency-a', ai.MODE_FIXED, 50, 8761))
+        atlas.sync_device_ca_for_caddy(ai.make('agencya', ai.MODE_FIXED, 50, 8761))
     except Exception:
         pass  # the copy itself needs a real /var/lib/caddy; the path is the point
 
-    assert landed.get('dir', '').endswith('atlas-agency-a')
+    assert landed.get('dir', '').endswith('atlas-agencya')

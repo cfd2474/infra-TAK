@@ -31,7 +31,7 @@ def posix(path):
     compare against separators that exist nowhere in production."""
     return str(path).replace(chr(92), '/')
 PLAIN = ai.make(None, ai.MODE_FIXED, 100, 8760)
-AGENCY = ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761)
+AGENCY = ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,11 +104,11 @@ def test_the_plain_instance_still_resolves_to_the_live_paths(rooted):
 def test_an_agency_resolves_beside_it_on_the_same_layout(rooted):
     p = atlas.instance_paths(None, AGENCY)
 
-    assert p['dir'] == '/root/atlas-agency-a'
-    assert p['mount'] == '/root/atlas-agency-a/store'
-    assert p['image'] == '/var/lib/atlas-agency-a/store.img'
-    assert p['pg_volume'] == 'takmdm-agency-a_pgdata'
-    assert p['compose_project'] == 'takmdm-agency-a'
+    assert p['dir'] == '/root/atlas-agencya'
+    assert p['mount'] == '/root/atlas-agencya/store'
+    assert p['image'] == '/var/lib/atlas-agencya/store.img'
+    assert p['pg_volume'] == 'takmdm-agencya_pgdata'
+    assert p['compose_project'] == 'takmdm-agencya'
 
 
 def test_agencies_follow_a_home_layout_too(monkeypatch):
@@ -116,7 +116,7 @@ def test_agencies_follow_a_home_layout_too(monkeypatch):
     constant said so while the plain instance lives in a home directory."""
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/home/console')
 
-    assert atlas.instance_paths(None, AGENCY)['dir'] == '/home/console/atlas-agency-a'
+    assert atlas.instance_paths(None, AGENCY)['dir'] == '/home/console/atlas-agencya'
     assert atlas.instance_paths(None, None)['dir'] == '/home/console/atlas'
 
 
@@ -178,7 +178,7 @@ def test_creating_an_agency_store_never_names_the_plain_one(box, tmp_path):
 
     ran = box.text()
 
-    assert 'atlas-agency-a' in ran
+    assert 'atlas-agencya' in ran
     assert posix(tmp_path / 'var' / 'store.img') not in ran
 
 
@@ -188,7 +188,7 @@ def test_creating_the_plain_store_never_names_an_agency(box, tmp_path):
     ran = box.text()
 
     assert posix(tmp_path / 'var' / 'store.img') in ran
-    assert 'agency-a' not in ran
+    assert 'agencya' not in ran
 
 
 def test_removing_an_agency_store_leaves_the_plain_one_alone(box, tmp_path):
@@ -213,7 +213,7 @@ def test_removing_an_agency_removes_only_its_own_volume(box):
 
     ran = box.text()
 
-    assert 'takmdm-agency-a_pgdata' in ran
+    assert 'takmdm-agencya_pgdata' in ran
     assert 'takmdm_pgdata ' not in ran + ' '
 
 
@@ -259,7 +259,7 @@ def test_the_module_constant_stays_authoritative_for_the_plain_image(monkeypatch
 
     assert atlas.instance_paths(None, None)['image'] == '/mnt/elsewhere/store.img'
     assert atlas.instance_paths(None, AGENCY)['image'] == (
-        '/var/lib/atlas-agency-a/store.img')
+        '/var/lib/atlas-agencya/store.img')
 
 
 def test_reserving_blocks_targets_the_image_it_was_given(monkeypatch):

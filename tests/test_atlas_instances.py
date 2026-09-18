@@ -27,7 +27,7 @@ from modules import atlas_instances as inst  # noqa: E402
 
 
 PLAIN = inst.make(None, inst.MODE_FIXED, 100, 8760)
-AGENCY_A = inst.make('agency-a', inst.MODE_DYNAMIC, 100, 8761)
+AGENCY_A = inst.make('agencya', inst.MODE_DYNAMIC, 100, 8761)
 
 
 # --------------------------------------------------------------------------- #
@@ -76,7 +76,7 @@ def test_no_plain_instance_reads_as_none():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("good", ["agency-a", "pd", "county-sheriff-1", "a1"])
+@pytest.mark.parametrize("good", ["agencya", "pd", "countysheriff", "corona"])
 def test_a_usable_slug_is_accepted(good):
     slug, err = inst.validate_slug(good)
 
@@ -90,10 +90,15 @@ def test_a_usable_slug_is_accepted(good):
         ("", "required"),
         (None, "required"),
         ("   ", "required"),
-        ("-lead", "letters, digits and hyphens"),
-        ("trail-", "letters, digits and hyphens"),
-        ("under_score", "letters, digits and hyphens"),
-        ("two words", "letters, digits and hyphens"),
+        # ⚠️ Hyphens and digits are refused now, not merely discouraged
+        # (operator decision): the slug becomes part of `atlas-<slug>`, and a
+        # hyphen inside it cannot be told from the separator.
+        ("-lead", "lowercase letters only"),
+        ("trail-", "lowercase letters only"),
+        ("under_score", "lowercase letters only"),
+        ("two words", "lowercase letters only"),
+        ("agency-a", "lowercase letters only"),
+        ("county1", "lowercase letters only"),
         ("sub.domain", "one label"),
         ("x" * 40, "characters or fewer"),
     ],
@@ -107,7 +112,7 @@ def test_an_unusable_slug_is_refused_with_a_reason(bad, because):
 
 @pytest.mark.parametrize(
     "typed,stored",
-    [("Agency-A", "agency-a"), ("PD", "pd"), ("  County-1  ", "county-1")],
+    [("AgencyA", "agencya"), ("PD", "pd"), ("  Corona  ", "corona")],
 )
 def test_case_is_forced_rather_than_refused(typed, stored):
     """⚠️ **Operator decision: force lowercase.** The slug is a DNS label, a
@@ -116,7 +121,7 @@ def test_case_is_forced_rather_than_refused(typed, stored):
 
     The *normalised* value is what comes back, because it is what gets stored and
     what the hostname is built from — the console has to show the operator
-    `atlas.agency-a.<fqdn>` rather than echoing what they typed."""
+    `atlas.agencya.<fqdn>` rather than echoing what they typed."""
     slug, err = inst.validate_slug(typed)
 
     assert err is None
@@ -135,9 +140,9 @@ def test_only_case_is_forced_and_nothing_else_is(bad):
 
 
 def test_uniqueness_survives_the_case_change():
-    """A consequence worth pinning: `Agency-A` and `agency-a` resolve to the same
+    """A consequence worth pinning: `AgencyA` and `agencya` resolve to the same
     hostname, so the second must be refused as a duplicate."""
-    slug, err = inst.validate_slug("Agency-A", [AGENCY_A])
+    slug, err = inst.validate_slug("AgencyA", [AGENCY_A])
 
     assert slug is None
     assert "already" in err
@@ -153,7 +158,7 @@ def test_a_reserved_slug_cannot_be_smuggled_in_by_case():
 
 
 def test_a_duplicate_slug_is_refused():
-    slug, err = inst.validate_slug("agency-a", [AGENCY_A])
+    slug, err = inst.validate_slug("agencya", [AGENCY_A])
 
     assert slug is None
     assert "already" in err
@@ -297,16 +302,16 @@ def test_the_plain_instance_derives_exactly_what_is_deployed_today():
 def test_an_agency_instance_derives_a_parallel_set():
     d = inst.derive(AGENCY_A, fqdn="leckliter.net")
 
-    assert d["dir"] == "/root/atlas-agency-a"
-    assert d["image"] == "/var/lib/atlas-agency-a/store.img"
-    assert d["mount"] == "/root/atlas-agency-a/store"
-    assert d["compose_project"] == "takmdm-agency-a"
-    assert d["pg_volume"] == "takmdm-agency-a_pgdata"
-    assert d["caddy_ca_dir"] == "/var/lib/caddy/atlas-agency-a"
-    assert d["settings_prefix"] == "atlas_agency-a_"
-    assert d["authentik_slug"] == "atlas-agency-a"
-    assert d["admin_group"] == "atlas-agency-a-admins"
-    assert d["vhost"] == "atlas.agency-a.leckliter.net"
+    assert d["dir"] == "/root/atlas-agencya"
+    assert d["image"] == "/var/lib/atlas-agencya/store.img"
+    assert d["mount"] == "/root/atlas-agencya/store"
+    assert d["compose_project"] == "takmdm-agencya"
+    assert d["pg_volume"] == "takmdm-agencya_pgdata"
+    assert d["caddy_ca_dir"] == "/var/lib/caddy/atlas-agencya"
+    assert d["settings_prefix"] == "atlas_agencya_"
+    assert d["authentik_slug"] == "atlas-agencya"
+    assert d["admin_group"] == "atlas-agencya-admins"
+    assert d["vhost"] == "atlas.agencya.leckliter.net"
     assert d["port"] == 8761
 
 
@@ -315,8 +320,8 @@ def test_the_agency_hostname_is_a_third_level_label():
     `tiles.map.leckliter.net` already holds its own certificate."""
     d = inst.derive(AGENCY_A, fqdn="example.org")
 
-    assert d["vhost"] == "atlas.agency-a.example.org"
-    assert d["device_host"] == "atlas.agency-a.example.org"
+    assert d["vhost"] == "atlas.agencya.example.org"
+    assert d["device_host"] == "atlas.agencya.example.org"
 
 
 def test_no_two_instances_share_any_derived_name():
@@ -334,7 +339,7 @@ def test_no_two_instances_share_any_derived_name():
 
 def test_the_job_key_is_acceptable_to_the_module_registry():
     """⚠️ Descriptor and job keys are validated `[a-z0-9_-]+`, so a colon would
-    fail at import — `atlas:agency-a` was the obvious first shape and is not
+    fail at import — `atlas:agencya` was the obvious first shape and is not
     allowed."""
     for record in (PLAIN, AGENCY_A):
         key = inst.derive(record)["job_key"]

@@ -441,7 +441,9 @@ def test_the_slug_field_says_blank_means_the_general_atlas(installed):
 
     assert 'Leave it blank' in span[:900]
     assert 'general ATLAS' in span[:900]
-    assert 'Lowercase, no spaces' in span[:900]
+    assert 'Lowercase letters' in span[:900]
+    # ⚠️ The field refuses the characters as typed, not only on submit.
+    assert 'pattern="[a-z]*"' in span[:900]
 
 
 def test_the_slug_is_shown_back_normalised(installed):

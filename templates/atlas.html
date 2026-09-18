@@ -160,12 +160,16 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
           Agency slug
         </label>
         <input type="text" id="agencySlug" placeholder="leave blank for the box's general ATLAS"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
+               inputmode="latin" pattern="[a-z]*"
                oninput="previewSlug()"
                style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
         <p class="note" style="margin:6px 0 0">
-          The agency this deployment belongs to. Lowercase, no spaces — it
-          becomes part of the hostname. <strong>Leave it blank</strong> for the
-          box&rsquo;s general ATLAS, of which there can be only one.
+          The agency this deployment belongs to. <strong>Lowercase letters
+          only</strong> — no spaces, digits or symbols, because it becomes part
+          of a hostname, a systemd unit name and a Docker volume name at once.
+          <strong>Leave it blank</strong> for the box&rsquo;s general ATLAS, of
+          which there can be only one.
         </p>
         <p class="note" id="slugPreview" style="margin:6px 0 0"></p>
       </div>
@@ -701,10 +705,19 @@ function currentMode(){
 }
 
 function typedSlug(){
-  // ⚠️ Normalised, not echoed. Case is forced server-side, so showing what was
-  // typed would promise a hostname that is not the one created.
+  // ⚠️ **The field is filtered as it is typed, not merely validated on submit**
+  // (operator decision): anything that is not a lowercase letter is dropped
+  // before it can be held. Case is forced rather than refused, because a capital
+  // has exactly one sensible reading; a space or a symbol has none.
+  //
+  // ⚠️ The server validates the same string again. A control that rejects
+  // characters is a convenience, never the guard — a value pasted past a browser
+  // is not a validation.
   const input = document.getElementById('agencySlug');
-  return ((input && input.value) || '').trim().toLowerCase();
+  if (!input) return '';
+  const clean = (input.value || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (input.value !== clean) input.value = clean;
+  return clean;
 }
 
 function onModeChanged(){
@@ -729,9 +742,8 @@ function previewSlug(){
     out.textContent = mayPlain
       ? 'No slug — this becomes the box\u2019s general ATLAS at its plain hostname.'
       : '⚠ This box already has a general ATLAS, so a slug is required.';
-  } else if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(slug)){
-    out.textContent = '⚠ Lowercase letters, digits and hyphens only, and it '
-      + 'cannot start or end with a hyphen.';
+  } else if (!/^[a-z]+$/.test(slug)){
+    out.textContent = '⚠ Lowercase letters only — no spaces, digits or symbols.';
   } else {
     out.textContent = 'Will deploy as ' + slug + ' at ' + hostFor(slug);
   }
@@ -746,8 +758,8 @@ function addInstanceProblem(){
   // slug is claimed and nothing was built.
   if (!slug && !mayPlain)
     return 'This box already has a general ATLAS. Enter an agency slug.';
-  if (slug && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(slug))
-    return 'That slug cannot be used as a hostname.';
+  if (slug && !/^[a-z]+$/.test(slug))
+    return 'Use lowercase letters only — no spaces, digits or symbols.';
   if (slug && (capacityState.slugs || []).indexOf(slug) !== -1)
     return 'There is already a deployment for ' + slug + '.';
   if (currentMode() === 'fixed'){

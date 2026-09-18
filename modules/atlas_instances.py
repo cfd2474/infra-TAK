@@ -28,9 +28,17 @@ MODES = (MODE_FIXED, MODE_DYNAMIC)
 #: room to spare, and keeps systemd unit names readable.
 SLUG_MAX = 32
 
-#: Lowercase letters, digits and hyphens; no leading or trailing hyphen; no
-#: dots, because the slug is a single DNS label.
-_SLUG_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,%d}[a-z0-9])?$' % (SLUG_MAX - 2))
+#: ⚠️ **Lowercase letters only** — no digits, no hyphens, no dots (operator
+#: decision, 2026-09-17: *"only accept lowercase letters, no spaces or
+#: symbols"*).
+#:
+#: Narrower than a DNS label allows, deliberately. The slug is four identifiers
+#: at once — a hostname label, part of a systemd unit name, a Compose project
+#: and a Docker volume — and the intersection of what each accepts is wider than
+#: what is *safe* in all of them. `a-b` is a legal hostname and a legal volume
+#: name, but it also collides with the separator this module uses to build
+#: `atlas-<slug>`, so `atlas-a-b` cannot be parsed back apart. Letters cannot.
+_SLUG_RE = re.compile(r'^[a-z]{1,%d}$' % SLUG_MAX)
 
 #: ⚠️ Not decoration. The settings prefix for a slug is `atlas_<slug>_`, so a
 #: slug of `pg` would produce `atlas_pg_password` — **the plain instance's own
@@ -144,8 +152,7 @@ def validate_slug(raw, instances=()):
         return None, ('A slug is one label, not a domain — it sits inside '
                       'atlas.<slug>.<your-domain>, so it cannot contain a dot.')
     if not _SLUG_RE.match(slug):
-        return None, ('Use lowercase letters, digits and hyphens, starting and '
-                      'ending with a letter or digit.')
+        return None, 'Use lowercase letters only — no spaces, digits or symbols.'
     if slug in RESERVED_SLUGS:
         return None, f'{slug!r} is reserved — please pick another.'
     if by_slug(instances, slug) is not None:

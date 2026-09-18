@@ -97,12 +97,12 @@ def test_the_migration_is_not_written_back(monkeypatch, tmp_path):
 
 def test_an_explicit_list_wins_over_the_migration(monkeypatch, tmp_path):
     monkeypatch.setattr(atlas, 'STORE_IMAGE', str(tmp_path / 'absent.img'))
-    recorded = [ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761)]
+    recorded = [ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761)]
 
     found = atlas.load_instances(
         Ctx({'atlas_enabled': True, ai.INSTANCES_KEY: recorded}))
 
-    assert [i['slug'] for i in found] == ['agency-a']
+    assert [i['slug'] for i in found] == ['agencya']
 
 
 def test_saving_replaces_rather_than_merges():
@@ -165,10 +165,10 @@ def test_a_second_plain_deployment_is_refused_with_a_reason(roomy):
 def test_an_agency_deployment_records_its_slug_and_mode(roomy):
     ctx = Ctx()
 
-    inst, err = atlas.add_instance(ctx, True, 'Agency-A', ai.MODE_DYNAMIC, 50)
+    inst, err = atlas.add_instance(ctx, True, 'AgencyA', ai.MODE_DYNAMIC, 50)
 
     assert err is None
-    assert inst['slug'] == 'agency-a', 'the slug was not normalised'
+    assert inst['slug'] == 'agencya', 'the slug was not normalised'
     assert inst['mode'] == ai.MODE_DYNAMIC
 
 
@@ -176,7 +176,7 @@ def test_a_fixed_and_a_dynamic_instance_can_coexist(roomy):
     """The operator's requirement, end to end through the registry."""
     ctx = Ctx()
     atlas.add_instance(ctx, False, None, ai.MODE_FIXED, 50)
-    atlas.add_instance(ctx, True, 'agency-a', ai.MODE_DYNAMIC, 50)
+    atlas.add_instance(ctx, True, 'agencya', ai.MODE_DYNAMIC, 50)
 
     modes = {i['mode'] for i in atlas.load_instances(ctx)}
 
@@ -186,7 +186,7 @@ def test_a_fixed_and_a_dynamic_instance_can_coexist(roomy):
 def test_each_instance_gets_its_own_port(roomy):
     ctx = Ctx()
     atlas.add_instance(ctx, False, None, ai.MODE_FIXED, 50)
-    atlas.add_instance(ctx, True, 'agency-a', ai.MODE_DYNAMIC, 50)
+    atlas.add_instance(ctx, True, 'agencya', ai.MODE_DYNAMIC, 50)
 
     ports = [i['port'] for i in atlas.load_instances(ctx)]
 
@@ -195,9 +195,9 @@ def test_each_instance_gets_its_own_port(roomy):
 
 def test_a_duplicate_slug_is_refused(roomy):
     ctx = Ctx()
-    atlas.add_instance(ctx, True, 'agency-a', ai.MODE_FIXED, 50)
+    atlas.add_instance(ctx, True, 'agencya', ai.MODE_FIXED, 50)
 
-    inst, err = atlas.add_instance(ctx, True, 'agency-a', ai.MODE_FIXED, 50)
+    inst, err = atlas.add_instance(ctx, True, 'agencya', ai.MODE_FIXED, 50)
 
     assert inst is None and 'already' in err
 
@@ -207,13 +207,13 @@ def test_the_instance_is_recorded_before_anything_is_built(roomy):
     half-built instance with no record is the shape of leak W212 was about."""
     ctx = Ctx()
 
-    atlas.add_instance(ctx, True, 'agency-a', ai.MODE_FIXED, 50)
+    atlas.add_instance(ctx, True, 'agencya', ai.MODE_FIXED, 50)
 
     assert ai.INSTANCES_KEY in ctx.settings
 
 
 def test_a_bad_mode_is_refused(roomy):
-    inst, err = atlas.add_instance(Ctx(), True, 'agency-a', 'elastic', 50)
+    inst, err = atlas.add_instance(Ctx(), True, 'agencya', 'elastic', 50)
 
     assert inst is None and 'sizing mode' in err
 
@@ -368,17 +368,17 @@ def test_each_instance_gets_its_own_job_key():
     """⚠️ Separate slots mean separate locks, so one agency's update cannot
     block or clobber another's."""
     plain = atlas.instance_job_key(ai.make(None, ai.MODE_FIXED, 50, 8760))
-    agency = atlas.instance_job_key(ai.make('agency-a', ai.MODE_FIXED, 50, 8761))
+    agency = atlas.instance_job_key(ai.make('agencya', ai.MODE_FIXED, 50, 8761))
 
     assert plain == 'atlas'
-    assert agency == 'atlas-agency-a'
+    assert agency == 'atlas-agencya'
     assert plain != agency
 
 
 def test_a_job_key_is_acceptable_to_the_registry():
-    """⚠️ `[a-z0-9_-]` only — `atlas:agency-a` was the obvious first shape and
+    """⚠️ `[a-z0-9_-]` only — `atlas:agencya` was the obvious first shape and
     the descriptor validator rejects it at import."""
-    key = atlas.instance_job_key(ai.make('agency-a', ai.MODE_FIXED, 50, 8761))
+    key = atlas.instance_job_key(ai.make('agencya', ai.MODE_FIXED, 50, 8761))
 
     assert all(c.isalnum() or c in '-_' for c in key)
 
@@ -406,16 +406,16 @@ def test_a_version_is_read_from_the_checkout_not_from_settings(deployed):
 
 def test_each_instance_reports_its_own_version(deployed):
     _checkout(deployed, 'atlas', '1.47.3')
-    _checkout(deployed, 'atlas-agency-a', '1.48.0')
+    _checkout(deployed, 'atlas-agencya', '1.48.0')
     ctx = Ctx({ai.INSTANCES_KEY: [
         ai.make(None, ai.MODE_FIXED, 100, 8760),
-        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+        ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761),
     ]})
 
     drift = atlas.version_drift(ctx)
 
     assert {r['slug']: r['version'] for r in drift['instances']} == {
-        None: '1.47.3', 'agency-a': '1.48.0'}
+        None: '1.47.3', 'agencya': '1.48.0'}
 
 
 def test_drift_is_reported_when_deployments_disagree(deployed):
@@ -423,10 +423,10 @@ def test_drift_is_reported_when_deployments_disagree(deployed):
     happen on the same day. Showing it makes a staged rollout deliberate rather
     than something discovered later."""
     _checkout(deployed, 'atlas', '1.47.3')
-    _checkout(deployed, 'atlas-agency-a', '1.48.0')
+    _checkout(deployed, 'atlas-agencya', '1.48.0')
     ctx = Ctx({ai.INSTANCES_KEY: [
         ai.make(None, ai.MODE_FIXED, 100, 8760),
-        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+        ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761),
     ]})
 
     assert atlas.version_drift(ctx)['drifted'] is True
@@ -434,10 +434,10 @@ def test_drift_is_reported_when_deployments_disagree(deployed):
 
 def test_agreement_is_not_reported_as_drift(deployed):
     _checkout(deployed, 'atlas', '1.47.3')
-    _checkout(deployed, 'atlas-agency-a', '1.47.3')
+    _checkout(deployed, 'atlas-agencya', '1.47.3')
     ctx = Ctx({ai.INSTANCES_KEY: [
         ai.make(None, ai.MODE_FIXED, 100, 8760),
-        ai.make('agency-a', ai.MODE_DYNAMIC, 50, 8761),
+        ai.make('agencya', ai.MODE_DYNAMIC, 50, 8761),
     ]})
 
     drift = atlas.version_drift(ctx)

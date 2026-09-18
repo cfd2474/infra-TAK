@@ -154,30 +154,43 @@ function harness(capacity) {
 
 // --- slugs ------------------------------------------------------------------ //
 {
-  const h = harness({ ...CAPACITY, slugs: ["agency-a"] });
+  const h = harness({ ...CAPACITY, slugs: ["agencya"] });
   h.pick("dynamic");
 
-  h.slug("agency-a");
+  h.slug("agencya");
   check("a slug already in use is refused",
     (h.problem() || "").includes("already a deployment"), String(h.problem()));
 
-  h.slug("Agency-B");
+  h.slug("AgencyB");
   check("an uppercase slug is accepted as its lowercase form",
     h.problem() === null, String(h.problem()));
   check("and is shown back normalised",
-    h.el("slugPreview").textContent.includes("atlas.agency-b.leckliter.net"),
+    h.el("slugPreview").textContent.includes("atlas.agencyb.leckliter.net"),
     h.el("slugPreview").textContent);
 
-  h.slug("AGENCY-A");
+  h.slug("AGENCYA");
   check("a duplicate is caught whatever the case",
     (h.problem() || "").includes("already a deployment"), String(h.problem()));
 
+  // ⚠️ The field **strips** what it will not accept rather than refusing the
+  // keystroke, so an invalid slug cannot be held at all. The preview then shows
+  // what was actually kept — the operator sees the name they will get, which is
+  // the same rule that forces case.
   h.slug("two words");
-  check("a slug with a space is refused",
-    (h.problem() || "").includes("hostname"), String(h.problem()));
+  check("a space is stripped as it is typed",
+    h.el("agencySlug").value === "twowords", h.el("agencySlug").value);
+  check("and what is left is accepted", h.problem() === null, String(h.problem()));
+  check("with the preview showing what was kept",
+    h.el("slugPreview").textContent.includes("atlas.twowords.leckliter.net"),
+    h.el("slugPreview").textContent);
 
-  h.slug("-lead");
-  check("a slug starting with a hyphen is refused", h.problem() !== null);
+  h.slug("county-1");
+  check("hyphens and digits are stripped too",
+    h.el("agencySlug").value === "county", h.el("agencySlug").value);
+
+  h.slug("!!!");
+  check("a slug of nothing but symbols empties the field",
+    h.el("agencySlug").value === "", h.el("agencySlug").value);
 }
 
 // --- fixed sizes are bounded ------------------------------------------------ //
