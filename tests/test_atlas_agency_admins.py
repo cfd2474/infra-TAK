@@ -284,7 +284,7 @@ def test_the_operator_is_told_what_to_add_people_to(authentik):
 def test_the_env_line_lists_both_groups(tmp_path, monkeypatch):
     """⚠️ Without this an agency administrator passes Authentik and is refused
     by ATLAS with a 403 — the proxy says yes and the application says no."""
-    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda: '')
+    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda ctx=None: '')
     env = tmp_path / '.env'
     env.write_text('TAKMDM_ADMIN_GROUP=authentik Admins\n', encoding='utf-8')
 
@@ -297,7 +297,7 @@ def test_the_env_line_lists_both_groups(tmp_path, monkeypatch):
 def test_the_plain_deployment_s_line_does_not_change(tmp_path, monkeypatch):
     """Every deployed box has exactly this, and a change it did not ask for is
     a restart it did not ask for."""
-    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda: '')
+    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda ctx=None: '')
     env = tmp_path / '.env'
     env.write_text('TAKMDM_ADMIN_GROUP=authentik Admins\n', encoding='utf-8')
 
@@ -311,7 +311,7 @@ def test_the_plain_deployment_s_line_does_not_change(tmp_path, monkeypatch):
 def test_only_one_admin_group_line_survives(tmp_path, monkeypatch):
     """Two would be one setting with two values, and `.env` takes the last —
     which is not the one anybody would read first."""
-    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda: '')
+    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda ctx=None: '')
     env = tmp_path / '.env'
     env.write_text('TAKMDM_ADMIN_GROUP=authentik Admins\n', encoding='utf-8')
 
@@ -322,7 +322,7 @@ def test_only_one_admin_group_line_survives(tmp_path, monkeypatch):
 
 
 def test_a_renamed_superuser_group_reaches_the_env_line(tmp_path, monkeypatch):
-    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda: '')
+    monkeypatch.setattr(atlas, '_proxy_auth_secret', lambda ctx=None: '')
     env = tmp_path / '.env'
     env.write_text('TAKMDM_ADMIN_GROUP=\n', encoding='utf-8')
 

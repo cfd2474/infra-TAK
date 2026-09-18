@@ -250,16 +250,45 @@ def test_the_facts_read_the_instance_s_own_image(box, monkeypatch):
     assert facts['size_is_reserved'] is False
 
 
-def test_the_module_constant_stays_authoritative_for_the_plain_image(monkeypatch):
-    """⚠️ `derive` would produce the same path, but `STORE_IMAGE` is what a
-    deployment configures — so the plain instance must follow the constant, not
-    a string rebuilt from a name."""
+def test_every_image_follows_the_module_constant(monkeypatch):
+    """⚠️ **Inverted deliberately (upstream review, item 9).** This asserted
+    that an agency's image stayed at the real `/var/lib` while the plain one
+    followed `STORE_IMAGE` — which is precisely the bug: three tests then
+    created `/var/lib/atlas-agencya` for real, and as root on a box they would
+    have created it there. `derive` hardcodes the directory; `instance_paths`
+    rebases it, so redirecting the constant moves every instance."""
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/root')
     monkeypatch.setattr(atlas, 'STORE_IMAGE', '/mnt/elsewhere/store.img')
 
     assert atlas.instance_paths(None, None)['image'] == '/mnt/elsewhere/store.img'
     assert atlas.instance_paths(None, AGENCY)['image'] == (
+        '/mnt/atlas-agencya/store.img')
+
+
+def test_the_real_layout_is_unchanged_by_that_rebasing():
+    """⚠️ The other half: a running box must keep the paths it already has.
+    `/var/lib/atlas/store.img` has grandparent `/var/lib`, so an agency still
+    resolves under it and no deployed store moves."""
+    assert atlas.STORE_IMAGE == '/var/lib/atlas/store.img'
+    assert atlas.instance_paths(None, AGENCY)['image'] == (
         '/var/lib/atlas-agencya/store.img')
+
+
+def test_no_instance_path_escapes_the_redirected_base(monkeypatch, tmp_path):
+    """The guard that would have caught item 9 on any platform.
+
+    ⚠️ On Windows `/var/lib/...` resolves to the drive root, so the tests
+    that created it passed here for weeks while creating them under the drive root.
+    Asserting containment does not care which platform it runs on.
+    """
+    base = posix(tmp_path)
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: base + '/atlas')
+    monkeypatch.setattr(atlas, 'STORE_IMAGE', base + '/var/atlas/store.img')
+
+    for inst in (None, AGENCY):
+        paths = atlas.instance_paths(None, inst)
+        for key in ('dir', 'mount', 'artifacts', 'cache', 'image', 'image_dir'):
+            assert paths[key].startswith(base), (inst, key, paths[key])
 
 
 def test_reserving_blocks_targets_the_image_it_was_given(monkeypatch):

@@ -134,6 +134,10 @@ API_CONTAINER = 'takmdm-api-1'
 # The one-shot `init` service then exits 1, `api` never starts, and the deploy
 # fails at the build step with nothing in the compose output naming a
 # permission problem. So: create them, and hand them to uid 1000 first.
+#: Spelled out, because an escaped backslash inside a replace() chain is
+#: exactly the kind of literal that gets mis-edited later.
+BACKSLASH = chr(92)
+
 APP_UID = 1000
 APP_GID = 1000
 
@@ -500,10 +504,18 @@ def instance_paths(ctx=None, inst=None):
     d['mount'] = posixpath.join(base, STORE_DIRNAME)
     d['artifacts'] = posixpath.join(base, 'artifacts')
     d['cache'] = posixpath.join(base, 'cache')
-    # ⚠️ `STORE_IMAGE` stays authoritative for the plain instance. `derive`
-    # would produce the same string, but the module constant is what a
-    # deployment configures and what tests redirect, so it wins.
-    d['image'] = STORE_IMAGE if not d['slug'] else d['image']
+    # ⚠️ **`STORE_IMAGE` is authoritative for every instance, not just the
+    # plain one.** `derive` hardcodes `/var/lib/<name>`, and rebasing only the
+    # plain image left an agency's pointing at the real `/var/lib` even when a
+    # test had redirected the constant — so three tests created
+    # `/var/lib/atlas-agencya` for real, as root on a box, and passed. The
+    # comment here already claimed this is 'what tests redirect'; now it is.
+    #
+    # Same layout on a real box: `/var/lib/atlas/store.img` has grandparent
+    # `/var/lib`, so an agency still resolves to `/var/lib/atlas-<slug>`.
+    store_base = posixpath.dirname(posixpath.dirname(STORE_IMAGE))
+    d['image'] = (STORE_IMAGE if not d['slug']
+                  else posixpath.join(store_base, d['name'], 'store.img'))
     d['image_dir'] = posixpath.dirname(d['image'])
     return d
 
@@ -672,6 +684,37 @@ def env_keys_that_reach_nothing(dirpath):
     return [key for key in env_keys_written() if key not in passed]
 
 
+def _env_quote(value):
+    """Make a free-text value safe to put in a compose `.env`.
+
+    ⚠️ **Unquoted is wrong in two ways at once**, and both were measured
+    against `docker compose config` on the box rather than recalled:
+
+    - `Corona & Co #1` arrived as `Corona & Co` — compose treats an unquoted
+      `#` as a comment and truncates the rest of the line.
+    - `${...}` and `$NAME` are **interpolated**, so a name could expand another
+      variable out of the environment into the agency's own footer.
+
+    ⚠️ **Single quotes are literal but cannot hold an apostrophe**, and
+    `'O'Brien County'` does not merely mangle the value — compose fails to
+    parse the entire `.env` (*"line 1: unexpected"*) and the deploy dies. The
+    shell's `'`+`"'"`+`'` trick is not honoured either. Apostrophes are
+    explicitly legal in an agency name, so single quoting is not an option.
+
+    So: **double quotes, with the three characters they give meaning to
+    escaped.** Measured to round-trip apostrophes, `"`, `&`, `#`, backslashes,
+    `$NAME` and `${NAME}` unchanged into the container.
+    """
+    text = '' if value is None else str(value)
+    text = (text.replace(BACKSLASH, BACKSLASH * 2)
+                .replace('"', BACKSLASH + '"')
+                # ⚠️ `$$` is compose's literal-dollar escape. Doubling is what
+                # stops `$HOME` in an agency's name reaching into the
+                # environment of the process that rendered the file.
+                .replace('$', '$$'))
+    return '"' + text + '"'
+
+
 def write_env_value(env_path, key, value):
     """Set one `KEY=value` line in a `.env`, adding it if it is absent.
 
@@ -685,11 +728,14 @@ def write_env_value(env_path, key, value):
     ⚠️ Rewrites the *line*, not a substring. A value containing the key's own
     name, or a comment mentioning it, must not be what gets replaced.
     """
-    try:
-        with open(env_path, 'r', encoding='utf-8') as handle:
-            body = handle.read()
-    except OSError:
-        return False
+    # ⚠️ **Raised, not swallowed.** This returned False on any `OSError`,
+    # and the route above it reported "Written to the deployment
+    # configuration" either way — so a permissions problem or a missing `.env`
+    # read as success, and the operator went looking for the name in a footer
+    # that was never going to show it. A deployment with no `.env` is not a
+    # deployment this can act on, and saying so is the whole point.
+    with open(env_path, 'r', encoding='utf-8') as handle:
+        body = handle.read()
     line = '%s=%s' % (key, value)
     out, replaced = [], False
     for existing in body.splitlines():
@@ -735,7 +781,17 @@ def set_agency_name(ctx, inst, raw_name):
     save_instances(ctx, remaining)
     steps.append('Recorded' if name else 'Name cleared')
 
-    write_env_value(env_path, 'TAKMDM_AGENCY_NAME', name)
+    # ⚠️ The failure is reported, not stepped over. `write_env_value` used to
+    # swallow `OSError` and this line claimed success regardless, so a
+    # permissions problem or a missing `.env` looked exactly like a name that
+    # had been applied — and the operator went looking for it in a footer that
+    # was never going to show it.
+    try:
+        write_env_value(env_path, 'TAKMDM_AGENCY_NAME', _env_quote(name))
+    except OSError as exc:
+        return steps, ('Could not write %s: %s. The name is recorded but this '
+                       'deployment has not been told about it.'
+                       % (env_path, exc))
     steps.append('Written to the deployment configuration')
 
     # ⚠️ **`up -d`, not `restart`.** Measured on the box: the name was in
@@ -1902,7 +1958,7 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
 
     # --- S-1: prove the identity headers came through Caddy -----------------
     if 'TAKMDM_PROXY_AUTH_SECRET=' not in body:
-        secret = _proxy_auth_secret()
+        secret = _proxy_auth_secret(ctx)
         injects = _caddyfile_injects_proxy_auth()
         if secret and injects:
             body = body.rstrip('\n') + '\n\n'
@@ -1918,6 +1974,30 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
             plog('⚠ The Caddy vhost does not inject X-Infratak-Proxy-Auth, so the')
             plog('  header check stays off. ATLAS is no worse off than before; it')
             plog('  simply cannot tell a forged identity header from a real one.')
+        else:
+            # ⚠️ **Caddy injects and we could not read the secret. Stop.**
+            #
+            # This branch did not exist, and its absence was a live hole rather
+            # than an oversight: nothing was logged, `TAKMDM_PROXY_AUTH_SECRET`
+            # was never written, and the vhost attached the header regardless —
+            # so the deploy read as armed while ATLAS had no way to tell a
+            # forged `X-Authentik-Username` from a real one. Any local process
+            # could reach the container through the bridge gateway, which
+            # `TAKMDM_TRUSTED_PROXIES` admits, and be an administrator.
+            #
+            # ⚠️ **Fatal, not a warning, and only in this exact case.** A
+            # console with no proxy-auth feature at all does not inject, and is
+            # handled above — so this cannot fire on a legitimately
+            # secret-less install. Reaching here means the console has the
+            # feature, Caddy is using it, and the module cannot find the file:
+            # a misconfiguration whose only symptom would otherwise be a
+            # security property silently absent.
+            searched = ', '.join(_proxy_auth_secret_path(ctx))
+            raise RuntimeError(
+                'The Caddy vhost injects X-Infratak-Proxy-Auth but this module '
+                'could not read the console\'s shared secret, so ATLAS would '
+                'accept forged identity headers from any process on this host. '
+                'Looked in: ' + searched + '. Refusing to continue.')
 
     if changed:
         with open(env_path, 'w') as f:
@@ -1925,15 +2005,48 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     return changed
 
 
-def _proxy_auth_secret():
-    """The shared secret core generates, or '' if this fork has none."""
-    for candidate in ('/root/infra-TAK/.config/proxy_auth.json',
-                      os.path.expanduser('~/infra-TAK/.config/proxy_auth.json')):
-        try:
-            with open(candidate) as f:
-                return (json.load(f).get('secret') or '').strip()
-        except Exception:
-            continue
+def _proxy_auth_secret_path(ctx=None):
+    """Where the console keeps the shared secret.
+
+    ⚠️ **From `ctx['CONFIG_DIR']` first, because guessing got it wrong.**
+    This asked `/root/infra-TAK/.config/proxy_auth.json` and the console's file
+    is under `CONFIG_DIR`, which is `$CONFIG_DIR` or `<console>/.config`. On a
+    standard install the guess missed, the helper returned `''`, and the gate
+    it arms was never armed — see [_arm_admin_gates] for what that cost.
+
+    The fallback is derived from **this file's own location** rather than from
+    a hardcoded home. `modules/atlas.py` sits one directory below the console,
+    so `../.config` is the same place `CONFIG_DIR` defaults to, whichever user
+    the console runs as and wherever it is installed. `ctx` carries the key
+    from v10.1.80; ours at v10.1.76 does not, so both paths are tried.
+    """
+    from_ctx = (ctx or {}).get('CONFIG_DIR')
+    if from_ctx:
+        yield os.path.join(from_ctx, 'proxy_auth.json')
+    console = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    yield os.path.join(console, '.config', 'proxy_auth.json')
+
+
+def _proxy_auth_secret(ctx=None):
+    """The shared secret the console generates, or '' when it has none.
+
+    ⚠️ `''` means *could not read it*, which is not the same as *this console
+    has no such feature*. The caller tells them apart by asking whether the
+    Caddyfile injects the header, and refuses to continue when it does.
+    """
+    read_priv = (ctx or {}).get('_read_priv')
+    for candidate in _proxy_auth_secret_path(ctx):
+        for reader in (lambda pth: open(pth).read(), read_priv):
+            if reader is None:
+                continue
+            try:
+                # ⚠️ Plain read first, brokered second. The console owns this
+                # file, so the direct read is the normal path; `_read_priv`
+                # covers a console whose config directory it cannot traverse
+                # as itself, and costs a broker round trip only when it must.
+                return (json.loads(reader(candidate)).get('secret') or '').strip()
+            except Exception:
+                continue
     return ''
 
 
@@ -2650,7 +2763,21 @@ def deploy(ctx, job, params):
     # ⚠️ The deployment being built, which is the plain one unless a slug was
     # chosen. Resolved from the recorded list rather than from the request, so a
     # deploy cannot build a deployment nobody registered.
-    _inst = atlas_instances.by_slug(load_instances(ctx), params.get('slug'))
+    #
+    # ⚠️ **An unknown slug is refused, not treated as the plain deployment.**
+    # `by_slug` answers None for both "no slug given" and "no such slug", and
+    # every other route already tells them apart through `_requested_instance`
+    # / `_addressed`. Here the second reading is the dangerous one: a deploy
+    # naming a slug nobody registered would build *over the plain deployment*
+    # — its directory, its port, its compose project, its database volume.
+    _requested_slug = (params.get('slug') or '').strip() or None
+    _known = load_instances(ctx)
+    _inst = atlas_instances.by_slug(_known, _requested_slug)
+    if _requested_slug and _inst is None:
+        raise RuntimeError(
+            'No deployment is registered with the slug "%s". Refusing to '
+            'deploy: an unrecognised slug would otherwise build over the '
+            'plain deployment.' % _requested_slug)
     # ⚠️ Resolved once, before anything is written. Every value below was a
     # module constant that quietly meant "the plain deployment". A deploy that
     # builds in the right directory and then configures itself with another
@@ -2804,7 +2931,10 @@ def deploy(ctx, job, params):
             device_url=_me['device_url'],
             apk_url=_me['apk_url'],
             console_url=_me['console_url'],
-            agency_name=_me['agency_name'],
+            # ⚠️ Quoted here and nowhere else. The instance record holds
+            # the plain name — it is what the console renders — and the
+            # escaping belongs only where compose parses it.
+            agency_name=_env_quote(_me['agency_name']),
         ), perm=0o600)
         # ⚠️ The allocated port, not `APP_PORT`. Two deployments both binding
         # 127.0.0.1:8760 would leave the second failing to start with a port

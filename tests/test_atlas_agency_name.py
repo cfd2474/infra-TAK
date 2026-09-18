@@ -156,9 +156,10 @@ def test_the_env_template_passes_it_to_the_application():
     blank with nothing to explain why."""
     body = atlas._ENV_TEMPLATE.format(
         trusted_proxies='10.0.0.0/8', pg_password='x', device_url='',
-        apk_url='', console_url='', agency_name='Corona Fire Department')
+        apk_url='', console_url='',
+        agency_name=atlas._env_quote('Corona Fire Department'))
 
-    assert 'TAKMDM_AGENCY_NAME=Corona Fire Department' in body
+    assert 'TAKMDM_AGENCY_NAME="Corona Fire Department"' in body
 
 
 def test_deploy_writes_the_name_it_resolved():
@@ -167,7 +168,10 @@ def test_deploy_writes_the_name_it_resolved():
     start = source.index(chr(10) + 'def deploy(')
     end = source.index(chr(10) + 'def ', start + 1)
 
-    assert "agency_name=_me['agency_name']" in source[start:end]
+    # ⚠️ Quoted at this one site. The instance record keeps the plain name —
+    # it is what the console renders — and the escaping belongs only where
+    # compose parses it (upstream review, item 7).
+    assert "agency_name=_env_quote(_me['agency_name'])" in source[start:end]
 
 
 def test_the_pin_points_at_the_release_that_renders_it():
@@ -201,9 +205,10 @@ def test_a_missing_key_is_added(tmp_path):
     env = tmp_path / '.env'
     env.write_text('A=1\n', encoding='utf-8')
 
-    atlas.write_env_value(str(env), 'TAKMDM_AGENCY_NAME', 'Corona Fire Department')
+    atlas.write_env_value(str(env), 'TAKMDM_AGENCY_NAME',
+                          atlas._env_quote('Corona Fire Department'))
 
-    assert 'TAKMDM_AGENCY_NAME=Corona Fire Department' in \
+    assert 'TAKMDM_AGENCY_NAME="Corona Fire Department"' in \
         env.read_text(encoding='utf-8')
 
 
@@ -230,8 +235,37 @@ def test_writing_the_same_value_changes_nothing(tmp_path):
     assert atlas.write_env_value(str(env), 'TAKMDM_AGENCY_NAME', 'Same') is False
 
 
-def test_a_missing_file_is_not_an_exception(tmp_path):
-    assert atlas.write_env_value(str(tmp_path / 'nope'), 'K', 'v') is False
+def test_a_missing_file_is_reported_rather_than_swallowed(tmp_path):
+    """⚠️ **Inverted deliberately (upstream review, item 8).** This used to
+    assert that a missing `.env` returned False — and the route above it
+    reported "Written to the deployment configuration" either way, so a
+    permissions problem read as success and the operator went looking for the
+    name in a footer that was never going to show it."""
+    with pytest.raises(OSError):
+        atlas.write_env_value(str(tmp_path / 'nope'), 'K', 'v')
+
+
+def test_the_route_reports_a_write_that_failed(tmp_path, monkeypatch):
+    """And the caller turns it into an error rather than a step."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    d = tmp_path / 'atlas-corona'
+    d.mkdir()
+    (d / '.env').write_text('TAKMDM_AGENCY_NAME=""\n', encoding='utf-8')
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    saved = {ai.INSTANCES_KEY: [inst]}
+    ctx = {'load_settings': lambda: dict(saved),
+           'save_settings': lambda s: saved.update(s)}
+
+    def refuse(*a, **k):
+        raise OSError(13, 'Permission denied')
+
+    monkeypatch.setattr(atlas, 'write_env_value', refuse)
+
+    steps, err = atlas.set_agency_name(ctx, inst, 'Corona Fire Department')
+
+    assert err and 'Permission denied' in err
+    assert 'Written to the deployment configuration' not in steps
 
 
 class Result:
@@ -273,7 +307,7 @@ def test_it_reaches_the_deployment_s_configuration(built):
 
     atlas.set_agency_name(ctx, inst, 'Corona Fire Department')
 
-    assert 'TAKMDM_AGENCY_NAME=Corona Fire Department' in \
+    assert 'TAKMDM_AGENCY_NAME="Corona Fire Department"' in \
         (d / '.env').read_text(encoding='utf-8')
 
 
@@ -321,7 +355,7 @@ def test_a_name_can_be_cleared(built):
 
     assert err is None
     assert saved[ai.INSTANCES_KEY][0]['agency_name'] == ''
-    assert 'TAKMDM_AGENCY_NAME=\n' in (d / '.env').read_text(encoding='utf-8')
+    assert 'TAKMDM_AGENCY_NAME=""\n' in (d / '.env').read_text(encoding='utf-8')
 
 
 def test_a_deployment_with_no_configuration_is_refused(monkeypatch, tmp_path):
