@@ -599,11 +599,19 @@ def env_keys_written():
 
 
 def env_keys_compose_passes(dirpath):
-    """The `TAKMDM_*` names the checkout's compose file passes to the container.
+    """The `TAKMDM_*` names the checkout's compose file actually consumes.
 
     None when the file cannot be read — "we could not look" is not "nothing is
     declared", and reporting the second would raise a false alarm on every
     deploy that happened to race the clone.
+
+    ⚠️ **Two ways a variable is consumed, and only counting one raised a false
+    alarm on the first run.** Most are named as keys under `environment:`, but
+    `TAKMDM_DB_PASSWORD` is only ever *interpolated* — into
+    `POSTGRES_PASSWORD` for the database service and into
+    `TAKMDM_DATABASE_URL` for the application. Reporting it as unread would put
+    a warning an operator cannot act on into every deploy log, which is how a
+    warning stops being read at all.
     """
     try:
         with open(os.path.join(dirpath, 'docker-compose.yml'),
@@ -611,8 +619,9 @@ def env_keys_compose_passes(dirpath):
             body = handle.read()
     except OSError:
         return None
-    return sorted(set(re.findall(r'^\s+(TAKMDM_[A-Z0-9_]+):', body,
-                                 re.MULTILINE)))
+    named = re.findall(r'^\s+(TAKMDM_[A-Z0-9_]+):', body, re.MULTILINE)
+    interpolated = re.findall(r'\$\{(TAKMDM_[A-Z0-9_]+)', body)
+    return sorted(set(named) | set(interpolated))
 
 
 def env_keys_that_reach_nothing(dirpath):

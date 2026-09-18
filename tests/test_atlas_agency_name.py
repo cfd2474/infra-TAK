@@ -560,3 +560,23 @@ def test_the_deploy_log_says_so():
 
     assert 'env_keys_that_reach_nothing(dirpath)' in body
     assert 'does not read' in body
+
+
+def test_a_variable_that_is_only_interpolated_still_counts(tmp_path):
+    """⚠️ **A false positive the first run produced, on the box.**
+    `TAKMDM_DB_PASSWORD` is never a key under `environment:` — it is
+    interpolated into `POSTGRES_PASSWORD` for the database and into
+    `TAKMDM_DATABASE_URL` for the application. Reporting it as unread would put
+    a warning an operator cannot act on into every deploy log, which is how a
+    warning stops being read at all."""
+    d = tmp_path / 'atlas-corona'
+    d.mkdir(parents=True)
+    (d / 'docker-compose.yml').write_text(
+        'services:' + chr(10)
+        + '  db:' + chr(10)
+        + '    environment:' + chr(10)
+        + '      POSTGRES_PASSWORD: ${TAKMDM_DB_PASSWORD:-takmdm}' + chr(10),
+        encoding='utf-8')
+
+    assert 'TAKMDM_DB_PASSWORD' in atlas.env_keys_compose_passes(str(d))
+    assert 'TAKMDM_DB_PASSWORD' not in atlas.env_keys_that_reach_nothing(str(d))
