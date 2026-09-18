@@ -53,6 +53,8 @@ function check(name, ok, detail) {
 const CAPACITY = {
   budget_gb: 354.6, committed_gb: 0, pool_gb: 354.6, remaining_gb: 354.6,
   min_gb: 2, max_gb: 319.6, may_deploy_plain: true, slugs: [],
+  plain_host: "atlas.leckliter.net",
+  host_template: "atlas.{slug}.leckliter.net",
 };
 
 function harness(capacity) {
@@ -163,7 +165,7 @@ function harness(capacity) {
   check("an uppercase slug is accepted as its lowercase form",
     h.problem() === null, String(h.problem()));
   check("and is shown back normalised",
-    h.el("slugPreview").textContent.includes("atlas.agency-b."),
+    h.el("slugPreview").textContent.includes("atlas.agency-b.leckliter.net"),
     h.el("slugPreview").textContent);
 
   h.slug("AGENCY-A");
@@ -222,7 +224,8 @@ function harness(capacity) {
   check("the modal opens for a valid choice",
     h.el("instanceModal").classList.contains("open"));
   check("the summary names the agency", summary.includes("pd"), summary);
-  check("the summary names the hostname", summary.includes("atlas.pd."), summary);
+  check("the summary names the real hostname",
+    summary.includes("atlas.pd.leckliter.net"), summary);
   check("the summary names the type", summary.includes("fixed"), summary);
   check("the summary names the size", summary.includes("50 GB"), summary);
 
@@ -269,6 +272,44 @@ function harness(capacity) {
   check("and it goes back when the last one is removed",
     h.el("addInstanceBtn").textContent === "Deploy instance",
     h.el("addInstanceBtn").textContent);
+}
+
+// --- the confirmation names the real domain --------------------------------- //
+{
+  const h = harness({ ...CAPACITY });
+  h.pick("dynamic");
+  h.slug("corona");
+  check("the preview names the real domain",
+    h.el("slugPreview").textContent.includes("atlas.corona.leckliter.net"),
+    h.el("slugPreview").textContent);
+
+  h.open();
+  const summary = h.el("instanceConfirmSummary").textContent;
+  check("and so does the confirmation",
+    summary.includes("atlas.corona.leckliter.net")
+    && !summary.includes("<your-domain>"), summary);
+}
+
+{
+  // ⚠️ Before the box has an FQDN there is nothing truthful to show, and an
+  // invented domain in a confirmation is worse than an obvious placeholder.
+  const h = harness({ ...CAPACITY, plain_host: "", host_template: "" });
+  h.pick("dynamic");
+  h.slug("corona");
+  h.open();
+  check("without an FQDN it falls back to the placeholder rather than guessing",
+    h.el("instanceConfirmSummary").textContent.includes("<your-domain>"),
+    h.el("instanceConfirmSummary").textContent);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.pick("dynamic");
+  h.slug("");
+  h.open();
+  check("a general deployment names the plain host",
+    h.el("instanceConfirmSummary").textContent.includes("atlas.leckliter.net"),
+    h.el("instanceConfirmSummary").textContent);
 }
 
 console.log(fails === 0

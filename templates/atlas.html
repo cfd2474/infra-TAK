@@ -684,6 +684,17 @@ function renderInstances(data){
   }
 }
 
+function hostFor(slug){
+  // ⚠️ The server sends the template, so the rule for where a slug sits in a
+  // hostname lives in `agency_host` and nowhere else. This only substitutes.
+  // `<your-domain>` is the honest fallback before the box's FQDN is known —
+  // a guessed domain in a confirmation is worse than an obvious placeholder.
+  const plain = (capacityState && capacityState.plain_host) || '';
+  const tpl = (capacityState && capacityState.host_template) || '';
+  if (!slug) return plain || 'atlas.<your-domain>';
+  return tpl ? tpl.replace('{slug}', slug) : 'atlas.' + slug + '.<your-domain>';
+}
+
 function currentMode(){
   const fixed = document.querySelector('input[name="sizeMode"][value="fixed"]');
   return fixed && fixed.checked ? 'fixed' : 'dynamic';
@@ -722,7 +733,7 @@ function previewSlug(){
     out.textContent = '⚠ Lowercase letters, digits and hyphens only, and it '
       + 'cannot start or end with a hyphen.';
   } else {
-    out.textContent = 'Will deploy as ' + slug + ' at atlas.' + slug + '.<your-domain>';
+    out.textContent = 'Will deploy as ' + slug + ' at ' + hostFor(slug);
   }
   refreshAddGate();
 }
@@ -775,7 +786,7 @@ function openInstanceConfirm(){
   const size = document.getElementById('instanceSize');
   const rows = [
     '  agency      ' + (slug || 'none — the box\u2019s general ATLAS'),
-    '  hostname    ' + (slug ? 'atlas.' + slug + '.<your-domain>' : 'atlas.<your-domain>'),
+    '  hostname    ' + hostFor(slug),
     '  type        ' + mode,
     '  storage     ' + (mode === 'fixed'
       ? (size.value + ' GB, reserved and held')

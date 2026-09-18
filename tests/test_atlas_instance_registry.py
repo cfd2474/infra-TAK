@@ -457,3 +457,27 @@ def test_drift_carries_what_is_available(deployed):
     _checkout(deployed, 'atlas', '1.47.3')
 
     assert atlas.version_drift(Ctx({'atlas_enabled': True}))['available'] == '1.48.0'
+
+
+def test_the_facts_carry_the_real_hostname(roomy, monkeypatch):
+    """⚠️ So the confirmation can name the box's actual domain instead of
+    `<your-domain>`. The *rule* for where a slug sits stays in `agency_host`:
+    the template is built here and the page only substitutes, so the two cannot
+    drift into disagreeing about the shape of an agency hostname."""
+    ctx = Ctx()
+    ctx['_get_service_domain'] = lambda s, key: 'atlas.leckliter.net'
+
+    facts = atlas.capacity_facts(ctx, size_gb=50)
+
+    assert facts['plain_host'] == 'atlas.leckliter.net'
+    assert facts['host_template'] == 'atlas.{slug}.leckliter.net'
+    assert facts['host_template'].replace('{slug}', 'corona') ==         'atlas.corona.leckliter.net'
+
+
+def test_a_box_without_a_domain_offers_no_hostname(roomy):
+    """⚠️ Empty, not invented. A guessed domain in a confirmation is worse than
+    an obvious placeholder, because it looks like it was checked."""
+    facts = atlas.capacity_facts(Ctx(), size_gb=50)
+
+    assert facts['plain_host'] == ''
+    assert facts['host_template'] == ''

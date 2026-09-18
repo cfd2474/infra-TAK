@@ -621,6 +621,16 @@ def capacity_facts(ctx, size_gb=None):
     dynamic = sum(1 for i in instances
                   if i.get('mode') == atlas_instances.MODE_DYNAMIC)
 
+    # ⚠️ The real hostname, so the confirmation can name it instead of saying
+    # "<your-domain>". The *rule* for where a slug goes stays in `agency_host`:
+    # the template is built here and the page only substitutes, so the two
+    # cannot drift into disagreeing about the shape of an agency hostname.
+    plain_host = ''
+    try:
+        plain_host = ctx['_get_service_domain'](ctx['load_settings'](), KEY) or ''
+    except (KeyError, TypeError):
+        plain_host = ''
+
     ram_total, ram_available = _memory_bytes()
     by_ram = atlas_instances.instances_that_ram_allows(
         ram_available, 4 * atlas_instances.GIB)
@@ -657,6 +667,9 @@ def capacity_facts(ctx, size_gb=None):
         'by_ram': by_ram,
         'binding': which,
         'room_for': how_many,
+        'plain_host': plain_host,
+        'host_template': atlas_instances.agency_host(plain_host, '{slug}')
+        if plain_host else '',
         'may_deploy_plain': atlas_instances.may_deploy_plain(instances),
         # ⚠️ So the page can refuse a duplicate slug before anything is
         # recorded. The server refuses it too — this is the courtesy, not
