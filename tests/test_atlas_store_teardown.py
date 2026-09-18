@@ -193,9 +193,13 @@ def test_uninstall_stops_and_reports_failure_when_the_store_will_not_go(
     """⚠️ **The contract that was missing.** The store failing means the mounts
     are still inside the install directory, so deleting it would half-succeed.
     Stop, say so, and leave the box re-runnable."""
-    recorder = Recorder(fail=("umount",))
-    monkeypatch.setattr(atlas, "_run_root", recorder)
-    monkeypatch.setattr(os.path, "ismount", lambda p: p.endswith("store"))
+    # ⚠️ The mechanism changed and the property did not. There is nothing to
+    # unmount now; what fails instead is deleting a tree the containers own --
+    # `pgdata` is uid 70, `artifacts` and `cache` are the application's uid --
+    # which is exactly what the operator hit on the first real teardown.
+    monkeypatch.setattr(
+        atlas, "_rm_priv",
+        lambda path, inside: "could not remove %s: Permission denied" % path)
 
     result = atlas.uninstall(uninstallable, None, {})
 
@@ -214,12 +218,15 @@ def test_uninstall_reports_failure_when_the_directory_will_not_go(
         raise OSError(16, "Device or resource busy")
 
     monkeypatch.setattr(atlas.shutil, "rmtree", refuse)
+    # ⚠️ The brokered fallback has to fail too, or `_rm_priv` succeeds and
+    # there is nothing to report. Without this the test would assert on a
+    # failure path it had just repaired.
+    monkeypatch.setattr(atlas, "_broker_script", lambda: None)
 
     result = atlas.uninstall(uninstallable, None, {})
 
     assert result["success"] is False
     assert "could not be removed" in result["error"]
-    assert "Device or resource busy" in result["error"]
 
 
 def test_a_failed_uninstall_does_not_clear_the_settings(
@@ -232,6 +239,7 @@ def test_a_failed_uninstall_does_not_clear_the_settings(
         atlas.shutil, "rmtree",
         lambda _p: (_ for _ in ()).throw(OSError(16, "Device or resource busy")),
     )
+    monkeypatch.setattr(atlas, "_broker_script", lambda: None)
 
     atlas.uninstall(uninstallable, None, {})
 

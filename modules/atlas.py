@@ -1240,6 +1240,47 @@ def _chown_priv(path, uid, gid):
     return None
 
 
+def _rm_priv(path, inside):
+    """Delete a tree the console may not own. Returns an error string, or None.
+
+    ⚠️ **The containers own most of what a deployment writes.** `pgdata` is
+    uid 70 and `0700`; `artifacts/` and `cache/` are the application's uid.
+    The console can descend into them and cannot unlink their contents, so
+    `shutil.rmtree` fails and — measured on the box — so does `rm -rf`
+    through the PATH shim, which only routes `/etc /opt /usr /var /run /boot
+    /swapfile` and lets a home path through to `/usr/bin/rm`.
+
+    ⚠️ **`inside` is not decoration.** This ends in `rm -rf` as root, so
+    the caller states the directory the target must live under and anything
+    else is refused before the broker is asked. The paths come from
+    `instance_paths` and the slug is `^[a-z]{1,32}$`, so this should be
+    unreachable — which is exactly when a guard is worth having.
+    """
+    root = inside.rstrip('/') + '/'
+    if not path.startswith(root) or '..' in path.split('/'):
+        return 'refusing to delete %s: it is not inside %s' % (path, inside)
+    if not os.path.isdir(path) and not os.path.isfile(path):
+        return None
+
+    try:
+        shutil.rmtree(path)
+        return None
+    except OSError:
+        pass
+
+    broker = _broker_script()
+    if broker is None:
+        return ('could not remove %s and this console is neither root nor has '
+                'a broker to ask.' % path)
+    rc, out = _run_root(['python3', broker, 'exec', '--', 'rm', '-rf', path],
+                        timeout=300)
+    # ⚠️ Checked, not trusted. W205's uninstall reported success over a
+    # device CA and a database it had left on disk.
+    if rc != 0 or os.path.exists(path):
+        return 'could not remove %s: %s' % (path, out.strip()[:200])
+    return None
+
+
 def _run_root(argv, timeout=120):
     """(rc, output). Runs as the console already does — root, no shell."""
     try:
@@ -1353,27 +1394,17 @@ def remove_store(ctx, plog, inst=None):
     if rc == 0:
         did.append('Docker volume %s removed' % volume)
 
-    store = paths['store']
-    if os.path.isdir(store):
-        # ⚠️ `pgdata` is owned by uid 70, not by the console, so an ordinary
-        # `rmtree` cannot remove it — a directory the console can descend into
-        # but whose entries it does not own. The brokered `rm` is what reaches
-        # it, and the outcome is checked rather than assumed, because the
-        # failure this replaces reported success over a database left on disk.
-        rc, out = _run_root(['rm', '-rf', store], timeout=300)
-        if rc != 0 or os.path.isdir(store):
-            errs.append('could not remove %s: %s' % (store, out.strip()[:200]))
-        else:
-            did.append('%s removed' % store)
-
-    for path in (paths['artifacts'], paths['cache']):
-        if not os.path.isdir(path):
+    # ⚠️ Every one of these is owned by a container, not by the console:
+    # `pgdata` by uid 70, `artifacts` and `cache` by the application's uid.
+    # All three go through the same privileged removal.
+    for path in (paths['store'], paths['artifacts'], paths['cache']):
+        if not os.path.exists(path):
             continue
-        try:
-            shutil.rmtree(path)
+        err = _rm_priv(path, paths['dir'])
+        if err:
+            errs.append(err)
+        else:
             did.append('%s removed' % path)
-        except OSError as exc:
-            errs.append('could not remove %s: %s' % (path, exc))
 
     return did, errs
 

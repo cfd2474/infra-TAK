@@ -269,17 +269,32 @@ def test_removing_a_clean_box_reports_no_errors(box):
     assert errs == []
 
 
-def test_the_volume_goes_before_the_directories(box, tmp_path):
+def test_the_volume_goes_before_the_directories(box, tmp_path, monkeypatch):
     """⚠️ Leaving it behind makes the next deploy refuse -- `_bind_pg_volume`
-    rejects a volume already pointing somewhere unexpected."""
+    rejects a volume already pointing somewhere unexpected.
+
+    ⚠️ Asserted by recording both kinds of call, not by looking for `rm -rf`
+    in the argv. `_rm_priv` only falls back to the broker when the console
+    cannot delete the tree itself, which on this machine it always can -- so a
+    test that searched for the brokered command found nothing and failed for
+    a reason that had nothing to do with ordering.
+    """
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+
+    order = []
+    real_rm = atlas._rm_priv
+    monkeypatch.setattr(atlas, '_rm_priv',
+                        lambda path, inside: order.append('rm') or real_rm(path, inside))
+    runner = atlas._run_root
+    monkeypatch.setattr(
+        atlas, '_run_root',
+        lambda argv, timeout=120: (order.append('volume')
+                                   if 'volume' in argv else None) or runner(argv, timeout))
 
     atlas.remove_store({}, lambda *_: None, inst=AGENCY)
 
-    calls = [' '.join(c) for c in box.calls]
-    volume = next(i for i, c in enumerate(calls) if 'volume rm' in c)
-    removal = next(i for i, c in enumerate(calls) if c.startswith('rm -rf'))
-    assert volume < removal, calls
+    assert 'volume' in order and 'rm' in order, order
+    assert order.index('volume') < order.index('rm'), order
 
 
 def test_the_default_instance_is_still_the_plain_one(box, tmp_path):
