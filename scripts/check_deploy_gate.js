@@ -369,6 +369,109 @@ function harness(capacity) {
     h.el("instanceList").textContent);
 }
 
+// --- one row per finished deployment, each acting on itself ---------------- //
+//
+// ⚠️ The single "Update ATLAS" / Restart / Stop trio acted on `takmdm` whatever
+// the box held, so on a box whose only deployment is an agency all three did
+// nothing and said nothing. These drive the replacement.
+
+const RUNNING = { slug: "corona", mode: "dynamic", size_gb: 354.6,
+                  built: true, running: true, version: "1.48.0" };
+const STOPPED = { slug: "redlands", mode: "dynamic", size_gb: 50,
+                  built: true, running: false, version: "1.48.0" };
+const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
+                     built: false, running: false, version: "1.48.0" };
+
+function labels(node) {
+  return (node.children || []).map((c) => c.textContent);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [RUNNING], capacity: { ...CAPACITY } });
+  const rows = h.el("instanceRows").children;
+
+  check("a finished deployment gets a row", rows.length === 1);
+  check("the row links to that deployment's own host",
+    labels(rows[0]).some((t) => t === "atlas.corona.leckliter.net"),
+    JSON.stringify(labels(rows[0])));
+  check("and says it is running, with its version",
+    labels(rows[0]).some((t) => t === "running  v1.48.0"),
+    JSON.stringify(labels(rows[0])));
+  check("a running deployment offers Update, Restart and Stop",
+    ["Update", "Restart", "Stop"].every((t) => labels(rows[0]).includes(t)),
+    JSON.stringify(labels(rows[0])));
+  check("and not Start",
+    !labels(rows[0]).includes("Start"), JSON.stringify(labels(rows[0])));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [STOPPED], capacity: { ...CAPACITY } });
+  const row = h.el("instanceRows").children[0];
+
+  check("a stopped deployment says so", labels(row).includes("stopped  v1.48.0"),
+    JSON.stringify(labels(row)));
+  // ⚠️ Start, not Restart. `docker compose restart` on a stopped project does
+  // nothing and reports success, so the button would look broken.
+  check("and offers Start rather than Stop",
+    labels(row).includes("Start") && !labels(row).includes("Stop"),
+    JSON.stringify(labels(row)));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [UNFINISHED], capacity: { ...CAPACITY } });
+
+  check("an unfinished deployment gets no row of buttons",
+    h.el("instanceRows").children.length === 0);
+  check("it is offered a way to finish instead",
+    h.el("retryRow").hidden === false);
+}
+
+// --- update all ------------------------------------------------------------- //
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [RUNNING], capacity: { ...CAPACITY } });
+  check("one deployment is not offered 'update all'",
+    h.el("updateAllRow").hidden === true);
+
+  h.render({ instances: [RUNNING, STOPPED], capacity: { ...CAPACITY } });
+  check("two are", h.el("updateAllRow").hidden === false);
+
+  h.render({ instances: [RUNNING, UNFINISHED], capacity: { ...CAPACITY } });
+  check("an unfinished one does not count towards it",
+    h.el("updateAllRow").hidden === true);
+}
+
+// --- drift ------------------------------------------------------------------ //
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [RUNNING, STOPPED], capacity: { ...CAPACITY } });
+  check("deployments on the same release are not called drifted",
+    h.el("driftNote").hidden === true);
+
+  h.render({ instances: [RUNNING, { ...STOPPED, version: "1.47.3" }],
+             capacity: { ...CAPACITY } });
+  check("deployments on different releases are",
+    h.el("driftNote").hidden === false);
+  check("and both releases are named",
+    h.el("driftNote").textContent.includes("1.47.3")
+    && h.el("driftNote").textContent.includes("1.48.0"),
+    h.el("driftNote").textContent);
+}
+
+{
+  // ⚠️ An unfinished deployment carries a VERSION the moment its clone
+  // succeeds, so counting it would report drift on a box where everything
+  // running agrees — true, and not something anybody can act on.
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [RUNNING, { ...UNFINISHED, version: "1.47.3" }],
+             capacity: { ...CAPACITY } });
+  check("an unfinished deployment is not drift",
+    h.el("driftNote").hidden === true, h.el("driftNote").textContent);
+}
+
 console.log(fails === 0
   ? "\n  all deployment-form checks passed"
   : "\n  " + fails + " check(s) failed");

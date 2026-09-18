@@ -26,6 +26,15 @@ from modules import atlas_instances as ai  # noqa: E402
 GIB = ai.GIB
 
 
+class _Probe:
+    """What `probe_run` hands back: stdout and nothing else."""
+
+    def __init__(self, stdout=''):
+        self.stdout = stdout
+        self.stderr = ''
+        self.returncode = 0
+
+
 class Ctx(dict):
     """Just enough console to hold settings."""
 
@@ -34,6 +43,10 @@ class Ctx(dict):
         self.settings = dict(settings or {})
         self['load_settings'] = lambda: dict(self.settings)
         self['save_settings'] = self._save
+        # ⚠️ Present and answering "not running". Left out, the liveness probe
+        # raised KeyError inside a bare `except Exception` and *looked* like a
+        # stopped container — so a test could pass for the wrong reason.
+        self['probe_run'] = lambda argv, **k: _Probe('false')
 
     def _save(self, s):
         self.settings = dict(s)
@@ -383,16 +396,33 @@ def test_a_job_key_is_acceptable_to_the_registry():
     assert all(c.isalnum() or c in '-_' for c in key)
 
 
-def _checkout(base, name, version):
+#: Compose projects the fixture pretends exist. ⚠️ A checkout alone is not a
+#: deployment — that is what `test_a_checkout_alone_is_not_a_deployment` pins —
+#: so a fixture that only writes VERSION describes an *unfinished* deploy. Every
+#: version test below means a finished one, so `_checkout` records the project
+#: too, and the one test about an unfinished deployment opts out.
+_BUILT = set()
+
+
+def _project_for(name):
+    return 'takmdm' if name == 'atlas' else 'takmdm-' + name.split('-', 1)[1]
+
+
+def _checkout(base, name, version, built=True):
     d = base / name
     d.mkdir(parents=True, exist_ok=True)
     (d / 'VERSION').write_text(version, encoding='utf-8')
+    if built:
+        _BUILT.add(_project_for(name))
 
 
 @pytest.fixture
 def deployed(monkeypatch, tmp_path):
+    _BUILT.clear()
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
     monkeypatch.setattr(atlas, '_latest_version', lambda use_cache=True: '1.48.0')
+    monkeypatch.setattr(atlas, 'compose_projects_present',
+                        lambda ctx=None: set(_BUILT))
     return tmp_path
 
 

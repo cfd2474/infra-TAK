@@ -297,6 +297,81 @@ def _function_source(name):
     return text[start:end]
 
 
+#: ⚠️ **Both jobs, not just `deploy`.** `_run_update` is `deploy` minus the
+#: destructive parts and had every one of the same constants — the plain
+#: checkout, the plain compose project, the plain network, the plain version
+#: key. Three mutations survived the chunk-8 sweep until these were
+#: parametrised, so the generalisation is not tidiness: it is the only thing
+#: standing between an agency update and a rebuild of somebody else's
+#: deployment.
+JOBS = ('deploy', '_run_update')
+
+
+@pytest.mark.parametrize('job', JOBS)
+def test_no_job_resolves_a_path_outside_its_identity(job):
+    """⚠️ `atlas_dir(ctx)` is the *plain* install directory. Calling it inside
+    a job that has already resolved its own deployment is how an agency update
+    came to `git fetch` in `/root/atlas` — which on a box with no plain
+    deployment does not exist, and on a box with one updates the wrong tree."""
+    source = _function_source(job)
+
+    assert 'atlas_dir(' not in source,         '%s resolves the plain install directory rather than its own' % job
+
+
+#: Helpers whose *default* is the plain deployment, so a call that omits the
+#: instance silently acts on somebody else's. ⚠️ Listed explicitly rather than
+#: matched by shape: `_installed_version(ctx, inst)` takes it positionally and
+#: a shape rule would either miss these or flag that.
+SCOPED_HELPERS = ('_compose', '_compose_exec', '_verify_access_control',
+                  'ensure_authentik_app')
+
+
+@pytest.mark.parametrize('job', JOBS)
+def test_every_scoped_call_in_a_job_names_its_deployment(job):
+    """⚠️ `_verify_access_control` was the last one found, by a mutation that
+    survived: an agency update re-checked the *plain* deployment's Authentik
+    binding, recorded the answer against the agency, and reported it in the
+    agency's log. The tile would then have gone green for a console nobody had
+    checked."""
+    import re
+
+    source = _function_source(job)
+    seen = 0
+    for fn in SCOPED_HELPERS:
+        for call in re.findall(r'%s\((?:[^()]|\([^()]*\))*\)' % fn, source):
+            seen += 1
+            flat = ' '.join(call.split())
+            assert 'inst=' in flat,                 '%s: this call still targets the plain deployment: %s'                 % (job, flat)
+
+    assert seen, '%s no longer calls any of %s' % (job, ', '.join(SCOPED_HELPERS))
+
+
+@pytest.mark.parametrize('job', JOBS)
+def test_every_plain_defaulted_call_in_a_job_names_its_deployment(job):
+    import re
+
+    source = _function_source(job)
+
+    for fn in ('_bridge_gateway', '_set_trusted_proxies'):
+        for call in re.findall(r'%s\((?:[^()]|\([^()]*\))*\)' % fn, source):
+            flat = ' '.join(call.split())
+            assert '_me[' in flat,                 '%s: this call still takes the plain default: %s' % (job, flat)
+
+
+@pytest.mark.parametrize('job', JOBS)
+def test_no_job_writes_a_setting_under_a_hardcoded_plain_key(job):
+    import re
+
+    source = _function_source(job)
+    writes = re.findall(r"s(?:_early)?\[f?'\{(\w+)\}(\w+)'\]", source)
+
+    for var, key in writes:
+        if var == 'KEY':
+            assert key == '_enabled',                 "%s writes the plain 'atlas%s' for every deployment" % (job, key)
+        else:
+            assert var == '_prefix',                 '%s: settings written under %r, not the deployment prefix'                 % (job, var)
+
+
 def test_every_compose_call_in_deploy_names_its_instance():
     """⚠️ **The bug this is here for.** `deploy` resolved the instance for its
     directory and its store and then left every `_compose` call on the default,

@@ -750,19 +750,63 @@ def version_drift(ctx):
     discovered later — and it is the reason an "update all" button needs a
     per-instance result list rather than a single success flag.
     """
-    rows = []
-    for inst in load_instances(ctx):
-        rows.append({
-            'slug': inst.get('slug'),
-            'mode': inst.get('mode'),
-            'version': _installed_version(ctx, inst),
-        })
-    versions = sorted({r['version'] for r in rows if r['version']})
+    projects = compose_projects_present(ctx)
+    rows = [instance_status(ctx, inst, projects, probe_version=True)
+            for inst in load_instances(ctx)]
+    # ⚠️ Drift is measured on the *built* deployments. An unfinished one has no
+    # version to disagree with, and counting its None as a version would report
+    # drift on a box where every running deployment is on the same release.
+    versions = sorted({r['version'] for r in rows if r['built'] and r['version']})
     return {
         'instances': rows,
         'versions': versions,
         'drifted': len(versions) > 1,
         'available': _latest_version(use_cache=True),
+    }
+
+
+def instance_status(ctx, inst, projects=None, probe_version=False):
+    """Everything the console needs to say about one deployment.
+
+    ⚠️ **`probe_version` is off by default, and that is a performance
+    contract.** Asking the container its version is an HTTP round-trip with a
+    five-second timeout. `detect` runs on every dashboard poll from several
+    threads and must answer in under a second, so it asks only the cheap
+    questions; the drift table, served by a route an operator opened
+    deliberately, asks the expensive one.
+
+    ⚠️ **`built` and `running` are different questions and both are needed.** A
+    deployment that never finished has no containers and is not "stopped" — it
+    is unfinished, and the action it needs is *finish*, not *start*. Collapsing
+    the two is what left the operator with a claimed slug and no button.
+    """
+    names = atlas_instances.derive(inst)
+    built = instance_is_built(ctx, inst, projects)
+    running = False
+    if built:
+        try:
+            r = ctx['probe_run'](
+                ['docker', 'inspect', '--format', '{{.State.Running}}',
+                 api_container(ctx, inst)],
+                text=True, timeout=3,
+            )
+            running = (r.stdout or '').strip() == 'true'
+        except Exception:
+            running = False
+    return {
+        'slug': names['slug'],
+        'name': names['name'],
+        'mode': inst.get('mode'),
+        'size_gb': inst.get('size_gb'),
+        'port': names['port'],
+        'built': built,
+        'running': running,
+        # ⚠️ Both versions, when asked. They agree on a healthy deployment;
+        # when they do not, the running one is the truth and the difference is a
+        # rebuild that did not take.
+        'version': _installed_version(ctx, inst),
+        'running_version': (_running_version(ctx, inst)
+                            if running and probe_version else None),
     }
 
 
@@ -791,6 +835,20 @@ def caddy_sites(settings, plain_host):
             'ca_path': sync_device_ca_for_caddy(inst),
         })
     return sites
+
+
+def api_container(ctx=None, inst=None):
+    """The API container of one deployment.
+
+    ⚠️ `API_CONTAINER` is the *plain* deployment's, and it was the answer
+    everywhere: logs, exec, the running-version probe, the tile's liveness
+    check. On a box whose only deployment is an agency, every one of those
+    reports on a container that does not exist — so the console says ATLAS is
+    down, shows no logs, and offers an update for a checkout it is not reading.
+    """
+    if not (inst or {}).get('slug'):
+        return API_CONTAINER
+    return '%s-api-1' % instance_paths(ctx, inst)['compose_project']
 
 
 def compose_projects_present(ctx=None):
@@ -1698,8 +1756,7 @@ def _compose_exec(ctx, argv, timeout=60, stdin=None, inst=None):
     # ⚠️ Each deployment has its own container, named from its compose project.
     # `API_CONTAINER` is the plain one, so an agency exec would land in another
     # deployment's database — or, more often, in nothing at all.
-    container = API_CONTAINER if not (inst or {}).get('slug') else (
-        f"{instance_paths(ctx, inst)['compose_project']}-api-1")
+    container = api_container(ctx, inst)
     try:
         r = subprocess.run(
             ['docker', 'exec'] + flags + [container] + argv,
@@ -1713,7 +1770,7 @@ def _compose_exec(ctx, argv, timeout=60, stdin=None, inst=None):
     return (r.stdout or '') + (r.stderr or '')
 
 
-def _compose_exec_rc(ctx, argv, timeout=60, stdin=None):
+def _compose_exec_rc(ctx, argv, timeout=60, stdin=None, inst=None):
     """Same, but the caller needs the exit status rather than the text.
 
     `_compose_exec` collapses failure into None, which suits a status read and
@@ -1724,7 +1781,7 @@ def _compose_exec_rc(ctx, argv, timeout=60, stdin=None):
     flags = ['-i'] if stdin is not None else []
     try:
         r = subprocess.run(
-            ['docker', 'exec'] + flags + [API_CONTAINER] + argv,
+            ['docker', 'exec'] + flags + [api_container(ctx, inst)] + argv,
             capture_output=True, text=True, timeout=timeout,
             input=stdin if stdin is not None else None,
         )
@@ -1824,15 +1881,21 @@ def detect(ctx):
     """
     s = ctx['load_settings']()
     enabled = bool(s.get(f'{KEY}_enabled'))
-    running = False
-    try:
-        r = ctx['probe_run'](
-            ['docker', 'inspect', '--format', '{{.State.Running}}', API_CONTAINER],
-            text=True, timeout=3,
-        )
-        running = (r.stdout or '').strip() == 'true'
-    except Exception:
-        running = False
+    # ⚠️ Every *built* deployment, not `takmdm-api-1`. A box running only an
+    # agency reported ATLAS down while its console was serving, and one agency
+    # stopped out of five would have reported ATLAS up.
+    #
+    # ⚠️ Unfinished deployments are excluded rather than counted as down. They
+    # have no containers by definition, so including them would pin the tile to
+    # "not running" until the operator either finished or forgot them — which is
+    # a different message, and one the page already shows.
+    # ⚠️ No `probe_version` here. See `instance_status`: this must answer in
+    # under a second, and an HTTP round-trip per deployment would make ATLAS's
+    # tile report its own containers' latency.
+    statuses = [instance_status(ctx, i, compose_projects_present(ctx))
+                for i in load_instances(ctx)]
+    live = [st for st in statuses if st['built']]
+    running = bool(live) and all(st['running'] for st in live)
 
     # Self-heal: the container is up but the flag was lost (a settings file
     # restored from before the install, most often). Trust the container.
@@ -2672,7 +2735,25 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
 #: and a deploy must never share a lock or a log: they can be started from
 #: different pages seconds apart, and interleaving their output would make both
 #: unreadable at exactly the moment somebody needs to read one.
-_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+#:
+#: ⚠️ **And one slot per deployment, for the same reason one layer up.** A
+#: module-global slot meant updating an agency wrote into the same log as the
+#: plain deployment's, and the second update of a pair was refused as "already
+#: running" against the first. Keyed by the job key `derive` already owns, so
+#: the slot, the lock and the directory all agree on which deployment this is.
+_update_slots = {}
+
+#: The sequential run over every deployment. Separate from the per-deployment
+#: slots because it outlives each of them and carries a result per deployment.
+_update_all_status = {'running': False, 'complete': False, 'error': False,
+                      'log': [], 'results': []}
+
+
+def _update_slot(inst=None):
+    """This deployment's update slot, created on first use."""
+    key = atlas_instances.derive(inst)['job_key']
+    return _update_slots.setdefault(
+        key, {'running': False, 'complete': False, 'error': False, 'log': []})
 
 #: Cheap cache for the upstream tag check. GitHub allows 60 unauthenticated
 #: requests an hour per IP and the console polls this for a badge; without a
@@ -2729,8 +2810,8 @@ def _latest_version(use_cache=True):
     return newest
 
 
-def _running_version():
-    """The version the container reports, or None if it cannot be asked.
+def _running_version(ctx=None, inst=None):
+    """The version this deployment's container reports, or None.
 
     ⚠️ This is the one that matters for "did the update work". The checkout and
     the process can disagree: `docker compose up -d` without `--build` keeps the
@@ -2743,9 +2824,13 @@ def _running_version():
     """
     import urllib.request
 
+    # ⚠️ This deployment's port. `APP_PORT` is the plain one, so with two
+    # deployments the second would report the first's version — and an update
+    # that did nothing would look like it had worked.
+    port = instance_paths(ctx, inst)['port'] if (inst or ctx) else APP_PORT
     try:
         with urllib.request.urlopen(
-            'http://127.0.0.1:%d/version' % APP_PORT, timeout=5
+            'http://127.0.0.1:%d/version' % port, timeout=5
         ) as response:
             body = json.loads(response.read().decode())
     except Exception:
@@ -2788,11 +2873,31 @@ def get_version_info(ctx):
     false, so a rate-limited box is never told it is current — it is told
     nothing, which the card renders as no badge rather than a reassuring one.
     """
+    # ⚠️ **The deployment furthest behind, not the plain one.** This badge is
+    # the only place an operator passively learns an update exists, and on a box
+    # with several agencies the question "is there an update" is answered by
+    # whichever is oldest — reporting the newest would hide the one that needs
+    # doing. On a box with a single deployment this resolves to exactly what it
+    # resolved to before.
+    #
+    # ⚠️ Versions read from checkouts, which is a file read each; the container
+    # is asked only for the one deployment being reported, so this stays at the
+    # single HTTP round-trip it always cost.
+    _projects = compose_projects_present(ctx)
+    _built = [i for i in load_instances(ctx)
+              if instance_is_built(ctx, i, _projects)]
+    # ⚠️ An unreadable VERSION sorts *oldest*, not newest. The file arrived in
+    # 1.0.0, so a deployment without one predates every release we can see — and
+    # is precisely the deployment that most needs telling.
+    _built.sort(key=lambda i: _parse_version(_installed_version(ctx, i))
+                or (0, 0, 0))
+    _oldest = _built[0] if _built else None
+
     # ⚠️ The running container first, the checkout second. They agree on a
     # healthy deployment; when they do not, the running one is the truth and the
     # difference is a rebuild that did not take.
-    checked_out = _installed_version(ctx)
-    running = _running_version()
+    checked_out = _installed_version(ctx, _oldest)
+    running = _running_version(ctx, _oldest)
     installed = running or checked_out
     latest = _latest_version()
     here, there = _parse_version(installed), _parse_version(latest)
@@ -2816,7 +2921,7 @@ def get_version_info(ctx):
     return info
 
 
-def _run_update(ctx):
+def _run_update(ctx, inst=None):
     """Fetch the newest release and rebuild in place. Data is never touched.
 
     ⚠️ This is `deploy` minus everything that would destroy state: no volume
@@ -2830,30 +2935,35 @@ def _run_update(ctx):
     """
     from datetime import datetime
 
-    global _update_status
+    slot = _update_slot(inst)
+    # ⚠️ The same seam `deploy` uses, spelled the same way, so the guard that
+    # catches half-threading in one catches it in the other.
+    _me = deployment_identity(ctx, inst, ctx['load_settings']())
+    _prefix = _me['settings_prefix']
     log = []
 
     def plog(msg):
         log.append('[' + datetime.now().strftime('%H:%M:%S') + '] ' + msg)
-        _update_status['log'] = list(log)
-        print('[' + KEY + '] update: ' + msg, flush=True)
+        slot['log'] = list(log)
+        print('[' + _me['name'] + '] update: ' + msg, flush=True)
 
-    _update_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    slot.update({'running': True, 'complete': False, 'error': False, 'log': []})
     try:
-        dirpath = atlas_dir(ctx)
+        dirpath = _me['dir']
         if not os.path.isdir(os.path.join(dirpath, '.git')):
             raise RuntimeError('ATLAS is not installed from a git checkout')
 
         target = _latest_version(use_cache=False)
         if not target:
             raise RuntimeError('Could not reach GitHub to find the newest release')
-        current = _installed_version(ctx)
-        plog('Installed ' + (current or 'unknown') + ' → available ' + target)
+        current = _installed_version(ctx, inst)
+        plog(_me['name'] + ': installed ' + (current or 'unknown') +
+             ' → available ' + target)
 
         here, there = _parse_version(current), _parse_version(target)
         if here and there and there <= here:
             plog('✓ Already on the newest release — nothing to do')
-            _update_status.update({'running': False, 'complete': True, 'error': False})
+            slot.update({'running': False, 'complete': True, 'error': False})
             return
 
         tag = 'v' + target
@@ -2874,12 +2984,12 @@ def _run_update(ctx):
 
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
-        _set_trusted_proxies(dirpath, plog)
+        _set_trusted_proxies(dirpath, plog, _me['compose_project'])
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
         # device CA with it, and every enrolled tablet would need a factory reset.
-        r = _compose(ctx, 'up -d --build api', timeout=1800)
+        r = _compose(ctx, 'up -d --build api', timeout=1800, inst=inst)
         if r.returncode != 0:
             raise RuntimeError('docker compose up failed: ' + (r.stderr or '')[-500:])
         plog('✓ Containers rebuilt — database and device CA untouched')
@@ -2890,7 +3000,7 @@ def _run_update(ctx):
         # after the deploy that made it — an Authentik restore, or somebody
         # unbinding the policy. A check that only runs at install answers a
         # question about the past (H-1).
-        _verify_access_control(ctx, plog=plog)
+        _verify_access_control(ctx, plog=plog, inst=inst)
 
         # ⚠️ Re-emit the vhost. `deploy` does this and `update` did not, so a
         # change to what ATLAS's Caddy block contains reached the box and then
@@ -2906,10 +3016,10 @@ def _run_update(ctx):
             plog('✓ Caddy vhost re-emitted')
             # ⚠️ Only now, with the freshly generated vhost on disk to check.
             # An install that predates these gates picks them up here.
-            changed = _arm_admin_gates(ctx, atlas_dir(ctx), plog)
-            changed = _push_email_relay(ctx, atlas_dir(ctx), plog) or changed
+            changed = _arm_admin_gates(ctx, dirpath, plog)
+            changed = _push_email_relay(ctx, dirpath, plog) or changed
             if changed:
-                _compose(ctx, 'up -d api', timeout=300)
+                _compose(ctx, 'up -d api', timeout=300, inst=inst)
         except Exception as exc:
             # Not fatal. The containers are already rebuilt and serving; a stale
             # vhost is worse reported than turned into a failed update.
@@ -2917,13 +3027,81 @@ def _run_update(ctx):
 
         plog('━━━ Step 3/3: Recording ━━━')
         s = ctx['load_settings']()
-        s[KEY + '_version'] = target
+        s[f'{_prefix}version'] = target
         ctx['save_settings'](s)
-        plog('✓ ATLAS updated to v' + target)
-        _update_status.update({'running': False, 'complete': True, 'error': False})
+        plog('✓ ' + _me['name'] + ' updated to v' + target)
+        slot.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
         plog('ERROR: ' + str(exc))
-        _update_status.update({'running': False, 'complete': False, 'error': True})
+        slot.update({'running': False, 'complete': False, 'error': True})
+
+
+def _run_update_all(ctx):
+    """Update every finished deployment, in order, without stopping at a failure.
+
+    ⚠️ **Continue on failure, with a result per deployment.** A single success
+    flag would report a run where three of five agencies failed as a failure
+    with no way to tell which — or, worse, as a success because the last one
+    worked. Stopping at the first failure is no better: it leaves the remaining
+    agencies on an old release for a reason that has nothing to do with them.
+
+    ⚠️ **Unfinished deployments are skipped, not attempted.** They have no
+    containers and no configuration; `update` would fail on the missing checkout
+    and report that as an update failure, when what they need is a deploy.
+    """
+    from datetime import datetime
+
+    log = []
+
+    def plog(msg):
+        log.append('[' + datetime.now().strftime('%H:%M:%S') + '] ' + msg)
+        _update_all_status['log'] = list(log)
+        print('[' + KEY + '] update-all: ' + msg, flush=True)
+
+    _update_all_status.update({'running': True, 'complete': False,
+                               'error': False, 'log': [], 'results': []})
+    results = []
+    try:
+        found = load_instances(ctx)
+        projects = compose_projects_present(ctx)
+        plog('%d deployment(s) on this box' % len(found))
+        for inst in found:
+            name = atlas_instances.derive(inst)['name']
+            if not instance_is_built(ctx, inst, projects):
+                plog('— ' + name + ': skipped, not finished deploying')
+                results.append({'name': name, 'slug': inst.get('slug'),
+                                'ok': None, 'detail': 'not finished deploying'})
+                _update_all_status['results'] = list(results)
+                continue
+            plog('━━━ ' + name + ' ━━━')
+            _run_update(ctx, inst)
+            slot = _update_slot(inst)
+            for line in slot['log']:
+                log.append('    ' + line)
+            _update_all_status['log'] = list(log)
+            ok = bool(slot['complete']) and not slot['error']
+            results.append({
+                'name': name, 'slug': inst.get('slug'), 'ok': ok,
+                'detail': ('updated to ' + (_installed_version(ctx, inst) or '?')
+                           if ok else 'failed — see the log above'),
+            })
+            _update_all_status['results'] = list(results)
+        failed = [r for r in results if r['ok'] is False]
+        if failed:
+            plog('✗ %d of %d deployment(s) failed: %s'
+                 % (len(failed), len(results),
+                    ', '.join(r['name'] for r in failed)))
+        else:
+            plog('✓ Every finished deployment is on the newest release')
+        # ⚠️ `complete` is true either way: the run finished. `error` says
+        # whether any deployment failed. Conflating them would make a partial
+        # success look like a run that never ended.
+        _update_all_status.update({'running': False, 'complete': True,
+                                   'error': bool(failed)})
+    except Exception as exc:
+        plog('ERROR: ' + str(exc))
+        _update_all_status.update({'running': False, 'complete': False,
+                                   'error': True})
 
 
 # --------------------------------------------------------------------------- #
@@ -3169,10 +3347,41 @@ services:
 def register(ctx):
     from flask import jsonify, request
 
+    def _requested_instance(default_first=False):
+        """The deployment a request is about, from `?slug=` or a JSON body.
+
+        ⚠️ **An unknown slug is refused, never silently treated as the plain
+        deployment.** `by_slug` answers None for both "no slug given" and "no
+        such slug", and letting the second fall through would point a restart,
+        an update or a log read at whichever deployment happens to be plain.
+
+        ⚠️ `default_first` exists for the page's single-deployment views: a box
+        with only an agency has no plain deployment, and answering about nothing
+        would show an empty console for a deployment that is running.
+        """
+        from flask import request as _rq
+        raw = _rq.args.get('slug')
+        if raw is None and _rq.method != 'GET':
+            raw = (_rq.get_json(silent=True) or {}).get('slug')
+        found = load_instances(ctx)
+        if raw:
+            inst = atlas_instances.by_slug(found, raw)
+            if inst is None:
+                return None, 'no deployment with that slug'
+            return inst, None
+        plain = atlas_instances.plain(found)
+        if plain is not None or not default_first:
+            return plain, None
+        return (found[0] if found else None), None
+
     def logs_view():
+        inst, err = _requested_instance(default_first=True)
+        if err:
+            return jsonify({'lines': [err]})
         try:
-            r = ctx['probe_run'](['docker', 'logs', '--tail', '200', API_CONTAINER],
-                                 text=True, timeout=10)
+            r = ctx['probe_run'](
+                ['docker', 'logs', '--tail', '200', api_container(ctx, inst)],
+                text=True, timeout=10)
             lines = ((r.stdout or '') + (r.stderr or '')).splitlines()
         except Exception as exc:
             lines = [f'could not read logs: {exc}']
@@ -3468,18 +3677,87 @@ def register(ctx):
 
     def update_view():
         import threading
-        if _update_status['running']:
-            return jsonify({'success': False, 'error': 'An update is already running'})
-        threading.Thread(target=_run_update, args=(ctx,), daemon=True).start()
+        inst, err = _requested_instance(default_first=True)
+        if err:
+            return jsonify({'success': False, 'error': err}), 404
+        slot = _update_slot(inst)
+        if slot['running']:
+            return jsonify({'success': False,
+                            'error': 'An update is already running for '
+                                     + atlas_instances.derive(inst)['name']})
+        # ⚠️ Refused while an update-all is in flight. The two would fight over
+        # the same checkout and the same containers, and the sequential run's
+        # result list would record whichever finished last.
+        if _update_all_status['running']:
+            return jsonify({'success': False,
+                            'error': 'An update of every deployment is already '
+                                     'running'})
+        threading.Thread(target=_run_update, args=(ctx, inst),
+                         daemon=True).start()
         return jsonify({'success': True})
 
     def update_status_view():
+        inst, err = _requested_instance(default_first=True)
+        if err:
+            return jsonify({'error': err}), 404
+        slot = _update_slot(inst)
         return jsonify({
-            'running': _update_status['running'],
-            'complete': _update_status['complete'],
-            'error': _update_status['error'],
-            'entries': list(_update_status['log']),
+            'running': slot['running'],
+            'complete': slot['complete'],
+            'error': slot['error'],
+            'entries': list(slot['log']),
         })
+
+    def update_all_view():
+        import threading
+        if _update_all_status['running']:
+            return jsonify({'success': False,
+                            'error': 'An update of every deployment is already '
+                                     'running'})
+        busy = [k for k, v in _update_slots.items() if v['running']]
+        if busy:
+            return jsonify({'success': False,
+                            'error': 'An update is already running for '
+                                     + ', '.join(sorted(busy))})
+        threading.Thread(target=_run_update_all, args=(ctx,),
+                         daemon=True).start()
+        return jsonify({'success': True})
+
+    def update_all_status_view():
+        return jsonify({
+            'running': _update_all_status['running'],
+            'complete': _update_all_status['complete'],
+            'error': _update_all_status['error'],
+            'entries': list(_update_all_status['log']),
+            'results': list(_update_all_status['results']),
+        })
+
+    def instance_control_view(slug):
+        """Start, stop or restart one deployment.
+
+        ⚠️ The registry's `control_map` takes only `ctx`, so it can only ever
+        act on the plain deployment. This is the same actions, addressed.
+        """
+        from flask import request as _rq
+        action = (_rq.get_json(silent=True) or {}).get('action')
+        argv = {'start': 'up -d api', 'stop': 'stop',
+                'restart': 'restart'}.get(action)
+        if not argv:
+            return jsonify({'success': False, 'error': 'unknown action'}), 400
+        # ⚠️ The plain deployment is addressed as `atlas`, which is in
+        # RESERVED_SLUGS — so no agency can ever claim that URL out from under
+        # it, and there is no empty path segment to special-case.
+        found = load_instances(ctx)
+        inst = (atlas_instances.plain(found) if slug == 'atlas'
+                else atlas_instances.by_slug(found, slug))
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        r = _compose(ctx, argv, timeout=300, inst=inst)
+        if r.returncode != 0:
+            return jsonify({'success': False,
+                            'error': (r.stderr or '')[-300:]}), 500
+        return jsonify({'success': True})
 
     register_module({
         'key': KEY,
@@ -3517,6 +3795,14 @@ def register(ctx):
              'endpoint': f'{KEY}_store', 'view': store_view},
             {'url': f'/api/{KEY}/update', 'methods': ['POST'],
              'endpoint': f'{KEY}_update', 'view': update_view},
+            {'url': f'/api/{KEY}/update-all', 'methods': ['POST'],
+             'endpoint': f'{KEY}_update_all', 'view': update_all_view},
+            {'url': f'/api/{KEY}/update-all-status', 'methods': ['GET'],
+             'endpoint': f'{KEY}_update_all_status', 'view': update_all_status_view},
+            {'url': f'/api/{KEY}/instances/<slug>/control', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_control', 'view': instance_control_view},
+            {'url': f'/api/{KEY}/drift', 'methods': ['GET'],
+             'endpoint': f'{KEY}_drift', 'view': lambda: jsonify(version_drift(ctx))},
             {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],
              'endpoint': f'{KEY}_update_status', 'view': update_status_view},
             {'url': f'/api/{KEY}/ca', 'methods': ['GET'],

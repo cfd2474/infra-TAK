@@ -103,7 +103,27 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     -->
     <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
 
+    <!--
+      ⚠️ One row per *finished* deployment, each acting on itself. The single
+      "Update ATLAS" / Restart / Stop trio below acted on `takmdm` whatever the
+      box held, so on a box whose only deployment is an agency all three did
+      nothing and said nothing.
+    -->
+    <div id="instanceRows" style="margin-top:14px"></div>
+
     <div id="retryRow" hidden style="margin-top:14px"></div>
+
+    <!--
+      ⚠️ Drift is expected, not a fault: updates are manual by design (§9) and
+      several agencies will not all be done on the same day. Naming it is what
+      makes a staged rollout deliberate rather than discovered later.
+    -->
+    <p class="note" id="driftNote" hidden style="margin:12px 0 0"></p>
+
+    <div id="updateAllRow" hidden style="margin-top:12px">
+      <button class="btn btn-secondary" id="updateAllBtn"
+              onclick="startUpdateAll()">Update all deployments</button>
+    </div>
 
     <button class="btn btn-primary" id="addInstanceBtn"
             onclick="openAddInstance()" style="margin-top:16px">
@@ -288,19 +308,23 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
 
   {% else %}
+  <!--
+    ⚠️ **The console link, the version and the three buttons have moved** into
+    the deployments card above, one set per deployment. Each of them named the
+    plain deployment: the link went to `atlas.<fqdn>` whatever this box serves,
+    the version read the plain checkout, and Restart/Stop ran compose in
+    `/root/atlas`. On a box whose only deployment is an agency every one of them
+    was wrong, and the two buttons failed silently.
+
+    What is left is genuinely box-wide: which release is available, and removing
+    the module.
+  -->
   <div class="card">
-    <div class="card-title">Status</div>
-    <div class="url-row"><strong>Console</strong>
-      <a class="mono atlas-link" href="https://{{ atlas_domain }}/"
-         target="_blank" rel="noopener noreferrer">https://{{ atlas_domain }}/ ↗</a></div>
-    <div class="url-row"><strong>Version</strong>
-      <span class="mono" id="versionNow">checking…</span>
-      <span id="updateBadge" class="badge-new" hidden></span></div>
+    <div class="card-title">Module</div>
+    <div class="url-row"><strong>Latest release</strong>
+      <span class="mono" id="latestRelease">checking…</span></div>
 
     <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn btn-primary" id="updateBtn" onclick="startUpdate()" hidden>Update ATLAS</button>
-      <button class="btn btn-secondary" onclick="control('restart')">Restart</button>
-      <button class="btn btn-secondary" onclick="control('stop')">Stop</button>
       <button class="btn btn-secondary" onclick="loadLogs()">Refresh logs</button>
       <button class="btn btn-danger" onclick="openUninstall()">Uninstall</button>
     </div>
@@ -350,7 +374,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
   </div>
 
   <div class="card" id="updateCard" hidden>
-    <div class="card-title">Update log</div>
+    <div class="card-title" id="updateLogTitle">Update log</div>
     <div class="log-box" id="updateLog"></div>
   </div>
 
@@ -674,6 +698,34 @@ function renderInstances(data){
     ? 'Deployments on this box:\n' + rows.join('\n')
     : 'No ATLAS deployment on this box yet.';
 
+  // ⚠️ Built deployments only. An unfinished one has nothing to update,
+  // restart or link to, and its row would offer three buttons that all fail.
+  const built = (data.instances || []).filter(i => i.built);
+  const rowBox = document.getElementById('instanceRows');
+  if (rowBox){
+    rowBox.innerHTML = '';
+    built.forEach(i => rowBox.appendChild(instanceRow(i)));
+  }
+
+  // ⚠️ Offered only from two. With one deployment it is the same action as its
+  // own Update button, and two buttons for one outcome is how an operator comes
+  // to wonder which one is the real one.
+  const allRow = document.getElementById('updateAllRow');
+  if (allRow) allRow.hidden = built.length < 2;
+
+  const versions = [];
+  built.forEach(i => {
+    if (i.version && versions.indexOf(i.version) < 0) versions.push(i.version);
+  });
+  const drift = document.getElementById('driftNote');
+  if (drift){
+    drift.hidden = versions.length < 2;
+    drift.textContent = versions.length < 2 ? '' :
+      'These deployments are on different releases: ' + versions.sort().join(', ')
+      + '. That is expected while a rollout is in progress — "Update all '
+      + 'deployments" brings them together.';
+  }
+
   // ⚠️ "Deploy additional instance" on a box with none is a contradiction,
   // so the wording follows the count. The markup ships the empty-box form, so
   // a fresh box reads correctly on first paint rather than flashing the wrong
@@ -710,6 +762,76 @@ function renderInstances(data){
       '\n' +
       'room for ' + c.room_for + ' more - ' + c.binding + ' is the limit';
   }
+}
+
+function stateLabel(i){
+  // ⚠️ Three states, not two. "Stopped" and "never finished" both mean "not
+  // serving" and need opposite actions — start it, or deploy it — so a page
+  // that collapsed them would offer the wrong button for the one an operator
+  // is most likely to be looking at.
+  if (!i.built) return 'not finished';
+  const v = i.version ? 'v' + i.version : 'version unknown';
+  return (i.running ? 'running' : 'stopped') + '  ' + v;
+}
+
+function rowButton(label, kind, handler){
+  const b = document.createElement('button');
+  b.className = 'btn ' + kind;
+  b.style.marginLeft = '8px';
+  b.textContent = label;
+  b.onclick = handler;
+  return b;
+}
+
+function instanceRow(i){
+  const row = document.createElement('div');
+  row.className = 'url-row';
+
+  const name = document.createElement('strong');
+  name.textContent = i.slug || 'general';
+  row.appendChild(name);
+
+  // ⚠️ `hostFor` again, so the link an operator clicks is built by the same
+  // rule Caddy serves and `.env` records. A second rule here is how the page
+  // comes to link somewhere nothing answers.
+  const link = document.createElement('a');
+  link.className = 'mono atlas-link';
+  link.href = 'https://' + hostFor(i.slug) + '/';
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = hostFor(i.slug);
+  row.appendChild(link);
+
+  const state = document.createElement('span');
+  state.className = 'mono';
+  state.textContent = stateLabel(i);
+  row.appendChild(state);
+
+  row.appendChild(rowButton('Update', 'btn-primary',
+                            function(){ startUpdate(i.slug); }));
+  row.appendChild(rowButton(i.running ? 'Restart' : 'Start', 'btn-secondary',
+                            function(){
+                              controlInstance(i, i.running ? 'restart' : 'start');
+                            }));
+  if (i.running)
+    row.appendChild(rowButton('Stop', 'btn-secondary',
+                              function(){ controlInstance(i, 'stop'); }));
+  return row;
+}
+
+function controlInstance(i, action){
+  // ⚠️ `atlas` addresses the plain deployment, and it is a reserved slug — so
+  // no agency can ever claim that URL, and there is no empty path segment to
+  // special-case.
+  fetch('/api/atlas/instances/' + (i.slug || 'atlas') + '/control',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({action: action})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { alert(d.error); return; }
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){});
 }
 
 function hostFor(slug){
@@ -1010,14 +1132,10 @@ function pollDeploy(){
   }).catch(() => setTimeout(pollDeploy, 4000));
 }
 
-function control(action){
-  fetch('/api/atlas/control', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: action}),
-    credentials: 'same-origin'
-  }).then(() => setTimeout(() => location.reload(), 1500));
-}
+// ⚠️ `control()` is gone with the buttons that called it. It POSTed to the
+// registry's `/api/atlas/control`, which takes no deployment and so could only
+// ever act on `takmdm` — the reason Start/Stop did nothing on an agency-only
+// box. `controlInstance` replaces it, addressed.
 
 function loadLogs(){
   fetch('/api/atlas/logs', {credentials:'same-origin'}).then(r => r.json()).then(d => {
@@ -1071,45 +1189,44 @@ async function doUninstall(){
 }
 
 // ── Version and updates ────────────────────────────────────────────────────
-function loadVersion(){
-  const now = document.getElementById('versionNow');
+function loadLatest(){
+  // ⚠️ The *available* release, which is the only version fact that belongs to
+  // the box rather than to a deployment. Each deployment's own version is in
+  // its row above, read from its own checkout.
+  const now = document.getElementById('latestRelease');
   if (!now) return;
   fetch('/api/atlas/version', {credentials:'same-origin'}).then(r => r.json()).then(d => {
-    now.textContent = d.version ? ('v' + d.version) : 'unknown';
-    const badge = document.getElementById('updateBadge');
-    const btn = document.getElementById('updateBtn');
-    if (d.update_available && d.latest) {
-      // ⚠️ Only when a newer version was actually established. A latest of null
-      // means the check could not run, which is not the same as being current.
-      if (badge) { badge.textContent = 'v' + d.latest + ' available'; badge.hidden = false; }
-      if (btn) btn.hidden = false;
-    } else if (!d.latest && badge) {
-      badge.textContent = 'update check unavailable';
-      badge.style.color = 'var(--text-dim)';
-      badge.hidden = false;
-    }
+    // ⚠️ A latest of null means the check could not run — GitHub allows 60
+    // unauthenticated requests an hour. That is not the same as being current,
+    // and saying "up to date" here would be a guess.
+    now.textContent = d.latest ? ('v' + d.latest) : 'update check unavailable';
   }).catch(() => { now.textContent = 'unknown'; });
 }
 
-let updatePolling = false;
+let updatePolling = null;
 
-function startUpdate(){
-  const btn = document.getElementById('updateBtn');
-  if (btn) btn.disabled = true;
-  fetch('/api/atlas/update', {method:'POST', credentials:'same-origin'})
+function startUpdate(slug){
+  fetch('/api/atlas/update', {method:'POST', credentials:'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({slug: slug || null})})
     .then(r => r.json()).then(d => {
-      if (d.error) { if (btn) btn.disabled = false; alert(d.error); return; }
-      updatePolling = true;
+      if (d.error) { alert(d.error); return; }
+      updatePolling = slug || null;
       pollUpdate();
-    }).catch(() => { if (btn) btn.disabled = false; });
+    }).catch(() => {});
 }
 
 function pollUpdate(){
-  if (!updatePolling) return;
-  fetch('/api/atlas/update-status', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+  if (updatePolling === false) return;
+  const q = updatePolling ? ('?slug=' + encodeURIComponent(updatePolling)) : '';
+  fetch('/api/atlas/update-status' + q, {credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
     const card = document.getElementById('updateCard');
+    const title = document.getElementById('updateLogTitle');
     const box = document.getElementById('updateLog');
     if (card) card.hidden = false;
+    if (title) title.textContent = updatePolling
+      ? 'Update log — ' + updatePolling : 'Update log';
     if (box) {
       box.textContent = (d.entries || []).join(String.fromCharCode(10));
       box.scrollTop = box.scrollHeight;
@@ -1124,7 +1241,56 @@ function pollUpdate(){
   }).catch(() => setTimeout(pollUpdate, 4000));
 }
 
-{% if installed %}loadLogs(); loadVersion();{% endif %}
+let updateAllPolling = false;
+
+function startUpdateAll(){
+  const btn = document.getElementById('updateAllBtn');
+  if (btn) btn.disabled = true;
+  fetch('/api/atlas/update-all', {method:'POST', credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+      if (d.error) { if (btn) btn.disabled = false; alert(d.error); return; }
+      updateAllPolling = true;
+      pollUpdateAll();
+    }).catch(() => { if (btn) btn.disabled = false; });
+}
+
+function pollUpdateAll(){
+  if (!updateAllPolling) return;
+  fetch('/api/atlas/update-all-status', {credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+    const card = document.getElementById('updateCard');
+    const title = document.getElementById('updateLogTitle');
+    const box = document.getElementById('updateLog');
+    if (card) card.hidden = false;
+    if (title) title.textContent = 'Update log — every deployment';
+    if (box) {
+      // ⚠️ The result list first, then the log. A run where one of five failed
+      // is the case this button exists to make legible, and burying which one
+      // under two hundred lines of build output is how it stops being legible.
+      const results = (d.results || []).map(function(r){
+        const mark = r.ok === null ? '—' : (r.ok ? '\u2713' : '\u2717');
+        return mark + ' ' + r.name + '  ' + (r.detail || '');
+      });
+      const parts = results.length
+        ? results.join(String.fromCharCode(10)) + String.fromCharCode(10, 10)
+        : '';
+      box.textContent = parts + (d.entries || []).join(String.fromCharCode(10));
+      box.scrollTop = box.scrollHeight;
+    }
+    // ⚠️ `complete` means the run ended; `error` means something in it failed.
+    // A partial failure must stop the poll — it is finished — and must not
+    // reload, or the operator never reads which deployment failed.
+    if (d.complete && !d.error) {
+      updateAllPolling = false;
+      setTimeout(function(){ location.reload(); }, 2000);
+      return;
+    }
+    if (d.complete || (d.error && !d.running)) { updateAllPolling = false; return; }
+    setTimeout(pollUpdateAll, 2000);
+  }).catch(() => setTimeout(pollUpdateAll, 4000));
+}
+
+{% if installed %}loadLogs(); loadLatest();{% endif %}
 refreshCapacity();
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
 {% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
@@ -1234,7 +1400,7 @@ function showRenewSteps(steps){
   document.getElementById('renewDone').hidden = false;
 }
 
-// ⚠️ Guarded like loadLogs/loadVersion above. On a box where ATLAS is not
+// ⚠️ Guarded like loadLogs/loadLatest above. On a box where ATLAS is not
 // installed this would docker-exec a container that does not exist and paint an
 // error card onto a page whose whole message is "not installed yet".
 {% if installed %}loadCa();{% endif %}
