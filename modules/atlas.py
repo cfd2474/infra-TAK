@@ -1780,26 +1780,48 @@ def deploy_validate(data):
         # gets no reservation at all rather than a size nobody chose.
         return {}, None
 
-    _, free = _disk_free(os.path.dirname(STORE_IMAGE))
-    reserved = os.stat(STORE_IMAGE).st_size if os.path.exists(STORE_IMAGE) else 0
-
-    # ⚠️ `in_use` is not consulted here. The "already storing N GB" refusal
-    # needs the store mounted to measure, and this runs before the deploy that
-    # mounts it; `ensure_store` refuses a shrink against the real image anyway.
-    # Asking here with a zero would have looked like a check and been none.
-    size, error = validate_store_size(raw, free, 0, reserved)
-    if error:
-        return {}, error
-
     # ⚠️ The sizing mode and the agency travel with the deploy, because the
     # store is built during it and cannot be changed afterwards: `resize2fs`
     # will not shrink a mounted filesystem, and a fixed store cannot become
     # sparse once its blocks are allocated. Choosing wrong here is not a setting
     # an operator can correct later.
+    #
+    # ⚠️ Read **before** the size is judged, because the mode decides which
+    # question to ask of it.
     mode, error = atlas_instances.validate_mode(
         data.get('mode') or atlas_instances.MODE_FIXED)
     if error:
         return {}, error
+
+    _, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    reserved = os.stat(STORE_IMAGE).st_size if os.path.exists(STORE_IMAGE) else 0
+
+    if mode == atlas_instances.MODE_DYNAMIC:
+        # ⚠️ **The 85% ceiling is a limit on *reservations*, and a dynamic
+        # deployment reserves nothing.** Applying it here refused a dynamic
+        # deployment whose ceiling was the pool — 354.6 GB against a 322.7 GB
+        # reservation cap — so the deploy never started while the instance had
+        # already been recorded. The ceiling asks "may ATLAS take this much disk
+        # now?", which is not the question a ceiling answers.
+        #
+        # The pool already bounded this figure in `add_instance`; all that is
+        # left is that it be a real, positive size.
+        try:
+            size = int(float(raw) * GIB)
+        except (TypeError, ValueError):
+            return {}, 'Store size must be a number of gigabytes.'
+        if size <= 0:
+            return {}, 'There is no space left in the ATLAS budget.'
+    else:
+        # ⚠️ `in_use` is not consulted here. The "already storing N GB" refusal
+        # needs the store mounted to measure, and this runs before the deploy
+        # that mounts it; `ensure_store` refuses a shrink against the real image
+        # anyway. Asking here with a zero would have looked like a check and
+        # been none.
+        size, error = validate_store_size(raw, free, 0, reserved)
+        if error:
+            return {}, error
+
     return {'store_bytes': size, 'mode': mode,
             'slug': (data.get('slug') or None)}, None
 
@@ -3175,6 +3197,28 @@ def register(ctx):
             return jsonify({'success': False, 'error': err}), 400
         return jsonify({'success': True, 'instance': inst})
 
+    def instance_forget_view(slug):
+        """Forget a deployment that was recorded but never built.
+
+        ⚠️ **Only when nothing was built.** The record is written before the
+        deploy so the slug and port are claimed while it runs; if the deploy is
+        then refused, that record is the only trace and it would block a retry
+        with the same name. This removes it — and refuses if the deployment has
+        a directory on disk, because then it is not a stray record, it is an
+        installed deployment and forgetting it would orphan a store.
+        """
+        found = atlas_instances.by_slug(load_instances(ctx), slug)
+        if found is None:
+            return jsonify({'success': True})
+        if os.path.isdir(instance_paths(ctx, found)['dir']):
+            return jsonify({
+                'success': False,
+                'error': ('That deployment exists on disk. Uninstall it rather '
+                          'than forgetting it, or its store would be orphaned.'),
+            }), 409
+        drop_instance(ctx, slug)
+        return jsonify({'success': True})
+
     def store_view():
         """What the box can offer, and what the reservation is doing (W205).
 
@@ -3251,6 +3295,8 @@ def register(ctx):
              'endpoint': f'{KEY}_instances', 'view': instances_view},
             {'url': f'/api/{KEY}/instances', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_create', 'view': instance_create_view},
+            {'url': f'/api/{KEY}/instances/<slug>/forget', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_forget', 'view': instance_forget_view},
             {'url': f'/api/{KEY}/store', 'methods': ['GET'],
              'endpoint': f'{KEY}_store', 'view': store_view},
             {'url': f'/api/{KEY}/update', 'methods': ['POST'],

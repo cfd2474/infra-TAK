@@ -137,24 +137,6 @@ def function_body(js, name):
 # it and leaves it hidden strands an operator with nothing left to act on.
 
 
-def test_a_refused_deploy_restores_the_install_card(idle):
-    """The server said no — the operator needs the field back to correct it."""
-    refusal = re.search(r"if \(d\.error\) \{([^}]*)\}",
-                        function_body(idle, "startDeployFor"))
-
-    assert refusal, "startDeployFor has no refusal branch"
-    assert "setInstallCard(true)" in refusal.group(1)
-
-
-def test_a_network_failure_restores_the_install_card(idle):
-    """The request never landed, so nothing is running and nothing is hidden."""
-    caught = re.search(r"\.catch\(\(\) => \{([^}]*)\}\)",
-                       function_body(idle, "startDeployFor"))
-
-    assert caught, "startDeployFor does not handle a failed request"
-    assert "setInstallCard(true)" in caught.group(1)
-
-
 def test_a_deploy_that_fails_midway_restores_the_install_card(idle):
     """The deploy started and then failed — the log is up, and retrying still
     needs the card."""
@@ -237,14 +219,6 @@ def test_a_failed_deploy_stops_promising_a_refresh(idle):
 
     assert failed, "pollDeploy has no failure branch"
     assert "setDeployNote(false)" in failed.group(1)
-
-
-def test_a_refused_deploy_stops_promising_a_refresh(idle):
-    refusal = re.search(r"if \(d\.error\) \{([^}]*)\}",
-                        function_body(idle, "startDeployFor"))
-
-    assert refusal, "startDeployFor has no refusal branch"
-    assert "setDeployNote(false)" in refusal.group(1)
 
 
 def test_an_accepted_deploy_puts_the_note_up(idle):
@@ -594,3 +568,58 @@ def test_the_wording_follows_the_count(installed):
     assert "rows.length" in body
     assert "'Deploy additional instance'" in body
     assert "'Deploy instance'" in body
+
+
+# --------------------------------------------------------------------------- #
+# A deploy that never starts
+# --------------------------------------------------------------------------- #
+
+
+def test_both_failure_paths_go_through_one_handler(idle):
+    """⚠️ The refusal and the network failure used to each restore the page
+    themselves. One handler means they cannot drift into cleaning up
+    differently — and only one of them was ever going to be exercised by hand."""
+    body = function_body(idle, 'startDeployFor')
+
+    assert body.count('deployRefused(') == 2
+
+
+def test_a_refused_deploy_puts_the_operator_back_where_they_were(idle):
+    body = function_body(idle, 'deployRefused')
+
+    assert 'setInstallCard(true)' in body
+    assert 'setDeployNote(false)' in body
+    assert "form.hidden = false" in body, 'the form is not reopened to correct'
+
+
+def test_a_refused_deploy_shows_the_reason_on_the_page(idle):
+    """An `alert()` is dismissed and gone; the reason belongs beside the field
+    that has to change."""
+    body = function_body(idle, 'deployRefused')
+
+    assert 'addInstanceError' in body
+    assert 'alert(' not in body
+
+
+def test_a_refused_deploy_releases_the_slug(idle):
+    """⚠️ **The bug this came from.** The instance record is written before the
+    deploy so the slug and port are held while it runs. When the deploy was
+    refused, that record was the only trace — and a retry under the same name
+    was then refused as a duplicate, with nothing built and no way forward from
+    the page."""
+    body = function_body(idle, 'deployRefused')
+
+    assert '/forget' in body
+    assert 'inst.slug' in body
+
+
+def test_the_deploy_log_appears_when_the_deploy_starts(idle):
+    """⚠️ It used to be revealed only by `renderLog`, on the first poll — so a
+    deploy refused before that never showed the card at all, and the page looked
+    like nothing had happened."""
+    body = function_body(idle, 'startDeployFor')
+
+    assert 'showDeployCard()' in body
+    reveal = function_body(idle, 'showDeployCard')
+    assert "getElementById('deployCard')" in reveal
+    assert "style.display = ''" in reveal

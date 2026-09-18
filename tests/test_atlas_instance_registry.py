@@ -481,3 +481,55 @@ def test_a_box_without_a_domain_offers_no_hostname(roomy):
 
     assert facts['plain_host'] == ''
     assert facts['host_template'] == ''
+
+
+# --------------------------------------------------------------------------- #
+# A dynamic deployment is not a reservation
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dynamic_deployment_is_not_held_to_the_reservation_ceiling(monkeypatch):
+    """⚠️ **The bug that stopped a real deploy.** The 85% ceiling limits how much
+    disk ATLAS may *take*, and a dynamic deployment takes none — its size is a
+    ceiling on a pool. Applying the reservation cap refused a deployment sized at
+    the pool (354.6 GB against a 322.7 GB cap), so the deploy never started while
+    the instance had already been recorded."""
+    monkeypatch.setattr(atlas, '_disk_free',
+                        lambda _p: (473 * GIB, int(379.6 * GIB)))
+
+    params, err = atlas.deploy_validate(
+        {'store_gb': 354.6, 'mode': 'dynamic', 'slug': 'corona'})
+
+    assert err is None, err
+    assert params['mode'] == 'dynamic'
+    assert params['slug'] == 'corona'
+
+
+def test_a_fixed_deployment_is_still_held_to_it(monkeypatch):
+    """The other half: a reservation that big really would take the disk."""
+    monkeypatch.setattr(atlas, '_disk_free',
+                        lambda _p: (473 * GIB, int(379.6 * GIB)))
+
+    params, err = atlas.deploy_validate({'store_gb': 354.6, 'mode': 'fixed'})
+
+    assert err and '85%' in err
+
+
+def test_a_dynamic_deployment_with_no_pool_left_is_refused(monkeypatch):
+    monkeypatch.setattr(atlas, '_disk_free',
+                        lambda _p: (473 * GIB, int(379.6 * GIB)))
+
+    params, err = atlas.deploy_validate({'store_gb': 0, 'mode': 'dynamic'})
+
+    assert err and 'budget' in err
+
+
+def test_the_mode_is_read_before_the_size_is_judged(monkeypatch):
+    """⚠️ Order matters here: the mode decides *which* question to ask of the
+    size, so judging the size first asks the wrong one."""
+    monkeypatch.setattr(atlas, '_disk_free',
+                        lambda _p: (473 * GIB, int(379.6 * GIB)))
+
+    params, err = atlas.deploy_validate({'store_gb': 354.6, 'mode': 'elastic'})
+
+    assert err and 'sizing mode' in err, err

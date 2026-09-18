@@ -892,6 +892,38 @@ function setDeployNote(visible){
   if (note) note.style.display = visible ? '' : 'none';
 }
 
+function showDeployCard(){
+  // ⚠️ Revealed the moment a deploy starts, not when the first log line lands.
+  // `renderLog` used to be the only thing that unhid it, so the card stayed
+  // hidden until the first poll returned — and if the deploy was refused before
+  // that, it never appeared at all and the operator was left with a page that
+  // looked like nothing had happened.
+  const card = document.getElementById('deployCard');
+  if (card) card.style.display = '';
+  const err = document.getElementById('deployError');
+  if (err) err.style.display = 'none';
+}
+
+function deployRefused(inst, message){
+  // ⚠️ A refused deploy must not leave the slug claimed. The record is written
+  // before the deploy so the name and port are held while it runs; if it never
+  // starts, that record is the only trace and it would block a retry under the
+  // same name with "there is already a deployment for ...".
+  setInstallCard(true);
+  setDeployNote(false);
+  const box = document.getElementById('addInstanceError');
+  if (box){ box.textContent = message; box.style.display = ''; }
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = false;
+  if (inst && inst.slug){
+    fetch('/api/atlas/instances/' + encodeURIComponent(inst.slug) + '/forget',
+          {method: 'POST', credentials: 'same-origin'})
+      .then(() => refreshCapacity()).catch(() => {});
+  } else {
+    refreshCapacity();
+  }
+}
+
 function startDeployFor(inst){
   // The deploy for one recorded instance. `store_gb` still carries the size,
   // because that is what `deploy_validate` measures against the box's free
@@ -904,15 +936,16 @@ function startDeployFor(inst){
   };
   setInstallCard(false);
   setDeployNote(true);
+  showDeployCard();
   fetch('/api/atlas/deploy', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
     credentials: 'same-origin'
   }).then(r => r.json()).then(d => {
-    if (d.error) { setInstallCard(true); setDeployNote(false); alert(d.error); return; }
+    if (d.error) { deployRefused(inst, d.error); return; }
     polling = true; pollDeploy();
-  }).catch(() => { setInstallCard(true); setDeployNote(false); });
+  }).catch(() => deployRefused(inst, 'The deploy request did not reach the console.'));
 }
 
 
