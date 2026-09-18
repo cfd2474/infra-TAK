@@ -2743,6 +2743,16 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
 #: the slot, the lock and the directory all agree on which deployment this is.
 _update_slots = {}
 
+#: The same, for removals. ⚠️ **Not the update slot.** A removal log rendered in
+#: a card labelled "update" is how an operator comes to believe a deployment was
+#: updated when it was destroyed; and the two must be able to refuse each other,
+#: which they cannot do through one shared `running` flag.
+_removal_slots = {}
+
+
+def _new_slot():
+    return {'running': False, 'complete': False, 'error': False, 'log': []}
+
 #: The sequential run over every deployment. Separate from the per-deployment
 #: slots because it outlives each of them and carries a result per deployment.
 _update_all_status = {'running': False, 'complete': False, 'error': False,
@@ -2751,9 +2761,49 @@ _update_all_status = {'running': False, 'complete': False, 'error': False,
 
 def _update_slot(inst=None):
     """This deployment's update slot, created on first use."""
-    key = atlas_instances.derive(inst)['job_key']
     return _update_slots.setdefault(
-        key, {'running': False, 'complete': False, 'error': False, 'log': []})
+        atlas_instances.derive(inst)['job_key'], _new_slot())
+
+
+def _removal_slot(inst=None):
+    """This deployment's removal slot, created on first use."""
+    return _removal_slots.setdefault(
+        atlas_instances.derive(inst)['job_key'], _new_slot())
+
+
+def _run_removal(ctx, inst):
+    """Tear one deployment down, in a thread, with a log the page can read.
+
+    ⚠️ **A job rather than a synchronous request.** `docker compose down -v`,
+    three unmounts and an `rmtree` over a store take minutes; a POST that blocks
+    for them times out in the browser, and the operator is left not knowing
+    whether a teardown that destroys a device CA ran or not.
+    """
+    from datetime import datetime
+
+    slot = _removal_slot(inst)
+    label = atlas_instances.derive(inst)['name']
+    log = []
+
+    def plog(msg):
+        log.append('[' + datetime.now().strftime('%H:%M:%S') + '] ' + msg)
+        slot['log'] = list(log)
+        print('[' + label + '] remove: ' + msg, flush=True)
+
+    slot.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    try:
+        plog('Removing ' + label + ' — its device CA, database and store.')
+        steps, errs = remove_instance(ctx, inst, plog)
+        if errs:
+            for line in errs:
+                plog('ERROR: ' + line)
+            slot.update({'running': False, 'complete': False, 'error': True})
+            return
+        plog('✓ ' + label + ' removed.')
+        slot.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog('ERROR: ' + str(exc))
+        slot.update({'running': False, 'complete': False, 'error': True})
 
 #: Cheap cache for the upstream tag check. GitHub allows 60 unauthenticated
 #: requests an hour per IP and the console polls this for a badge; without a
@@ -3109,137 +3159,239 @@ def _run_update_all(ctx):
 # --------------------------------------------------------------------------- #
 
 
-def uninstall(ctx, job, params):
-    """Remove ATLAS completely. Nothing of it survives this call.
+def remove_instance(ctx, inst, plog=None):
+    """Remove one deployment and everything that belongs to it.
 
-    ⚠️ **This destroys the device CA and the database, and that is deliberate.**
-    Every enrolled tablet's identity is signed by that CA; once it is gone they
-    cannot be re-adopted, only factory reset in person. The console asks for a
-    password and says so before calling this.
+    Returns `(steps, errors)`. Best-effort and re-runnable: every step is
+    idempotent, so a teardown that failed halfway can be repeated.
+
+    ⚠️ **This destroys that deployment's device CA and database.** Every tablet
+    enrolled against it is signed by that CA; once it is gone they cannot be
+    re-adopted, only factory reset in person. Deployments do not share a CA —
+    that is the whole point of the per-agency trust pool — so this is precisely
+    one agency's fleet, and never another's.
+
+    ⚠️ **Order is the reverse of deploy, and `remove_store` comes before the
+    `rmtree`.** Three mount points live *inside* the install directory and
+    `shutil.rmtree` cannot delete through a mount. W212 was exactly this, and it
+    reported success.
+
+    ⚠️ **What it must not touch:** the 8449 firewall rule and `atlas_enabled`
+    are box-wide. Caddy selects the device site by SNI, so every deployment
+    shares that listener; removing the rule with the first agency would take the
+    device port away from every remaining one. `uninstall` handles those, once.
+    """
+    log = plog or (lambda _msg: None)
+    steps, errs = [], []
+
+    def note(msg):
+        # ⚠️ Recorded *and* logged, together. Appending to `steps` and logging
+        # separately meant `remove_store`'s own progress lines appeared twice —
+        # once raw from its plog, once labelled from the returned list — and a
+        # teardown log that repeats itself reads like a teardown that ran twice.
+        steps.append(msg)
+        log(msg)
+
+    paths = instance_paths(ctx, inst)
+    names = atlas_instances.authentik_names(inst)
+    label = paths['name']
+    dirpath = paths['dir']
+
+    # Volumes go with the containers: `down -v` is the only step that removes
+    # the database, and it needs the compose file, so it runs before the
+    # directory does.
+    if os.path.isdir(dirpath):
+        _compose(ctx, 'down -v --remove-orphans', timeout=300, inst=inst)
+        note(f'{label}: containers, network and database volume removed')
+    else:
+        note(f'{label}: no install directory — nothing to stop')
+
+    # ⚠️ This deployment's images, named from its compose project. `takmdm-api`
+    # was hardcoded, so an agency's images survived every teardown.
+    if _run(ctx, ['docker', 'image', 'rm', '-f'] + list(paths['images'])):
+        note(f'{label}: images removed')
+
+    # ⚠️ A silent plog: its lines come back in `store_did` and are noted
+    # below, so letting it log as well printed each of them twice.
+    store_did, store_errs = remove_store(ctx, lambda *_a: None, inst)
+    for line in store_did:
+        note(f'{label}: {line}')
+    if store_errs:
+        # ⚠️ Stop here rather than attempting the rmtree. The mounts are what
+        # blocks it, and deleting *around* them is how W212 came to report a
+        # clean uninstall over a directory still holding the device CA.
+        errs.extend(f'{label}: the reserved store could not be removed: '
+                    f'{line}' for line in store_errs)
+        note(f'{label}: STOPPED before deleting the install directory, '
+             f'so the device CA and database are still on disk. Re-run '
+             f'once the mounts are clear.')
+        return steps, errs
+
+    for stale in _stale_deploy_key(dirpath):
+        try:
+            os.remove(stale)
+            note(f'{label}: obsolete deploy key removed')
+        except OSError:
+            pass
+
+    for path, what in ((dirpath, 'install directory (device CA, artifacts, .env)'),
+                       (_caddy_ca_dir(inst), "Caddy's copy of the device CA")):
+        try:
+            if path and os.path.isdir(path):
+                shutil.rmtree(path)
+                note(f'{label}: {what} removed')
+        except OSError as exc:
+            errs.append(f'{label}: {what} could not be removed: {exc}')
+
+    if errs:
+        # ⚠️ **Nothing below this line may run.** Clearing
+        # `atlas_<slug>_pg_password` while that database is still on disk is what
+        # arms the *next* deploy to fail forever: it generates a fresh password,
+        # Postgres keeps the old one because the data directory is not empty, and
+        # the API sits on "password authentication failed" with no way back.
+        # Dropping the record would be worse still — the store, the CA and the
+        # database would all be on the box with nothing left that knows about
+        # them.
+        note(f'{label}: STOPPED — its record, settings and Authentik '
+             f'application are left in place, so this can be re-run '
+             f'once whatever is holding those files lets go.')
+        return steps, errs
+
+    # ⚠️ This deployment's own Authentik objects. The helper matches the
+    # provider by *exact* name, so `ATLAS MDM Proxy` never resolves to
+    # `ATLAS MDM Proxy (corona)` and an agency teardown cannot sign every
+    # administrator out of the plain console.
+    try:
+        ctx['_deregister_authentik_proxy_app'](
+            ctx['load_settings'](), names['app_slug'], names['provider'])
+        note(f"{label}: Authentik application '{names['app_slug']}' removed")
+    except Exception:
+        note(f'{label}: Authentik application not present (not configured)')
+
+    # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
+    # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
+    # deployment would take every agency's database password with it.
+    settings = ctx['load_settings']()
+    owned = atlas_instances.owned_settings_keys(
+        inst, list(settings), load_instances(ctx))
+    for key in owned:
+        settings.pop(key, None)
+    ctx['save_settings'](settings)
+    if owned:
+        note(f'{label}: {len(owned)} generated setting(s) cleared')
+
+    drop_instance(ctx, (inst or {}).get('slug'))
+    note(f'{label}: removed from the deployment list')
+
+    # ⚠️ Regenerated from the settings that are left, so this deployment's vhost
+    # goes and every remaining one stays. Emitting nothing, or skipping this,
+    # leaves Caddy asking for a certificate for a host with no upstream.
+    try:
+        ctx['generate_caddyfile'](ctx['load_settings']())
+        ctx['_caddy_reload']()
+        note(f'{label}: Caddy vhost removed')
+    except Exception as exc:
+        errs.append(f'{label}: Caddy could not be reloaded: {exc}')
+
+    return steps, errs
+
+
+def uninstall(ctx, job, params):
+    """Remove ATLAS completely — every deployment on this box.
+
+    ⚠️ **This destroys every device CA and every database, and that is
+    deliberate.** Each enrolled tablet's identity is signed by its deployment's
+    CA; once that is gone they cannot be re-adopted, only factory reset in
+    person. The console asks for a password and says so before calling this.
 
     The alternative — keeping the data "just in case" — was worse in practice:
     an operator who uninstalls expects the box to be as it was, and a leftover
     database silently decided the *next* install's fate, because Postgres only
     honours POSTGRES_PASSWORD on an empty volume. Install regenerates all of it.
 
-    ⚠️ The deploy key is *not* removed. It lives beside the install directory,
-    not inside it, and it is the credential for fetching ATLAS rather than any
-    part of ATLAS — taking it would make the next install fail at `git clone`
-    with nothing on the page to explain why.
+    ⚠️ **It used to remove only the plain deployment** — `atlas_dir(ctx)` and
+    `remove_store(ctx, …, inst=None)` — so on a box running one agency and no
+    plain ATLAS it reported success having removed nothing at all. That is W212
+    again, multiplied by the number of agencies, and it is the reason this
+    iterates.
 
-    ⚠️ **The reserved store goes too, and the order matters (W212).** Three
-    mount points live *inside* the install directory, and `shutil.rmtree` cannot
-    delete through a mount — so `remove_store` runs first. Without it this
-    function removed the containers and then silently left the device CA, every
-    private key, the Postgres data directory and `.env` on disk, while reporting
-    success. It now returns `success: False` if either the store or the
-    directory cannot be removed, because an uninstall that half-worked is not a
-    thing to report as done.
+    ⚠️ **Continue on failure, and report the failure.** One agency whose mounts
+    are busy must not leave four others installed, and an uninstall that
+    half-worked is not a thing to report as done.
     """
-    steps = []
-    dirpath = atlas_dir(ctx)
+    steps, errs = [], []
 
-    # Volumes go with the containers: `down -v` is the only step that removes
-    # the database, and it needs the compose file, so it runs before the
-    # directory does.
-    if os.path.isdir(dirpath):
-        _compose(ctx, 'down -v --remove-orphans', timeout=300)
-        steps.append('Containers, network and database volume removed')
-    else:
-        steps.append('No install directory — nothing to stop')
+    found = load_instances(ctx)
+    if not found:
+        steps.append('No ATLAS deployment recorded on this box')
+    for inst in found:
+        did, failed = remove_instance(ctx, inst)
+        steps.extend(did)
+        errs.extend(failed)
 
-    r = _run(ctx, ['docker', 'image', 'rm', '-f', 'takmdm-api', 'takmdm-init'])
-    steps.append('Images removed' if r else 'Images already absent')
-
-    # ⚠️ **Before the rmtree below, which is what the mounts were blocking.**
-    # Three mount points live inside the install directory, and `shutil.rmtree`
-    # cannot delete through one — so until W212 this whole uninstall left the
-    # device CA, the Postgres data directory and `.env` on disk while reporting
-    # that it had removed them.
-    store_did, store_errs = remove_store(ctx, lambda *_: None)
-    steps.extend(store_did)
-    if store_errs:
+    if errs:
+        # ⚠️ **The box-wide clear-out does not run.** A deployment whose files
+        # survived is still a deployment: it needs its device port, its
+        # settings and `atlas_enabled` so the console can still see it and the
+        # operator can try again. Wiping those would leave a running ATLAS that
+        # the console reports as absent, with a database nothing holds the
+        # password for.
+        #
+        # Caddy *is* regenerated: the deployments that succeeded are out of the
+        # list now, so this removes their vhosts and keeps the rest.
+        try:
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload']()
+        except Exception:
+            pass
         return {
             'success': False,
-            'error': 'the reserved store could not be removed: '
-                     + '; '.join(store_errs),
+            'error': '; '.join(errs),
             'steps': steps + [
-                'STOPPED before deleting the install directory, so the device '
-                'CA and database are still on disk. Re-run once the mounts are '
-                'clear.'
+                'STOPPED SHORT: the deployments above that failed still have '
+                'files on disk, and their settings and records are untouched so '
+                'this can be re-run. Anything still mounted will block it — '
+                'check `mount | grep atlas` — then uninstall again.'
             ],
         }
 
-    # The install directory carries the device CA, the bundle signing key, the
-    # uploaded artifacts and the generated .env.
-    # The obsolete deploy key goes with everything else now. It was kept while
-    # the repository was private, because removing it would have failed the next
-    # install at `git clone`. A public repository takes no credential, so a
-    # private key left on the box is pure liability.
-    for stale in _stale_deploy_key(dirpath):
-        try:
-            os.remove(stale)
-            steps.append(f'Obsolete deploy key removed ({os.path.basename(stale)})')
-        except OSError:
-            pass
-
-    # ⚠️ **A failed rmtree is a failed uninstall, not a footnote.** This used to
-    # append "NOT removed: {exc}" to the step list and carry on returning
-    # success — so when the mounts blocked it, the console reported a clean
-    # uninstall over a directory still holding the device CA, every private key,
-    # the database and `.env`. That silent success is why the real bug went
-    # unnoticed until someone audited the box by hand.
-    for path, label in ((dirpath, 'Install directory (device CA, artifacts, .env)'),
-                        (_caddy_ca_dir(), "Caddy's copy of the device CA")):
-        try:
-            if path and os.path.isdir(path):
-                shutil.rmtree(path)
-                steps.append(f'{label} removed')
-        except OSError as exc:
-            return {
-                'success': False,
-                'error': f'{label} could not be removed: {exc}',
-                'steps': steps + [
-                    f'STOPPED: {path} is still on disk. Anything still mounted '
-                    f'inside it will block this — check `mount | grep atlas`.'
-                ],
-            }
-
+    # ⚠️ Only now, once every deployment is gone. Caddy selects the device site
+    # by SNI so all of them share 8449, and removing the rule earlier would take
+    # the device listener away from the deployments still running.
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
     steps.append(f'Firewall rule for {DEVICE_PORT}/tcp removed')
 
-    # ⚠️ Every generated value goes. Leaving
-    # atlas_pg_password behind would hand the next install a password for a
-    # database that no longer exists — harmless only by luck, since the volume
-    # it belonged to is gone.
-    s = ctx['load_settings']()
-    for key in [k for k in list(s) if k.startswith(f'{KEY}_')]:
-        s.pop(key, None)
-    s[f'{KEY}_enabled'] = False
-    ctx['save_settings'](s)
-    ctx['generate_caddyfile'](s)
+    # ⚠️ Every generated value goes, agencies included. `startswith` is right
+    # *here* — the point is to leave nothing — where in `remove_instance` it
+    # would have taken a running agency's database password.
+    s_now = ctx['load_settings']()
+    for key in [k for k in list(s_now) if k.startswith(f'{KEY}_')]:
+        s_now.pop(key, None)
+    s_now[f'{KEY}_enabled'] = False
+    ctx['save_settings'](s_now)
+    ctx['generate_caddyfile'](s_now)
     ctx['_caddy_reload']()
     steps.append('Generated settings cleared and Caddy vhosts removed')
-
-    try:
-        ctx['_deregister_authentik_proxy_app'](s, KEY, 'ATLAS MDM Proxy')
-        steps.append('ATLAS application removed from Authentik')
-    except Exception:
-        steps.append('ATLAS application not in Authentik (not configured)')
 
     return {'success': True, 'steps': steps}
 
 
-def _caddy_ca_dir():
-    """Where app.py stages a Caddy-readable copy of the device CA, or None.
+def _caddy_ca_dir(inst=None):
+    """Where a deployment's Caddy-readable device CA is staged, or None.
 
     Mirrors sync_device_ca_for_caddy above: Caddy runs unprivileged and cannot
     read the install directory, so the certificate is copied into its own home.
     A stale copy left behind would have Caddy verifying client certificates
     against a CA that no longer exists.
+
+    ⚠️ **Per deployment**, matching where `sync_device_ca_for_caddy` puts it.
+    Hardcoded to `atlas`, tearing down an agency would have deleted the *plain*
+    deployment's trust pool — and Caddy then refuses to start, taking every
+    vhost on the box with it, not only ATLAS's.
     """
+    name = atlas_instances.derive(inst)['name']
     for base in ('/var/lib/caddy', os.path.expanduser('~caddy')):
-        candidate = os.path.join(base, KEY)
+        candidate = os.path.join(base, name)
         if os.path.isdir(candidate):
             return candidate
     return None
@@ -3732,6 +3884,84 @@ def register(ctx):
             'results': list(_update_all_status['results']),
         })
 
+    def _addressed(slug):
+        """The deployment a `<slug>` path segment names, or None.
+
+        ⚠️ The plain deployment is addressed as `atlas`, which is in
+        RESERVED_SLUGS — so no agency can ever claim that URL, and there is no
+        empty path segment to special-case.
+        """
+        found = load_instances(ctx)
+        return (atlas_instances.plain(found) if slug == 'atlas'
+                else atlas_instances.by_slug(found, slug))
+
+    def instance_remove_view(slug):
+        """Destroy one deployment.
+
+        ⚠️ **The confirmation is the page's job and this route's too.** The body
+        must repeat the deployment's own name back; a bare POST to a URL is one
+        mis-click or one stale tab away from destroying an agency's fleet, and
+        the device CA cannot be recovered — every tablet enrolled against it
+        needs a factory reset in person.
+        """
+        import threading
+        from flask import request as _rq
+
+        inst = _addressed(slug)
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        confirm = (_rq.get_json(silent=True) or {}).get('confirm')
+        expected = inst.get('slug') or 'general'
+        if (confirm or '').strip() != expected:
+            return jsonify({
+                'success': False,
+                'error': 'Type %r to confirm removing this deployment.'
+                         % expected,
+            }), 400
+        if _removal_slot(inst)['running']:
+            return jsonify({'success': False,
+                            'error': 'That deployment is already being '
+                                     'removed'}), 409
+        # ⚠️ Refused during an update. The two would fight over the same
+        # checkout and containers, and an update that succeeded against files
+        # a removal had already deleted would report success over nothing.
+        if _update_slot(inst)['running'] or _update_all_status['running']:
+            return jsonify({'success': False,
+                            'error': 'An update is running — wait for it to '
+                                     'finish'}), 409
+        threading.Thread(target=_run_removal, args=(ctx, inst),
+                         daemon=True).start()
+        return jsonify({'success': True})
+
+    def instance_remove_status_view(slug):
+        """The removal log, keyed by the slug rather than by the record.
+
+        ⚠️ **`remove_instance` drops the record as its last step**, so a status
+        read that resolved the deployment first would lose the whole log on the
+        very poll that reports success — and the operator would be left with
+        "that deployment is gone" where the list of what was destroyed had been.
+
+        ⚠️ Looked up, never created. `setdefault` here would let any slug
+        typed into the URL add an entry to a module-level dict, and would answer
+        "not running, not complete" forever — leaving the page polling.
+        """
+        key = atlas_instances.derive(
+            {'slug': None if slug == 'atlas' else slug})['job_key']
+        slot = _removal_slots.get(key)
+        if slot is None:
+            gone = _addressed(slug) is None
+            return jsonify({
+                'running': False, 'complete': gone, 'error': False,
+                'entries': ['That deployment is gone.'] if gone else [],
+            })
+        return jsonify({
+            'running': slot['running'],
+            'complete': slot['complete'],
+            'error': slot['error'],
+            'entries': list(slot['log']),
+        })
+
     def instance_control_view(slug):
         """Start, stop or restart one deployment.
 
@@ -3744,12 +3974,7 @@ def register(ctx):
                 'restart': 'restart'}.get(action)
         if not argv:
             return jsonify({'success': False, 'error': 'unknown action'}), 400
-        # ⚠️ The plain deployment is addressed as `atlas`, which is in
-        # RESERVED_SLUGS — so no agency can ever claim that URL out from under
-        # it, and there is no empty path segment to special-case.
-        found = load_instances(ctx)
-        inst = (atlas_instances.plain(found) if slug == 'atlas'
-                else atlas_instances.by_slug(found, slug))
+        inst = _addressed(slug)
         if inst is None:
             return jsonify({'success': False,
                             'error': 'no deployment with that slug'}), 404
@@ -3801,6 +4026,11 @@ def register(ctx):
              'endpoint': f'{KEY}_update_all_status', 'view': update_all_status_view},
             {'url': f'/api/{KEY}/instances/<slug>/control', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_control', 'view': instance_control_view},
+            {'url': f'/api/{KEY}/instances/<slug>/remove', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_remove', 'view': instance_remove_view},
+            {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
+             'endpoint': f'{KEY}_instance_remove_status',
+             'view': instance_remove_status_view},
             {'url': f'/api/{KEY}/drift', 'methods': ['GET'],
              'endpoint': f'{KEY}_drift', 'view': lambda: jsonify(version_drift(ctx))},
             {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],

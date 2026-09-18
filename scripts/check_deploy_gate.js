@@ -41,6 +41,10 @@ if (start < 0 || end < 0) {
 const source = scripts.slice(start, end);
 
 let fails = 0;
+
+function labels(node) {
+  return (node.children || []).map((c) => c.textContent);
+}
 function check(name, ok, detail) {
   if (ok) console.log("  ok   " + name);
   else {
@@ -114,12 +118,15 @@ function harness(capacity) {
     + "\n;ctx.problem = addInstanceProblem; ctx.gate = refreshAddGate;"
     + "ctx.render = renderInstances;"
     + "ctx.onMode = onModeChanged; ctx.preview = previewSlug;"
-    + "ctx.open = openInstanceConfirm; ctx.close = closeInstanceConfirm;");
+    + "ctx.open = openInstanceConfirm; ctx.close = closeInstanceConfirm;"
+    + "ctx.openRemove = openRemove; ctx.removeGate = refreshRemoveGate;");
 
   return {
     el,
     problem: ctx.problem, open: ctx.open, close: ctx.close,
     render: ctx.render,
+    openRemove: ctx.openRemove,
+    typeConfirm(v) { el("removeConfirm").value = v; ctx.removeGate(); },
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
       radios.fixed.checked = mode === "fixed";
@@ -350,11 +357,15 @@ function harness(capacity) {
     h.el("instanceList").textContent);
   check("and offers a way to finish it",
     h.el("retryRow").hidden === false
-    && h.el("retryRow").children.length === 1,
-    "hidden=" + h.el("retryRow").hidden);
-  check("naming the deployment it would finish",
-    (h.el("retryRow").children[0] || {}).textContent === "Finish deploying corona",
-    (h.el("retryRow").children[0] || {}).textContent);
+    && labels(h.el("retryRow")).includes("Finish deploying corona"),
+    JSON.stringify(labels(h.el("retryRow"))));
+  // ⚠️ **And a way out of it.** "Forget" refuses once a directory exists
+  // on disk — exactly what a deploy that cloned and then failed leaves behind
+  // — so without this the only route out of a failed deploy was to finish it,
+  // with the slug claimed and the store unreclaimable either way.
+  check("and a way to abandon it",
+    labels(h.el("retryRow")).includes("Remove corona"),
+    JSON.stringify(labels(h.el("retryRow"))));
 }
 
 {
@@ -381,10 +392,6 @@ const STOPPED = { slug: "redlands", mode: "dynamic", size_gb: 50,
                   built: true, running: false, version: "1.48.0" };
 const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
                      built: false, running: false, version: "1.48.0" };
-
-function labels(node) {
-  return (node.children || []).map((c) => c.textContent);
-}
 
 {
   const h = harness({ ...CAPACITY });
@@ -470,6 +477,91 @@ function labels(node) {
              capacity: { ...CAPACITY } });
   check("an unfinished deployment is not drift",
     h.el("driftNote").hidden === true, h.el("driftNote").textContent);
+}
+
+// --- removing one deployment ----------------------------------------------- //
+//
+// ⚠️ Removing a deployment destroys *its* device CA, so every tablet enrolled
+// against it needs a factory reset in person. Deployments do not share a CA —
+// that is the point of the per-agency trust pool — so this is exactly one
+// agency's fleet, and a red button beside five rows is one mis-click away from
+// the wrong one.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [RUNNING], capacity: { ...CAPACITY } });
+  const row = h.el("instanceRows").children[0];
+
+  check("a finished deployment can be removed",
+    labels(row).includes("Remove"), JSON.stringify(labels(row)));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+
+  check("the confirmation names the deployment",
+    h.el("removeTitle").textContent === "Remove corona",
+    h.el("removeTitle").textContent);
+  check("and names its own hostname, not the box's",
+    h.el("removeWhat").textContent.includes("atlas.corona.leckliter.net"),
+    h.el("removeWhat").textContent);
+  check("and says what it destroys",
+    ["device volume", "reserved store", "install directory", "Authentik"]
+      .some((t) => h.el("removeWhat").textContent.includes(t))
+    && h.el("removeWhat").textContent.includes("store"),
+    h.el("removeWhat").textContent);
+  check("and asks for the name to be typed",
+    h.el("removePrompt").textContent === "Type corona to confirm.",
+    h.el("removePrompt").textContent);
+  check("the button starts disabled",
+    h.el("removeGo").disabled === true);
+
+  h.typeConfirm("coron");
+  check("a partial name does not enable it", h.el("removeGo").disabled === true);
+
+  // ⚠️ The typed name must match the deployment the modal was opened for, not
+  // merely be a name that exists. Accepting any of them is how the wrong agency
+  // gets destroyed by an operator typing from memory.
+  h.typeConfirm("redlands");
+  check("another deployment's name does not enable it",
+    h.el("removeGo").disabled === true);
+
+  h.typeConfirm("corona");
+  check("the exact name enables it", h.el("removeGo").disabled === false);
+
+  h.typeConfirm("  corona  ");
+  check("and surrounding whitespace is forgiven",
+    h.el("removeGo").disabled === false);
+}
+
+{
+  // ⚠️ "" is not something an operator can type, and the server expects the
+  // same word this asks for.
+  const h = harness({ ...CAPACITY });
+  h.openRemove({ slug: null, built: true, running: true, version: "1.48.0" });
+
+  check("the general deployment is confirmed by typing 'general'",
+    h.el("removePrompt").textContent === "Type general to confirm.",
+    h.el("removePrompt").textContent);
+
+  h.typeConfirm("atlas");
+  check("its URL name is not what is asked for",
+    h.el("removeGo").disabled === true);
+
+  h.typeConfirm("general");
+  check("but 'general' is", h.el("removeGo").disabled === false);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.openRemove(STOPPED);
+  check("re-opening for another deployment clears the confirmation",
+    h.el("removeGo").disabled === true
+    && h.el("removeConfirm").value === "",
+    h.el("removeConfirm").value);
 }
 
 console.log(fails === 0

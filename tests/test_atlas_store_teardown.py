@@ -322,7 +322,7 @@ class FakeCtx(dict):
 def uninstallable(box, monkeypatch):
     monkeypatch.setattr(atlas, "_compose", lambda *a, **k: None)
     monkeypatch.setattr(atlas, "_run", lambda *a: True)
-    monkeypatch.setattr(atlas, "_caddy_ca_dir", lambda: None)
+    monkeypatch.setattr(atlas, "_caddy_ca_dir", lambda inst=None: None)
     monkeypatch.setattr(atlas, "_stale_deploy_key", lambda _d: [])
     return FakeCtx()
 

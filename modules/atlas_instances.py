@@ -224,6 +224,12 @@ def derive(instance, fqdn=None):
         # ⚠️ Compose takes the project name from `-p`, which outranks the
         # `name:` in the released compose file, so ATLAS itself needs no change.
         'compose_project': 'takmdm' if slug is None else f'takmdm-{slug}',
+        # ⚠️ Compose names a built image `<project>-<service>`, so these follow
+        # the project. `takmdm-api` and `takmdm-init` were hardcoded in
+        # `uninstall`, which meant an agency's two images survived every
+        # teardown and accumulated a release's worth of layers each time.
+        'images': (['takmdm-api', 'takmdm-init'] if slug is None else
+                   [f'takmdm-{slug}-api', f'takmdm-{slug}-init']),
         'pg_volume': 'takmdm_pgdata' if slug is None else f'takmdm-{slug}_pgdata',
         'port': (instance or {}).get('port') or BASE_PORT,
         'caddy_ca_dir': f'/var/lib/caddy/{name}',
@@ -257,6 +263,54 @@ def agency_host(plain_host, slug):
     if not dot:
         return f'{head}.{slug}'
     return f'{head}.{slug}.{rest}'
+
+
+#: Settings that describe the *box*, not any one deployment.
+#:
+#: ⚠️ **`atlas_domain` is the operator's service-domain override**, and it is the
+#: input `agency_host` builds every agency hostname from. Removing it with the
+#: plain deployment would move every remaining agency to a different name — new
+#: certificates, and every enrolled tablet pointing at a host that no longer
+#: answers. It is cleared by the whole-module uninstall, which is a different
+#: question, asked once everything is gone.
+#:
+#: ⚠️ `atlas_enabled` means "the module is installed here" and `atlas_instances`
+#: is the registry itself. Taking either with one deployment would make the
+#: remaining ones invisible.
+BOX_SETTINGS_KEYS = frozenset({'atlas_enabled', 'atlas_domain', INSTANCES_KEY})
+
+
+def owned_settings_keys(instance, keys, instances=()):
+    """The settings keys belonging to `instance` alone.
+
+    ⚠️ **`atlas_` is a prefix of `atlas_corona_`.** The existing teardown swept
+    `startswith('atlas_')`, which for the *plain* deployment would have taken
+    every agency's keys with it — database passwords included, and Postgres only
+    honours `POSTGRES_PASSWORD` on an empty volume, so each of those databases
+    would have become permanently unopenable by a deployment still running.
+
+    The rule is "mine, unless a longer prefix claims it": the plain deployment's
+    `atlas_` yields to `atlas_corona_`, and `atlas_corona_` does not yield to
+    the shorter `atlas_`. ⚠️ Slugs are lowercase letters only, so no two agency
+    prefixes can overlap — `atlas_pd_` and `atlas_pdx_` are distinct because of
+    the trailing underscore. `validate_slug` is what keeps that true.
+    """
+    mine = derive(instance)['settings_prefix']
+    slug = (instance or {}).get('slug') or None
+    longer = [p for p in
+              (derive(i)['settings_prefix'] for i in instances or ()
+               if ((i or {}).get('slug') or None) != slug)
+              if len(p) > len(mine)]
+    owned = []
+    for key in keys or ():
+        if key in BOX_SETTINGS_KEYS:
+            continue
+        if not key.startswith(mine):
+            continue
+        if any(key.startswith(other) for other in longer):
+            continue
+        owned.append(key)
+    return sorted(owned)
 
 
 def authentik_names(instance):

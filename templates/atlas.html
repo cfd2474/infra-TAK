@@ -603,6 +603,38 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
   </div>
 </div>
 
+<!--
+  ⚠️ **A separate confirmation from the whole-module uninstall, and no easier.**
+  Removing one deployment destroys *that* deployment's device CA, so every tablet
+  enrolled against it needs a factory reset in person. Deployments do not share a
+  CA — that is the point of the per-agency trust pool — so this is exactly one
+  agency's fleet, and the operator has to name which one.
+
+  ⚠️ The name is typed, not clicked. A red button beside five rows is one
+  mis-click away from the wrong agency, and there is no undo.
+-->
+<div class="modal-overlay" id="instanceRemoveModal">
+  <div class="modal">
+    <h3 id="removeTitle">Remove deployment</h3>
+    <p class="note" id="removeWhat"></p>
+    <p class="note" style="margin-top:10px;color:var(--red)">
+      ⚠️ <strong>This destroys that deployment's device CA and database.</strong>
+      Every tablet enrolled against it is signed by that CA. Once it is gone they
+      cannot be re-adopted — each needs a factory reset, in person. Other
+      deployments on this box are untouched.
+    </p>
+    <p class="note" style="margin-top:10px" id="removePrompt"></p>
+    <input type="text" id="removeConfirm" autocomplete="off" spellcheck="false"
+           oninput="refreshRemoveGate()">
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeRemove()">Cancel</button>
+      <button class="btn btn-danger" id="removeGo" disabled
+              onclick="doRemove()">Remove deployment</button>
+    </div>
+    <div id="removeError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="uninstallModal">
   <div class="modal">
     <h3>Uninstall ATLAS</h3>
@@ -692,6 +724,15 @@ function renderInstances(data){
       b.textContent = 'Finish deploying ' + (i.slug || 'the general ATLAS');
       b.onclick = () => startDeployFor(i);
       retry.appendChild(b);
+      // ⚠️ **Abandoning it has to be possible too.** "Forget" refuses once a
+      // directory exists on disk — which is exactly what a deploy that cloned
+      // and then failed leaves behind — so without this the only way out of a
+      // failed deploy was to finish it. The slug stays claimed either way, and
+      // an operator who has changed their mind is left with a name they cannot
+      // reuse and a store they cannot reclaim.
+      retry.appendChild(rowButton('Remove ' + (i.slug || 'the general ATLAS'),
+                                  'btn-danger',
+                                  function(){ openRemove(i); }));
     });
   }
   list.textContent = rows.length
@@ -816,6 +857,8 @@ function instanceRow(i){
   if (i.running)
     row.appendChild(rowButton('Stop', 'btn-secondary',
                               function(){ controlInstance(i, 'stop'); }));
+  row.appendChild(rowButton('Remove', 'btn-danger',
+                            function(){ openRemove(i); }));
   return row;
 }
 
@@ -832,6 +875,108 @@ function controlInstance(i, action){
       if (d.error) { alert(d.error); return; }
       setTimeout(function(){ location.reload(); }, 1200);
     }).catch(function(){});
+}
+
+let removeTarget = null;
+
+function removeName(i){
+  // ⚠️ `general` for the slug-less deployment, because "" is not something an
+  // operator can type and the server expects the same word.
+  return (i && i.slug) || 'general';
+}
+
+function openRemove(i){
+  removeTarget = i;
+  const name = removeName(i);
+  const host = hostFor(i.slug);
+  const title = document.getElementById('removeTitle');
+  const what = document.getElementById('removeWhat');
+  const prompt = document.getElementById('removePrompt');
+  const field = document.getElementById('removeConfirm');
+  const err = document.getElementById('removeError');
+  if (title) title.textContent = 'Remove ' + name;
+  if (what) what.textContent =
+    'Removes the ' + name + ' deployment at ' + host + ': its containers, '
+    + 'images, database volume, reserved store, install directory, Caddy vhost '
+    + 'and its own Authentik application.';
+  if (prompt) prompt.textContent = 'Type ' + name + ' to confirm.';
+  if (field){ field.value = ''; field.placeholder = name; }
+  if (err) err.style.display = 'none';
+  refreshRemoveGate();
+  document.getElementById('instanceRemoveModal').classList.add('open');
+}
+
+function closeRemove(){
+  document.getElementById('instanceRemoveModal').classList.remove('open');
+  removeTarget = null;
+}
+
+function refreshRemoveGate(){
+  // ⚠️ The typed name must match the deployment the modal was opened for, not
+  // merely be a name that exists. Accepting any of them is how the wrong agency
+  // gets destroyed by an operator who typed from memory.
+  const field = document.getElementById('removeConfirm');
+  const go = document.getElementById('removeGo');
+  const want = removeName(removeTarget);
+  if (go) go.disabled = !field || field.value.trim() !== want;
+}
+
+let removePolling = false;
+
+function doRemove(){
+  if (!removeTarget) return;
+  const slug = removeTarget.slug || 'atlas';
+  const name = removeName(removeTarget);
+  const go = document.getElementById('removeGo');
+  if (go) go.disabled = true;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({confirm: name})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error){
+        const err = document.getElementById('removeError');
+        if (err){ err.textContent = d.error; err.style.display = ''; }
+        if (go) go.disabled = false;
+        return;
+      }
+      closeRemove();
+      removePolling = slug;
+      pollRemove();
+    }).catch(function(){ if (go) go.disabled = false; });
+}
+
+function pollRemove(){
+  if (!removePolling) return;
+  const slug = removePolling;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove-status',
+        {credentials: 'same-origin'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      const card = document.getElementById('updateCard');
+      const title = document.getElementById('updateLogTitle');
+      const box = document.getElementById('updateLog');
+      if (card) card.hidden = false;
+      // ⚠️ Says *removal*. The same card carries update logs, and a teardown
+      // shown under "update log" is how an operator comes to believe a
+      // deployment was updated when it was destroyed.
+      if (title) title.textContent = 'Removal log — ' + slug;
+      if (box){
+        box.textContent = (d.entries || []).join(String.fromCharCode(10));
+        box.scrollTop = box.scrollHeight;
+      }
+      if (d.complete && !d.error){
+        removePolling = false;
+        setTimeout(function(){ location.reload(); }, 1500);
+        return;
+      }
+      // ⚠️ A failed removal does not reload. Its record and settings are left
+      // in place deliberately so it can be retried, and the log is the only
+      // place that says what is still on disk.
+      if (d.error && !d.running){ removePolling = false; return; }
+      setTimeout(pollRemove, 2000);
+    }).catch(function(){ setTimeout(pollRemove, 4000); });
 }
 
 function hostFor(slug){
