@@ -179,7 +179,10 @@ _TRUSTED_FALLBACK = '172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.0/8'
 #: The image itself. Outside the ATLAS directory on purpose: that directory is
 #: a git checkout the updater rewrites, and a 40G file inside it would be one
 #: `git clean` away from deletion.
-STORE_IMAGE = '/var/lib/atlas/store.img'
+#: ⚠️ Retired with the loop store (W230). Kept as a name only so that a
+#: stale reference fails loudly at import rather than silently reading a
+#: path nothing writes any more.
+STORE_IMAGE = None
 
 #: Where it is mounted. Inside the ATLAS directory, because the compose file's
 #: bind mounts are relative to it.
@@ -323,58 +326,6 @@ def validate_store_size(requested_gb, free_bytes, in_use_bytes=0, already_reserv
 STORE_RESERVED_FRACTION = 0.95
 
 
-def mkfs_argv(image, label='atlas-store', mode=None):
-    """The `mkfs.ext4` command for the store image.
-
-    ⚠️ **`-E nodiscard` is why this function exists (W213).** `mkfs` discards
-    its target by default, and on a regular file on ext4 a discard is
-    `FALLOC_FL_PUNCH_HOLE` — so it handed back every block the `fallocate`
-    above had just reserved and left the image sparse. The reservation reserved
-    nothing for its entire first release, while reporting that it had.
-
-    Measured on the box: 5 GB fallocated, then `mkfs.ext4` → 67 MiB of real
-    blocks; with `-E nodiscard` → 5121 MiB. Pure, so the flag can be asserted
-    without a disk — the absence of one is exactly why nothing caught this.
-
-    ⚠️ **W216 makes the flag conditional.** Under **dynamic** sizing the discard
-    is exactly what is wanted: the image is sparse on purpose, the filesystem is
-    only a ceiling, and blocks come from the host as data arrives. So the flag is
-    present for `fixed`, absent for `dynamic`, and the two modes are one code
-    path with a single difference.
-
-    ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB store is
-    2 GB an operator asked for and cannot use. A dedicated data volume needs no
-    headroom to recover.
-    """
-    argv = ['mkfs.ext4', '-F', '-m', '0']
-    if (mode or MODE_FIXED) == MODE_FIXED:
-        argv += ['-E', 'nodiscard']
-    return argv + ['-L', label, image]
-
-
-def mount_options(mode=None):
-    """Mount options for the store, by sizing mode.
-
-    ⚠️ **`discard` is what makes dynamic shrink**, and it is not an
-    optimisation. Without it a dynamic store only ever grows: deleting 40 GB of
-    imagery would free space inside the agency's filesystem and hand nothing back
-    to the box, defeating the entire mode. Measured on the box — a 4 GB sparse
-    image went 67 → 667 MiB on a 600 MB write and straight back to 67 MiB on
-    delete, with the filesystem holding its size throughout.
-
-    ⚠️ **`errors=remount-ro` for dynamic only**, and deliberately. A dynamic
-    store's filesystem believes it has space the host may be unable to deliver,
-    so a write can fail as an *I/O error* rather than a clean `ENOSPC`. The live
-    fixed store measures `Errors behavior: Continue` — carrying on after such an
-    error, which for a database is the worst of the options. A loud stop beats
-    quiet damage. A fixed store cannot reach that state at all: its blocks are
-    already allocated.
-    """
-    if mode == MODE_DYNAMIC:
-        return 'loop,discard,errors=remount-ro'
-    return 'loop'
-
-
 def allocated_bytes(path):
     """Bytes really backing `path`, or **None** when the platform cannot say.
 
@@ -394,16 +345,27 @@ def allocated_bytes(path):
     return int(blocks) * 512
 
 
-def is_fully_reserved(apparent, allocated, fraction=STORE_RESERVED_FRACTION):
-    """Whether an image of `apparent` bytes really holds its blocks.
+def _tree_bytes(path):
+    """Bytes a directory tree really occupies, or 0.
 
-    ⚠️ Unknown (`allocated is None`) is **not** reserved. A reservation that
-    cannot be demonstrated must not be reported as one — making that claim from
-    the apparent size is the bug this fixes.
+    ⚠️ **Real blocks, not apparent sizes** — [allocated_bytes] per file, so a
+    sparse file counts what it holds rather than what it claims. That was
+    W213's lesson about the loop image and it applies just as well to the
+    directory that replaced it.
+
+    ⚠️ Pure Python on purpose. `du` is not on the broker's allowlist, and
+    reaching for it would put a binary in the ask for a number we can count
+    ourselves. A deployment is a few hundred megabytes of mostly large files;
+    the walk is not the expensive part of any page that calls it.
     """
-    if apparent <= 0 or allocated is None:
-        return False
-    return allocated >= apparent * fraction
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            measured = allocated_bytes(os.path.join(root, name))
+            # None is "this platform cannot say" — Windows, where the tests
+            # run. Counting it as 0 is right: it is the only honest floor.
+            total += measured or 0
+    return total
 
 
 def deliverable_free(fs_free, host_free, mode):
@@ -434,40 +396,42 @@ def store_facts(ctx=None, mode=None, inst=None):
     root reserve both mean usable space is less than the image, and a predicted
     figure that is wrong is worse than a real one that arrives a moment later.
 
-    ⚠️ **`reserved_gb` used to be the apparent size, and that made this
-    docstring false (W213).** `st_size` on a sparse image is what it *claims*,
-    not what it holds, so the console reported "100 GB reserved" about a file
-    backed by roughly 2 GB — the one number on the page an operator cannot
-    check for themselves. `allocated_gb` is the measured truth and
-    `fully_reserved` says whether the two agree.
+    ⚠️ **`reserved_gb` is now a commitment, not a measurement (W230).** It
+    was the loop image's size on disk; with the image gone it is what the
+    registry records this deployment was promised. `used_gb` is still
+    measured — by walking the directory — so the pair still answers "how much
+    was promised, how much is in use". What it can no longer answer is "is the
+    promise actually held on disk", because nothing holds it any more:
+    `fully_reserved` is therefore always False and says so rather than
+    claiming a guarantee that was withdrawn.
     """
-    image = instance_paths(ctx, inst)['image'] if inst else STORE_IMAGE
-    total, free = _disk_free(os.path.dirname(image))
-    reserved = 0
-    if os.path.exists(image):
-        try:
-            reserved = os.stat(image).st_size
-        except OSError:
-            reserved = 0
-    allocated = allocated_bytes(image) if reserved else None
+    paths = instance_paths(ctx, inst)
+    total, free = _disk_free(install_base(ctx))
+    # The promise, from the record. `inst` is None for the plain deployment on
+    # a box that predates the registry, and 0 is the honest answer there.
+    reserved = int((inst or {}).get('size_gb') or 0) * GIB
 
     mode = mode or MODE_FIXED
     usable = used = 0
-    mount = _store_mount(ctx, inst) if ctx is not None else None
-    if mount and os.path.ismount(mount):
-        try:
-            usage = shutil.disk_usage(mount)
-            usable = usage.total
-            used = usage.used
-        except (OSError, ValueError):
-            pass
+    store = paths['store']
+    if os.path.isdir(store):
+        used = _tree_bytes(paths['dir'])
+        # ⚠️ The filesystem's free space, not a private allocation. Every
+        # deployment now shares one filesystem, so "usable" is what the box
+        # has left plus what this deployment already holds.
+        usable = used + free
 
     return {
         'disk_total_gb': round(total / GIB, 1),
         'disk_free_gb': round(free / GIB, 1),
         'reserved_gb': round(reserved / GIB, 1) if reserved else 0,
-        'allocated_gb': round(allocated / GIB, 1) if allocated else 0,
-        'fully_reserved': is_fully_reserved(reserved, allocated),
+        # ⚠️ Measured usage, which under a shared filesystem is the only
+        # number here that is a fact about this deployment alone.
+        'allocated_gb': round(used / GIB, 1) if used else 0,
+        # ⚠️ **Always False, deliberately.** Nothing reserves blocks any
+        # more, and a page that kept saying "fully reserved" would be
+        # promising a guarantee that was removed.
+        'fully_reserved': False,
         'usable_gb': round(usable / GIB, 1) if usable else 0,
         'used_gb': round(used / GIB, 1) if usable else 0,
         'mode': mode,
@@ -481,7 +445,11 @@ def store_facts(ctx=None, mode=None, inst=None):
         'size_is_reserved': mode == MODE_FIXED,
         'max_gb': round(store_ceiling_bytes(free, reserved) / GIB, 1),
         'min_gb': int(STORE_MIN_BYTES / GIB),
-        'mounted': bool(mount and os.path.ismount(mount)),
+        # ⚠️ **Always False now, and kept rather than dropped.** The page
+        # reads this key; removing it would make it `undefined` in the
+        # browser, which renders the same as False but for the wrong
+        # reason. There is no mount: the store is a directory (W230).
+        'mounted': False,
     }
 
 
@@ -501,22 +469,9 @@ def instance_paths(ctx=None, inst=None):
     base = plain_dir if not d['slug'] else posixpath.join(
         posixpath.dirname(plain_dir), d['name'])
     d['dir'] = base
-    d['mount'] = posixpath.join(base, STORE_DIRNAME)
+    d['store'] = posixpath.join(base, STORE_DIRNAME)
     d['artifacts'] = posixpath.join(base, 'artifacts')
     d['cache'] = posixpath.join(base, 'cache')
-    # ⚠️ **`STORE_IMAGE` is authoritative for every instance, not just the
-    # plain one.** `derive` hardcodes `/var/lib/<name>`, and rebasing only the
-    # plain image left an agency's pointing at the real `/var/lib` even when a
-    # test had redirected the constant — so three tests created
-    # `/var/lib/atlas-agencya` for real, as root on a box, and passed. The
-    # comment here already claimed this is 'what tests redirect'; now it is.
-    #
-    # Same layout on a real box: `/var/lib/atlas/store.img` has grandparent
-    # `/var/lib`, so an agency still resolves to `/var/lib/atlas-<slug>`.
-    store_base = posixpath.dirname(posixpath.dirname(STORE_IMAGE))
-    d['image'] = (STORE_IMAGE if not d['slug']
-                  else posixpath.join(store_base, d['name'], 'store.img'))
-    d['image_dir'] = posixpath.dirname(d['image'])
     return d
 
 
@@ -557,11 +512,12 @@ def load_instances(ctx):
     if not settings.get(f'{KEY}_enabled'):
         return []
 
+    # ⚠️ **0, and it is the honest answer.** This adopts a deployment made
+    # before the registry existed, and the size it was promised is not
+    # recorded anywhere — it used to be read off the loop image's apparent
+    # size, and there is no image now. Measuring what the directory *uses*
+    # would report a different quantity under the same name.
     size_gb = 0
-    try:
-        size_gb = round(os.stat(STORE_IMAGE).st_size / atlas_instances.GIB)
-    except (OSError, ValueError):
-        pass
     return [atlas_instances.make(None, atlas_instances.MODE_FIXED,
                                  size_gb, atlas_instances.BASE_PORT)]
 
@@ -848,7 +804,7 @@ def capacity_facts(ctx, size_gb=None):
     larger figure would plan for twice what fits.
     """
     instances = load_instances(ctx)
-    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    total, free = _disk_free(install_base(ctx))
     floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
     reserved = atlas_instances.committed_bytes(instances)
     # Everything on the disk that is not an ATLAS reservation.
@@ -918,7 +874,7 @@ def capacity_facts(ctx, size_gb=None):
 
 def _pool_gb(ctx, instances):
     """The pool, in GB. One place, so the screen and the validator agree."""
-    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    total, free = _disk_free(install_base(ctx))
     floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
     committed = atlas_instances.committed_bytes(instances)
     non_atlas = max(0, total - free - committed)
@@ -929,7 +885,7 @@ def _pool_gb(ctx, instances):
 def fits_here(ctx, size_gb, instances=None):
     """`(ok, error)` for one requested size against this box's budget."""
     instances = load_instances(ctx) if instances is None else instances
-    total, free = _disk_free(os.path.dirname(STORE_IMAGE))
+    total, free = _disk_free(install_base(ctx))
     floor = int(atlas_instances.DEFAULT_FLOOR_GB * atlas_instances.GIB)
     reserved = atlas_instances.committed_bytes(instances)
     non_atlas = max(0, total - free - reserved)
@@ -1163,7 +1119,14 @@ def caddy_sites(settings, plain_host):
             'slug': slug,
             'host': atlas_instances.agency_host(plain_host, slug),
             'upstream': f'127.0.0.1:{port}',
-            'ca_path': sync_device_ca_for_caddy(inst),
+            # ⚠️ **Describes, never writes (W230).** This used to call
+            # `sync_device_ca_for_caddy` here — a privileged write, from the
+            # function whose job is to render a config, with a `ctx` it had
+            # built itself out of nothing. When that write failed the path
+            # came back None, the `:8449` block was quietly omitted, and the
+            # deploy log still said "Devices: https://…:8449 (mutual TLS)".
+            # Staging is now `deploy`'s job and failing is fatal there.
+            'ca_path': device_ca_path(inst) if _ca_is_staged(inst) else None,
         })
     return sites
 
@@ -1214,7 +1177,7 @@ def instance_is_built(ctx, inst, projects=None):
 
 
 def _store_mount(ctx, inst=None):
-    return instance_paths(ctx, inst)['mount']
+    return instance_paths(ctx, inst)['store']
 
 
 #: The Postgres image runs as uid/gid 70 and refuses to start unless its data
@@ -1238,228 +1201,66 @@ def _run_root(argv, timeout=120):
         return 1, str(exc)
 
 
-def _systemd_unit_name(path):
-    """`/root/atlas/store` → `root-atlas-store.mount`.
-
-    ⚠️ A mount unit's **filename must encode its mount point**, or systemd
-    refuses it with "Where= setting doesn't match unit name". `systemd-escape`
-    is the only thing that gets this right for every path, so it is asked rather
-    than imitated.
-    """
-    rc, out = _run_root(['systemd-escape', '--path', '--suffix=mount', path])
-    if rc == 0 and out.strip():
-        return out.strip()
-    return path.strip('/').replace('-', '\\x2d').replace('/', '-') + '.mount'
-
-
-def mount_unit_text(what, where, fstype, options, description,
-                    requires_mounts_for=None):
-    """The text of a systemd mount unit.
-
-    ⚠️ **`Before=docker.service` is the load-bearing line.** Docker starting
-    first would let it create the Postgres volume, and a container write into it,
-    against a directory that is not yet the reservation — so ATLAS would fill the
-    root disk while the reserved image sat empty. That is the exact failure this
-    feature exists to prevent, and boot order is the only thing standing between
-    it and a reboot.
-
-    Pure so the parts that matter can be checked without a systemd to load them.
-    """
-    lines = [
-        '# Managed by the InfraTAK ATLAS module (W205). Edits are overwritten.',
-        '[Unit]',
-        f'Description={description}',
-        'Before=docker.service',
-    ]
-    if requires_mounts_for:
-        # The bind cannot mount before the filesystem it is binding out of.
-        lines.append(f'RequiresMountsFor={requires_mounts_for}')
-    lines += [
-        '',
-        '[Mount]',
-        f'What={what}',
-        f'Where={where}',
-        f'Type={fstype}',
-        f'Options={options}',
-        '',
-        '[Install]',
-        'WantedBy=multi-user.target',
-        '',
-    ]
-    return '\n'.join(lines)
-
-
-def _write_mount_unit(what, where, plog, options='loop'):
-    """A systemd mount unit, enabled, so the store survives a reboot.
-
-    ⚠️ **A bare `mount` would be worse than nothing.** After a reboot the
-    image would be unmounted and `<atlas>/store` would be an ordinary empty
-    directory on the root filesystem — so ATLAS would start, write to the root
-    disk, and report a healthy store while the reservation sat unused in a file.
-    The failure this whole feature exists to prevent, arriving quietly.
-    """
-    name = _systemd_unit_name(where)
-    unit = mount_unit_text(what, where, 'ext4', options, 'ATLAS reserved store')
-    path = os.path.join('/etc/systemd/system', name)
-    try:
-        with open(path, 'w') as fh:
-            fh.write(unit)
-    except OSError as exc:
-        return f'could not write {path}: {exc}'
-    _run_root(['systemctl', 'daemon-reload'])
-    rc, out = _run_root(['systemctl', 'enable', '--now', name], timeout=90)
-    if rc != 0:
-        return f'systemctl enable --now {name} failed: {out.strip()[:300]}'
-    plog(f'  ✓ {where} mounted and enabled at boot ({name})')
-    return None
-
-
-def _bind_unit(source, target, plog):
-    """Bind one directory inside the store onto the path compose expects.
-
-    ⚠️ **This is what keeps `docker-compose.yml` untouched.** The compose
-    file bind-mounts `./artifacts` and `./cache`; binding the store's copies
-    onto those paths means ATLAS writes into the reservation without knowing the
-    reservation exists — and no ATLAS release is coupled to a module change,
-    which matters because the two repositories are released by different people.
-    """
-    name = _systemd_unit_name(target)
-    unit = mount_unit_text(source, target, 'none', 'bind', 'ATLAS store bind',
-                           requires_mounts_for=os.path.dirname(source))
-    path = os.path.join('/etc/systemd/system', name)
-    try:
-        with open(path, 'w') as fh:
-            fh.write(unit)
-    except OSError as exc:
-        return f'could not write {path}: {exc}'
-    _run_root(['systemctl', 'daemon-reload'])
-    rc, out = _run_root(['systemctl', 'enable', '--now', name], timeout=90)
-    if rc != 0:
-        return f'systemctl enable --now {name} failed: {out.strip()[:300]}'
-    plog(f'  ✓ {target} → {source}')
-    return None
-
-
 def ensure_store(ctx, size_bytes, plog, mode=None, inst=None):
-    """Create, grow or leave the store. Returns an error, or None.
+    """Create the directories a deployment keeps its data in. Error, or None.
 
-    Idempotent: a deploy at the size already in place does nothing but report.
+    ⚠️ **This was a loop-mounted ext4 image and is now four directories
+    (W230).** The old version wrote `/var/lib/<name>/store.img`, ran
+    `fallocate`/`truncate`, `mkfs.ext4`, `resize2fs`, `e2fsck` and `losetup`,
+    and installed three systemd `.mount` units. None of that is available to
+    an unprivileged console, and upstream's review named the design itself
+    rather than the permissions: *"a root-mounted filesystem image whose file
+    the unprivileged console can write is exactly the kind of thing the broker
+    exists to prevent."* They are right — a console that can write the image
+    and have root mount it can hand root a filesystem of its choosing.
 
-    ⚠️ **`mode` decides whether the size is a reservation or a ceiling**
-    (W216). Under `fixed` the blocks are taken from the box up front and held,
-    which is what `fallocate` + `-E nodiscard` + `_reserve_blocks` achieve
-    together. Under `dynamic` the image is deliberately sparse: the filesystem
-    is only a cap, blocks arrive from the host as data does, and `discard`
-    hands them back on delete. Defaulting to `fixed` keeps every existing
-    call site behaving exactly as it does today.
+    ⚠️ **So capacity is no longer enforced at runtime, and that is a real
+    loss taken deliberately.** `size_gb` remains a commitment the box plans
+    against — `fits_here` still refuses an over-commitment at deploy — but
+    nothing now stops a deployment growing past it and crowding its
+    neighbours. The alternative was asking upstream to broker the whole loop
+    lifecycle, which is more privilege for a property we can get back later.
 
-    ⚠️ **Called before compose starts anything.** The mounts have to be in
-    place before Docker creates a volume or a container writes a byte, or ATLAS
-    populates the root filesystem and the reservation stays an empty file.
+    `size_bytes` and `mode` are kept in the signature: the size is recorded
+    and planned against, and callers should not have to change shape for a
+    storage decision.
     """
-    mode = mode or MODE_FIXED
     paths = instance_paths(ctx, inst)
-    image = paths['image']
-    mount = paths['mount']
-    parent = paths['image_dir']
+    store = paths['store']
 
-    try:
-        os.makedirs(parent, exist_ok=True)
-        os.makedirs(mount, exist_ok=True)
-    except OSError as exc:
-        return f'could not create {parent} or {mount}: {exc}'
-
-    existing = os.stat(image).st_size if os.path.exists(image) else 0
-
-    if existing and size_bytes < existing:
-        # The validator refuses this, so reaching it means the two disagree.
-        return (f'the store is already {existing / GIB:.1f} GB and shrinking is not '
-                f'supported')
-
-    if not existing:
-        # ⚠️ **`fallocate` for fixed, `truncate` for dynamic, and the
-        # difference is the whole feature.** A sparse file reserves *nothing*:
-        # under `fixed` that was W213's bug, because the disk would still be
-        # handed to whatever asked next and ATLAS would hit ENOSPC inside a
-        # store claiming to be half empty. Under `dynamic` it is the point —
-        # the space stays available to the box until this agency uses it.
-        if mode == MODE_FIXED:
-            plog(f'  Reserving {size_bytes / GIB:.1f} GB at {image}...')
-            rc, out = _run_root(['fallocate', '-l', str(size_bytes), image],
-                                timeout=600)
-        else:
-            plog(f'  Creating a {size_bytes / GIB:.1f} GB ceiling at {image} '
-                 f'(dynamic — space is taken as it is used)...')
-            rc, out = _run_root(['truncate', '-s', str(size_bytes), image],
-                                timeout=600)
-        if rc != 0:
-            return f'creating the store image failed: {out.strip()[:300]}'
-        # ⚠️ `-m 0`: ext4 keeps 5% for root by default, which on a 40 GB
-        # store is 2 GB an operator asked for and cannot use. This is a
-        # dedicated data volume, not a root filesystem that needs headroom to
-        # recover, so the reserve buys nothing.
-        rc, out = _run_root(mkfs_argv(image, mode=mode), timeout=900)
-        if rc != 0:
-            return f'mkfs.ext4 failed: {out.strip()[:300]}'
-        plog('  ✓ Filesystem created')
-    elif size_bytes > existing:
-        plog(f'  Growing the store {existing / GIB:.1f} → {size_bytes / GIB:.1f} GB...')
-        # Fixed takes the new blocks now; dynamic only raises the ceiling and
-        # takes them when data arrives.
-        grow = 'fallocate' if mode == MODE_FIXED else 'truncate'
-        flag = '-l' if mode == MODE_FIXED else '-s'
-        rc, out = _run_root([grow, flag, str(size_bytes), image], timeout=600)
-        if rc != 0:
-            return f'{grow} failed: {out.strip()[:300]}'
-        # Online growth needs the filesystem mounted; e2fsck first if it is not.
-        if not os.path.ismount(mount):
-            _run_root(['e2fsck', '-fp', image], timeout=900)
-        rc, out = _run_root(['resize2fs', image], timeout=900)
-        if rc != 0:
-            return f'resize2fs failed: {out.strip()[:300]}'
-        plog('  ✓ Filesystem grown')
-    else:
-        plog(f'  ✓ Store already reserved at {existing / GIB:.1f} GB')
-
-    # ⚠️ **Every store created before W213 is sparse**, because `mkfs` discarded
-    # the blocks `fallocate` had just reserved. So a present image of the right
-    # apparent size is not evidence of a reservation, and this runs on every
-    # deploy rather than only on creation — it is the repair path for existing
-    # boxes as much as a belt-and-braces check for new ones.
-    # ⚠️ **Only for fixed.** Calling this on a dynamic store would allocate
-    # every block up front and turn it into a fixed one, silently — the
-    # operator would have chosen dynamic and received the opposite.
-    if mode == MODE_FIXED:
-        err = _reserve_blocks(size_bytes, plog, image=image)
-        if err:
-            return err
-
-    if not os.path.ismount(mount):
-        err = _write_mount_unit(image, mount, plog, options=mount_options(mode))
-        if err:
-            return err
-    else:
-        plog(f'  ✓ {mount} already mounted')
-
-    # The three directories ATLAS keeps things in, inside the reservation.
-    for sub in ('artifacts', 'cache', 'pgdata'):
+    # ⚠️ Created as the console, not as root. Everything here lives under
+    # the console's own install directory, so ordinary `makedirs` is the whole
+    # of it — no broker, no allowlist, no privileged path.
+    wanted = [store, paths['artifacts'], paths['cache'],
+              posixpath.join(store, 'pgdata')]
+    for path in wanted:
         try:
-            os.makedirs(os.path.join(mount, sub), exist_ok=True)
+            os.makedirs(path, exist_ok=True)
         except OSError as exc:
-            return f'could not create {mount}/{sub}: {exc}'
+            return 'could not create %s: %s' % (path, exc)
 
-    pgdir = os.path.join(mount, 'pgdata')
-    try:
-        os.chown(pgdir, STORE_PG_UID, STORE_PG_GID)
-        os.chmod(pgdir, 0o700)
-    except OSError as exc:
-        return f'could not set ownership on {pgdir}: {exc}'
+    plog('  ✓ Store directories ready under %s' % paths['dir'])
+    if mode == MODE_FIXED:
+        # ⚠️ Said out loud rather than quietly dropped. An operator who chose
+        # "fixed" asked for a reservation and is no longer getting one; the
+        # number still governs what the box will let them commit.
+        plog('  ⚠ %0.1f GB is a commitment this box plans against, not a '
+             'reservation on disk.' % (size_bytes / GIB))
+        plog('    Nothing stops this deployment growing past it.')
 
-    for sub in ('artifacts', 'cache'):
-        err = _bind_unit(os.path.join(mount, sub),
-                         os.path.join(paths['dir'], sub), plog)
-        if err:
-            return err
+    pgdir = posixpath.join(store, 'pgdata')
+    # ⚠️ **Postgres runs as uid 70 inside its container and must own this.**
+    # The only chown left, and it goes through the shimmed `chown` rather than
+    # `os.chown`, which is `EPERM` for a non-root console. The other three
+    # chowns are gone: the api container now runs as the console's own uid, so
+    # `pki/`, `artifacts/` and `cache/` are owned by whoever created them.
+    rc, out = _run_root(['chown', '%d:%d' % (STORE_PG_UID, STORE_PG_GID), pgdir])
+    if rc != 0:
+        return ('could not give %s to the database user (uid %d): %s'
+                % (pgdir, STORE_PG_UID, out.strip()[:200]))
+    rc, out = _run_root(['chmod', '700', pgdir])
+    if rc != 0:
+        return 'could not set permissions on %s: %s' % (pgdir, out.strip()[:200])
 
     err = _bind_pg_volume(pgdir, plog, volume=paths['pg_volume'])
     if err:
@@ -1468,137 +1269,57 @@ def ensure_store(ctx, size_bytes, plog, mode=None, inst=None):
 
 
 def remove_store(ctx, plog, inst=None):
-    """Undo `ensure_store`. Returns a list of what it did, and a list of errors.
+    """Undo `ensure_store`. Returns what it did, and any errors.
 
-    ⚠️ **This is the step whose absence made uninstall a no-op.** W205 added the
-    reservation and its three mount units and never wrote the counterpart, so
-    `uninstall` left `/root/atlas/store`, `/root/atlas/artifacts` and
-    `/root/atlas/cache` mounted — and `shutil.rmtree` cannot delete through a
-    mount point, so the install directory survived with the device CA, the
-    Postgres data directory and `.env` inside it. The operator was told the
-    uninstall had succeeded.
+    ⚠️ **Most of this function was unmounting, and there is nothing left to
+    unmount (W230).** It used to disable three systemd units, `umount` three
+    paths (falling back to `umount -l`), delete the unit files, `losetup -d`
+    the loop device and remove the image. The store is now a directory tree
+    the console owns, so deleting it is deleting it.
 
-    ⚠️ **Order is the entire function.** The two binds mount *out of* the store,
-    so they come first; unmounting the store underneath them would leave systemd
-    holding units over a vanished source. Reverse of `ensure_store`, deliberately
-    and in the same file so the two can be read against each other.
+    ⚠️ **The named volume still goes first.** It is only a pointer at
+    `pgdata`, but leaving it behind makes the next deploy refuse —
+    `_bind_pg_volume` rejects a volume that already exists pointing somewhere
+    unexpected, which is exactly the right behaviour and exactly what a
+    half-finished teardown would trigger.
 
-    Best-effort by design: every step is idempotent and an already-clean box
-    produces no errors, because an uninstall must be re-runnable after a partial
-    failure.
+    ⚠️ **Still best-effort and still idempotent.** An uninstall has to be
+    re-runnable after a partial failure, and a clean box must produce no
+    errors. That was W205's lesson — uninstall reported success while leaving
+    the device CA and the Postgres directory behind — and it survives the
+    simplification.
     """
     did, errs = [], []
     paths = instance_paths(ctx, inst)
-    mount = paths['mount']
-    base = paths['dir']
-    image = paths['image']
     volume = paths['pg_volume']
 
-    # The named volume first: it is only a pointer at `pgdata`, but leaving it
-    # behind would make the next deploy refuse — `_bind_pg_volume` rejects a
-    # volume that already exists pointing somewhere unexpected.
     rc, out = _run_root(['docker', 'volume', 'rm', '-f', volume])
     if rc == 0:
-        did.append(f'Docker volume {volume} removed')
+        did.append('Docker volume %s removed' % volume)
 
-    # ⚠️ Binds before the store they come out of.
-    #
-    # ⚠️ Taken from `instance_paths` rather than rebuilt here. Constructing a
-    # path twice is how a teardown ends up naming something the setup never
-    # created — W212 in miniature, and now multiplied by the number of agencies.
-    # It was already wrong on the development machine, where `os.path.join`
-    # produced a separator no box uses.
-    for path in (paths['artifacts'], paths['cache'], mount):
-        name = _systemd_unit_name(path)
-        _run_root(['systemctl', 'disable', '--now', name], timeout=90)
-        # `disable --now` stops a *loaded* unit. A unit whose file was already
-        # deleted while the mount stayed up is still a live mount, and only
-        # `umount` reaches that.
-        if os.path.ismount(path):
-            rc, out = _run_root(['umount', path], timeout=90)
-            if rc != 0:
-                rc, out = _run_root(['umount', '-l', path], timeout=90)
-                if rc != 0:
-                    errs.append(f'could not unmount {path}: {out.strip()[:200]}')
-                    continue
-        unit = os.path.join('/etc/systemd/system', name)
-        if os.path.exists(unit):
-            try:
-                os.remove(unit)
-            except OSError as exc:
-                errs.append(f'could not remove {unit}: {exc}')
-        did.append(f'{path} unmounted and its unit removed')
+    store = paths['store']
+    if os.path.isdir(store):
+        # ⚠️ `pgdata` is owned by uid 70, not by the console, so an ordinary
+        # `rmtree` cannot remove it — a directory the console can descend into
+        # but whose entries it does not own. The brokered `rm` is what reaches
+        # it, and the outcome is checked rather than assumed, because the
+        # failure this replaces reported success over a database left on disk.
+        rc, out = _run_root(['rm', '-rf', store], timeout=300)
+        if rc != 0 or os.path.isdir(store):
+            errs.append('could not remove %s: %s' % (store, out.strip()[:200]))
+        else:
+            did.append('%s removed' % store)
 
-    _run_root(['systemctl', 'daemon-reload'])
-
-    # ⚠️ Only ours. `losetup -D` would detach every loop device on the box,
-    # including other modules' — so the image is named explicitly.
-    rc, out = _run_root(['losetup', '-j', image])
-    if rc == 0 and out.strip():
-        for line in out.strip().splitlines():
-            dev = line.split(':', 1)[0].strip()
-            if dev:
-                _run_root(['losetup', '-d', dev])
-                did.append(f'Loop device {dev} detached')
-
-    if os.path.exists(image):
+    for path in (paths['artifacts'], paths['cache']):
+        if not os.path.isdir(path):
+            continue
         try:
-            os.remove(image)
-            did.append(f'Reservation {image} deleted')
+            shutil.rmtree(path)
+            did.append('%s removed' % path)
         except OSError as exc:
-            errs.append(f'could not delete {image}: {exc}')
-
-    # Only if empty: /var/lib/atlas is ours, but rmdir refusing on a non-empty
-    # directory is the correct outcome rather than something to force.
-    parent = os.path.dirname(image)
-    try:
-        if os.path.isdir(parent) and not os.listdir(parent):
-            os.rmdir(parent)
-            did.append(f'{parent} removed')
-    except OSError:
-        pass
+            errs.append('could not remove %s: %s' % (path, exc))
 
     return did, errs
-
-
-def _reserve_blocks(size_bytes, plog, image=None):
-    """Fill any holes in the image, so the reservation is one. Error, or None.
-
-    ⚠️ **Safe on a mounted store, and proven so before being written here.**
-    Measured on the box: a 2 GB sparse image holding a 64 MB random payload,
-    mounted; `fallocate` while mounted took it from 66 MiB of real blocks to
-    2049 MiB, the payload's md5 was unchanged, and `e2fsck -fn` came back clean.
-    Allocating a hole does not alter what the filesystem reads there — holes and
-    allocated-but-unwritten blocks both read as zeros — which is why this can
-    repair a live deployment instead of needing a maintenance window.
-
-    Idempotent: a store already holding its blocks is measured and left alone.
-    """
-    image = image or STORE_IMAGE
-    allocated = allocated_bytes(image)
-    if is_fully_reserved(size_bytes, allocated):
-        return None
-
-    if allocated is not None:
-        plog(f'  Reserving blocks: {allocated / GIB:.1f} of '
-             f'{size_bytes / GIB:.1f} GB are actually allocated...')
-    rc, out = _run_root(['fallocate', '-l', str(size_bytes), image],
-                        timeout=900)
-    if rc != 0:
-        return f'fallocate (reserving blocks) failed: {out.strip()[:300]}'
-
-    after = allocated_bytes(image)
-    if after is None:
-        # No `st_blocks` to check against. The fallocate succeeded, so say what
-        # is known rather than either failing or claiming success.
-        plog('  ✓ Blocks requested (this platform cannot measure allocation)')
-        return None
-    if not is_fully_reserved(size_bytes, after):
-        return (f'the store still holds only {after / GIB:.1f} GB of blocks '
-                f'after reserving {size_bytes / GIB:.1f} GB — the reservation '
-                f'would not actually hold the space')
-    plog(f'  ✓ {after / GIB:.1f} GB of blocks reserved')
-    return None
 
 
 def _bind_pg_volume(pgdir, plog, volume=None):
@@ -2323,19 +2044,19 @@ def _write_root_key(path, pem):
     reasoning as ATLAS's own key writer. A world-readable window on *this* key is
     the worst one in the system.
 
-    Owned by the container's uid, or the application cannot read what it was
-    given and the ceremony fails with a permission error nobody expects.
+    ⚠️ **No chown any more (W230).** This used to hand the file to the
+    container's baked-in uid 1000, wrapped in a bare `except` — so on a
+    non-root console the `EPERM` was swallowed and the ceremony failed later,
+    inside the container, with a permission error nobody could place. The
+    container now runs as this console's uid, so a file the console creates is
+    already readable by the only process that needs it.
     """
-    body = pem if pem.endswith('\n') else pem + '\n'
+    body = pem if pem.endswith(chr(10)) else pem + chr(10)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, body.encode())
     finally:
         os.close(fd)
-    try:
-        os.chown(path, APP_UID, APP_GID)
-    except Exception:
-        pass
 
 
 def _shred(path):
@@ -2698,8 +2419,16 @@ def deploy_validate(data):
     if error:
         return {}, error
 
-    _, free = _disk_free(os.path.dirname(STORE_IMAGE))
-    reserved = os.stat(STORE_IMAGE).st_size if os.path.exists(STORE_IMAGE) else 0
+    # ⚠️ No `ctx` here — the registry calls this with the form data alone —
+    # so `install_base()` answers from the box's own layout.
+    _, free = _disk_free(install_base())
+    # ⚠️ **0, and it is the honest figure now (W230).** This was the loop
+    # image's size, meaning "space ATLAS already holds, which a resize may
+    # count as available". There is no image, and without `ctx` there is no
+    # registry to total either. Nothing is lost: `add_instance` has already
+    # bounded the request against the pool with full knowledge, which the
+    # dynamic branch above says in as many words.
+    reserved = 0
 
     if mode == atlas_instances.MODE_DYNAMIC:
         # ⚠️ **The 85% ceiling is a limit on *reservations*, and a dynamic
@@ -3005,7 +2734,11 @@ def deploy(ctx, job, params):
         # Caddy's upstream for the second one points at the first.
         ctx['_write_priv'](
             os.path.join(dirpath, 'docker-compose.override.yml'),
-            _COMPOSE_OVERRIDE.format(app_port=_app_port),
+            _COMPOSE_OVERRIDE.format(app_port=_app_port,
+                                     app_uid=os.getuid() if hasattr(os, 'getuid')
+                                     else APP_UID,
+                                     app_gid=os.getgid() if hasattr(os, 'getgid')
+                                     else APP_GID),
         )
         plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{_app_port})')
         # ⚠️ Checked against the release that was just checked out, because a
@@ -3019,20 +2752,17 @@ def deploy(ctx, job, params):
             plog('    them, so the application will never see them. Whatever')
             plog('    they configure is not configured.')
 
-        # The container runs unprivileged; the directories it writes are ours.
-        # See APP_UID. Done here rather than after `up` because the very first
-        # thing the stack does is write the device CA into pki/.
+        # ⚠️ **Created, not chowned (W230).** This used to `os.chown` each
+        # directory and then walk it chowning every entry, so that the
+        # container's baked-in uid 1000 could write them. Both are `EPERM` for
+        # a non-root console — and the recursive one was unguarded, so every
+        # deploy stopped there (upstream review, item 1). The container now
+        # runs as this console's uid, so creating them is enough and they are
+        # owned by the only user that needs them.
         for name in WRITABLE_DIRS:
-            path = os.path.join(dirpath, name)
-            os.makedirs(path, exist_ok=True)
-            os.chown(path, APP_UID, APP_GID)
-            # Anything already inside — a re-deploy over an existing install,
-            # or files the repository ships — needs the same owner, or the
-            # application can read its own CA but not renew it.
-            for root, dirs, files in os.walk(path):
-                for entry in dirs + files:
-                    os.chown(os.path.join(root, entry), APP_UID, APP_GID)
-        plog(f'✓ {", ".join(WRITABLE_DIRS)} owned by uid {APP_UID} (the container is not root)')
+            os.makedirs(os.path.join(dirpath, name), exist_ok=True)
+        plog('✓ %s created (the container runs as this console, not as root)'
+             % ', '.join(WRITABLE_DIRS))
 
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
@@ -3081,6 +2811,24 @@ def deploy(ctx, job, params):
         s[f'{_prefix}pg_password'] = pg_password
         s[f'{_prefix}commit_sha'] = commit
         ctx['save_settings'](s)
+
+        # ⚠️ **Staged before the Caddyfile is rendered, and fatal if it
+        # fails (upstream review, item 1).** `caddy_sites` only emits the
+        # `:8449` device listener when a trust pool is actually on disk. This
+        # write used to happen *inside* that renderer, so when it failed the
+        # block was silently omitted — and the deploy went on to print
+        # "Devices: https://…:8449 (mutual TLS)" over a device channel that
+        # did not exist. A device channel that is absent must stop the deploy,
+        # not decorate it.
+        staged = sync_device_ca_for_caddy(_inst, ctx)
+        if not staged:
+            raise RuntimeError(
+                'Could not stage the device CA for Caddy at %s. The device '
+                'channel on :8449 would be silently missing while the rest of '
+                'the deployment looked healthy, so this stops here.'
+                % device_ca_path(_inst))
+        plog('✓ Device CA staged for Caddy at %s' % staged)
+
         ctx['generate_caddyfile'](s)
         if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
@@ -3181,7 +2929,54 @@ def deploy(ctx, job, params):
 # sanctioned direction (rule 10: a module imports nothing from app.py).
 # --------------------------------------------------------------------------- #
 
-def sync_device_ca_for_caddy(inst=None):
+def caddy_base():
+    """Where Caddy keeps its data, as one overridable answer.
+
+    ⚠️ **A function, so tests can redirect it.** Hardcoding `/var/lib/caddy`
+    is what made three store tests create real directories under the drive
+    root on Windows (upstream review, item 9) — the same trap, one directory
+    over. Anything a test needs to *write* has to be reachable from a
+    fixture.
+
+    ⚠️ `pwd` is imported here, not at module scope: it is Unix-only and
+    these tests run on Windows, where the import itself fails.
+    """
+    try:
+        import pwd as _pwd
+        home = _pwd.getpwnam('caddy').pw_dir
+        if home and os.path.isdir(home):
+            return home
+    except (ImportError, KeyError, AttributeError):
+        pass
+    return '/var/lib/caddy'
+
+
+def device_ca_path(inst=None):
+    """Where Caddy reads this deployment's device CA. Pure — touches nothing.
+
+    ⚠️ One directory per deployment. A shared `atlas/device-ca.crt` would
+    have the last instance to deploy overwrite every other agency's trust
+    pool, and Caddy would then verify one agency's devices against another
+    agency's CA.
+    """
+    return posixpath.join(caddy_base(), atlas_instances.derive(inst)['name'],
+                          'device-ca.crt')
+
+
+def _ca_is_staged(inst=None):
+    """Is there actually a trust pool at that path?
+
+    ⚠️ Asked rather than assumed, because the answer decides whether the
+    device listener is emitted at all. `caddy_sites` runs on every Caddyfile
+    render, long after the deploy that staged it.
+    """
+    try:
+        return os.path.getsize(device_ca_path(inst)) > 0
+    except OSError:
+        return False
+
+
+def sync_device_ca_for_caddy(inst=None, ctx=None):
     """Deploy a Caddy-readable copy of ATLAS's device CA; return its path or None.
 
     ATLAS issues its own client certificates to enrolled tablets, and Caddy has
@@ -3195,7 +2990,6 @@ def sync_device_ca_for_caddy(inst=None):
     copy of the key readable by a web server is a fleet's device identity one
     file-read away.
     """
-    import shutil, pwd
     # ⚠️ The instance's own directory first, then the two historical locations
     # for the plain deployment. Dropping the legacy probe would break a box whose
     # checkout predates `install_base`, and keeping it costs two `os.path.exists`
@@ -3236,25 +3030,21 @@ def sync_device_ca_for_caddy(inst=None):
     if not bundle_parts:
         return None
     try:
-        try:
-            caddy_pw = pwd.getpwnam('caddy')
-            base = caddy_pw.pw_dir if os.path.isdir(caddy_pw.pw_dir) else '/var/lib/caddy'
-        except KeyError:
-            caddy_pw = None
-            base = '/var/lib/caddy'
         # ⚠️ One directory per deployment. A shared `atlas/device-ca.crt`
         # would have the last instance to deploy overwrite every other
         # agency's trust pool — and Caddy would then verify one agency's
         # devices against another agency's CA.
-        dest_dir = os.path.join(base, atlas_instances.derive(inst)['name'])
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, 'device-ca.crt')
-        with open(dest, 'w') as fh:
-            fh.write('\n'.join(bundle_parts) + '\n')
-        os.chmod(dest, 0o644)
-        if caddy_pw:
-            os.chown(dest_dir, caddy_pw.pw_uid, caddy_pw.pw_gid)
-            os.chown(dest, caddy_pw.pw_uid, caddy_pw.pw_gid)
+        dest = device_ca_path(inst)
+        body = chr(10).join(bundle_parts) + chr(10)
+        # ⚠️ **Through the broker (W230).** `/var/lib/caddy` is not the
+        # console's to write, and the chowns to the `caddy` user were
+        # `EPERM` besides. `_write_priv` is the seam the console already
+        # exposes for exactly this, and it creates the parent. 0644
+        # because Caddy only reads it, and it is a certificate, not a key.
+        writer = (ctx or {}).get('_write_priv')
+        if writer is None:
+            return None
+        writer(dest, body, perm=0o644)
         return dest
     except Exception as exc:
         print('[' + KEY + '] could not stage device CA for Caddy: ' + str(exc), flush=True)
@@ -4228,8 +4018,7 @@ def uninstall(ctx, job, params):
             'steps': steps + [
                 'STOPPED SHORT: the deployments above that failed still have '
                 'files on disk, and their settings and records are untouched so '
-                'this can be re-run. Anything still mounted will block it — '
-                'check `mount | grep atlas` — then uninstall again.'
+                'this can be re-run. The log above names what would not go.'
             ],
         }
 
@@ -4371,6 +4160,18 @@ services:
   api:
     ports:
       - "127.0.0.1:{app_port}:8000"
+    # ⚠️ **The application runs as the console's own uid (W230).** The
+    # image bakes in `USER takmdm` (uid 1000), so `pki/`, `artifacts/` and
+    # `cache/` had to be chowned to 1000 on the host — three `os.chown` calls
+    # that are `EPERM` for a non-root console, and which on a cloud image
+    # handed the device CA private keys to `ubuntu` or `rocky`, the default
+    # login user (upstream review, item 5).
+    #
+    # Running as the console instead means those directories are simply owned
+    # by whoever created them, and the chowns disappear rather than moving to
+    # the broker. `user:` overrides the image's USER; the numeric form is
+    # required, because the container has no passwd entry for this uid.
+    user: "{app_uid}:{app_gid}"
 
   # No self-signed server certificate. Caddy holds a publicly-issued one, and a
   # local CA here would end up pinned in provisioning QRs that then fail.
@@ -4545,7 +4346,7 @@ def register(ctx):
         # ⚠️ *This* deployment's bundle, into *this* deployment's Caddy
         # directory. Staging the plain one would leave the renewed agency
         # verifying devices against the certificate it just replaced.
-        staged = sync_device_ca_for_caddy(inst)
+        staged = sync_device_ca_for_caddy(inst, ctx)
         steps.append('Trust bundle staged for Caddy' if staged
                      else '⚠ Could not stage the trust bundle for Caddy')
         ctx['_caddy_reload']()

@@ -286,8 +286,10 @@ def test_the_plain_instance_derives_exactly_what_is_deployed_today():
     d = inst.derive(PLAIN, fqdn="leckliter.net")
 
     assert d["dir"] == "/root/atlas"
-    assert d["image"] == "/var/lib/atlas/store.img"
-    assert d["mount"] == "/root/atlas/store"
+    # ⚠️ No `image` any more: the loop store is gone (W230), and `store`
+    # is a plain directory inside the install directory.
+    assert "image" not in d
+    assert d["store"] == "/root/atlas/store"
     assert d["artifacts"] == "/root/atlas/artifacts"
     assert d["cache"] == "/root/atlas/cache"
     assert d["compose_project"] == "takmdm"
@@ -303,8 +305,8 @@ def test_an_agency_instance_derives_a_parallel_set():
     d = inst.derive(AGENCY_A, fqdn="leckliter.net")
 
     assert d["dir"] == "/root/atlas-agencya"
-    assert d["image"] == "/var/lib/atlas-agencya/store.img"
-    assert d["mount"] == "/root/atlas-agencya/store"
+    assert "image" not in d
+    assert d["store"] == "/root/atlas-agencya/store"
     assert d["compose_project"] == "takmdm-agencya"
     assert d["pg_volume"] == "takmdm-agencya_pgdata"
     assert d["caddy_ca_dir"] == "/var/lib/caddy/atlas-agencya"
@@ -329,7 +331,7 @@ def test_no_two_instances_share_any_derived_name():
     and prefix has to differ, or two agencies would write to each other."""
     a = inst.derive(PLAIN, fqdn="x.net")
     b = inst.derive(AGENCY_A, fqdn="x.net")
-    shared = ("dir", "image", "image_dir", "mount", "artifacts", "cache",
+    shared = ("dir", "store", "artifacts", "cache",
               "compose_project", "pg_volume", "caddy_ca_dir", "settings_prefix",
               "authentik_slug", "job_key", "vhost", "port")
 

@@ -305,7 +305,7 @@ def test_the_renewed_trust_bundle_is_staged_for_its_own_deployment():
     source = _view_source('ca_renew_view')
     calls = re.findall(r'sync_device_ca_for_caddy\([^)]*\)', source)
 
-    assert calls == ['sync_device_ca_for_caddy(inst)'], calls
+    assert calls == ['sync_device_ca_for_caddy(inst, ctx)'], calls
 
 
 def test_the_pki_directory_is_asked_for_by_deployment():

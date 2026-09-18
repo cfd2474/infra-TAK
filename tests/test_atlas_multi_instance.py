@@ -14,6 +14,8 @@ import os
 import pathlib
 import sys
 
+import shutil
+
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -94,10 +96,9 @@ def test_the_plain_instance_still_resolves_to_the_live_paths(rooted):
     p = atlas.instance_paths(None, None)
 
     assert p['dir'] == '/root/atlas'
-    assert p['mount'] == '/root/atlas/store'
+    assert p['store'] == '/root/atlas/store'
     assert p['artifacts'] == '/root/atlas/artifacts'
     assert p['cache'] == '/root/atlas/cache'
-    assert p['image'] == atlas.STORE_IMAGE == '/var/lib/atlas/store.img'
     assert p['pg_volume'] == atlas.STORE_PG_VOLUME == 'takmdm_pgdata'
 
 
@@ -105,8 +106,7 @@ def test_an_agency_resolves_beside_it_on_the_same_layout(rooted):
     p = atlas.instance_paths(None, AGENCY)
 
     assert p['dir'] == '/root/atlas-agencya'
-    assert p['mount'] == '/root/atlas-agencya/store'
-    assert p['image'] == '/var/lib/atlas-agencya/store.img'
+    assert p['store'] == '/root/atlas-agencya/store'
     assert p['pg_volume'] == 'takmdm-agencya_pgdata'
     assert p['compose_project'] == 'takmdm-agencya'
 
@@ -124,7 +124,7 @@ def test_no_instance_shares_a_path_with_another(rooted):
     a = atlas.instance_paths(None, None)
     b = atlas.instance_paths(None, AGENCY)
 
-    for field in ('dir', 'mount', 'artifacts', 'cache', 'image', 'image_dir',
+    for field in ('dir', 'store', 'artifacts', 'cache',
                   'pg_volume', 'compose_project'):
         assert a[field] != b[field], f'{field} is shared between instances'
 
@@ -140,167 +140,141 @@ class Runner:
 
     def __call__(self, argv, timeout=120):
         self.calls.append(list(argv))
-        if argv[0] == 'systemd-escape':
-            return 0, 'unit.mount'
-        if argv[:2] == ['losetup', '-j']:
-            return 0, ''
+        # ⚠️ **`rm -rf` actually removes.** `remove_store` checks that the
+        # directory is gone rather than trusting the exit code — the failure
+        # it replaces reported success over a database still on disk — so a
+        # fake that records the call and deletes nothing makes the real check
+        # look like a bug. Faithful beats convenient.
+        if argv[:2] == ['rm', '-rf'] and os.path.isdir(argv[2]):
+            shutil.rmtree(argv[2])
         return 0, ''
 
     def text(self):
-        return '\n'.join(' '.join(c) for c in self.calls)
+        return chr(10).join(' '.join(c) for c in self.calls)
 
 
 @pytest.fixture
 def box(monkeypatch, tmp_path):
-    """A pretend box where both instances could exist."""
+    """A pretend box where both deployments could exist.
+
+    ⚠️ Far smaller than it was (W230). It used to patch `STORE_IMAGE`,
+    `_run_root`, `_bind_unit`, `_bind_pg_volume`, `os.chown`, `os.chmod` and
+    `os.path.ismount`, because creating a store meant a loop image, a
+    filesystem and three systemd units. It is now directories plus one
+    brokered `chown`, and the fixture shrank to match.
+    """
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: posix(tmp_path))
-    monkeypatch.setattr(atlas, 'STORE_IMAGE',
-                        posix(tmp_path / 'var' / 'store.img'))
     runner = Runner()
     monkeypatch.setattr(atlas, '_run_root', runner)
-    monkeypatch.setattr(atlas, '_bind_unit', lambda *a, **k: None)
     monkeypatch.setattr(atlas, '_bind_pg_volume', lambda *a, **k: None)
-    monkeypatch.setattr(atlas.os, 'chown', lambda *a: None, raising=False)
-    monkeypatch.setattr(atlas.os, 'chmod', lambda *a: None)
-    monkeypatch.setattr(atlas.os.path, 'ismount', lambda _p: True)
-    for inst in (None, AGENCY):
-        pathlib.Path(atlas.instance_paths(None, inst)['mount']).mkdir(
-            parents=True, exist_ok=True)
     return runner
 
 
-def test_creating_an_agency_store_never_names_the_plain_one(box, tmp_path):
-    """⚠️ **Compartmentalisation, asserted against the commands actually run.**
-    Chunk 1 proved the names differ; this proves nothing reaches for the wrong
-    one."""
-    atlas.ensure_store({}, 4 * GIB, lambda *_: None,
-                       mode=ai.MODE_DYNAMIC, inst=AGENCY)
+def test_creating_an_agency_store_makes_only_its_own_directories(box, tmp_path):
+    """⚠️ Compartmentalisation, asserted against the filesystem."""
+    err = atlas.ensure_store({}, 4 * GIB, lambda *_: None,
+                             mode=ai.MODE_DYNAMIC, inst=AGENCY)
 
-    ran = box.text()
-
-    assert 'atlas-agencya' in ran
-    assert posix(tmp_path / 'var' / 'store.img') not in ran
+    assert err is None, err
+    assert (tmp_path / 'atlas-agencya' / 'store' / 'pgdata').is_dir()
+    assert (tmp_path / 'atlas-agencya' / 'artifacts').is_dir()
+    assert not (tmp_path / 'atlas').exists(), 'the plain deployment was touched'
 
 
 def test_creating_the_plain_store_never_names_an_agency(box, tmp_path):
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=None)
 
-    ran = box.text()
+    assert (tmp_path / 'atlas' / 'store' / 'pgdata').is_dir()
+    assert 'agencya' not in box.text()
+    assert not (tmp_path / 'atlas-agencya').exists()
 
-    assert posix(tmp_path / 'var' / 'store.img') in ran
-    assert 'agencya' not in ran
+
+def test_the_database_directory_is_given_to_the_postgres_uid(box, tmp_path):
+    """⚠️ **The one chown left, and it goes through the shim.** Postgres runs
+    as uid 70 in its container and refuses to start unless it owns its data
+    directory. `os.chown` is EPERM for a non-root console, so this is the
+    brokered binary -- which is on the allowlist."""
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+
+    ran = box.text()
+    assert 'chown 70:70' in ran, ran
+    assert posix(tmp_path / 'atlas-agencya' / 'store' / 'pgdata') in ran
+
+
+def test_nothing_reaches_for_a_loop_device_or_a_mount(box):
+    """⚠️ The whole point of W230: none of these binaries is shimmed, and the
+    console cannot run them. A regression here is a deploy that fails on a
+    real box and passes here."""
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+
+    ran = box.text()
+    for forbidden in ('losetup', 'mount', 'mkfs', 'resize2fs', 'e2fsck',
+                      'fallocate', 'truncate', 'systemd-escape', 'systemctl'):
+        assert forbidden not in ran, '%s is not available to the console: %s' % (
+            forbidden, ran)
 
 
 def test_removing_an_agency_store_leaves_the_plain_one_alone(box, tmp_path):
-    """⚠️ The offboarding case, and the one W212 warned about at N instances:
-    a teardown that names the wrong image deletes a live agency's database."""
-    plain_image = pathlib.Path(atlas.STORE_IMAGE)
-    plain_image.parent.mkdir(parents=True, exist_ok=True)
-    plain_image.write_bytes(bytes(10))
-    agency_image = pathlib.Path(atlas.instance_paths(None, AGENCY)['image'])
-    agency_image.parent.mkdir(parents=True, exist_ok=True)
-    agency_image.write_bytes(bytes(10))
+    """⚠️ The offboarding case: a teardown naming the wrong path deletes a
+    live agency's database."""
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=None)
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
 
     did, errs = atlas.remove_store({}, lambda *_: None, inst=AGENCY)
 
-    assert errs == []
-    assert not agency_image.exists(), "the agency's own image survived"
-    assert plain_image.exists(), "removing an agency deleted the plain store"
+    assert errs == [], errs
+    assert (tmp_path / 'atlas' / 'store').is_dir(), 'the plain store was removed'
+    assert posix(tmp_path / 'atlas-agencya' / 'store') in chr(10).join(did)
 
 
 def test_removing_an_agency_removes_only_its_own_volume(box):
     atlas.remove_store({}, lambda *_: None, inst=AGENCY)
 
     ran = box.text()
-
     assert 'takmdm-agencya_pgdata' in ran
     assert 'takmdm_pgdata ' not in ran + ' '
 
 
+def test_removing_a_clean_box_reports_no_errors(box):
+    """An uninstall has to be re-runnable after a partial failure."""
+    did, errs = atlas.remove_store({}, lambda *_: None, inst=AGENCY)
+
+    assert errs == []
+
+
+def test_the_volume_goes_before_the_directories(box, tmp_path):
+    """⚠️ Leaving it behind makes the next deploy refuse -- `_bind_pg_volume`
+    rejects a volume already pointing somewhere unexpected."""
+    atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
+
+    atlas.remove_store({}, lambda *_: None, inst=AGENCY)
+
+    calls = [' '.join(c) for c in box.calls]
+    volume = next(i for i, c in enumerate(calls) if 'volume rm' in c)
+    removal = next(i for i, c in enumerate(calls) if c.startswith('rm -rf'))
+    assert volume < removal, calls
+
+
 def test_the_default_instance_is_still_the_plain_one(box, tmp_path):
-    """⚠️ Every existing call site omits `inst`. If the default moved, an
-    ordinary deploy would build a store for an agency that does not exist."""
     atlas.ensure_store({}, 4 * GIB, lambda *_: None)
 
-    assert posix(tmp_path / 'var' / 'store.img') in box.text()
-
-
-def test_the_facts_read_the_instance_s_own_image(box, monkeypatch):
-    """⚠️ **Asserted on the image actually read, not on a rounded figure.** The
-    first version checked `reserved_gb == 0.0`, which is true whether it reads
-    the agency's image or the plain one — so it survived a mutation that ignored
-    the instance entirely. A number that cannot distinguish the two answers is
-    not a test of which one was used."""
-    monkeypatch.setattr(atlas, '_disk_free', lambda _p: (500 * GIB, 400 * GIB))
-    agency_path = atlas.instance_paths(None, AGENCY)['image']
-    agency_image = pathlib.Path(agency_path)
-    agency_image.parent.mkdir(parents=True, exist_ok=True)
-    agency_image.write_bytes(bytes(2048))
-    read = []
-    monkeypatch.setattr(atlas, 'allocated_bytes',
-                        lambda path: read.append(path) or 0)
-
-    facts = atlas.store_facts({}, mode=ai.MODE_DYNAMIC, inst=AGENCY)
-
-    # ⚠️ Compared against the derived string, not `str(Path(...))` — pathlib
-    # hands back the development machine's separators and the module emits the
-    # box's.
-    assert read == [agency_path], 'store_facts read the wrong image'
-    assert facts['mode'] == ai.MODE_DYNAMIC
-    assert facts['size_is_reserved'] is False
-
-
-def test_every_image_follows_the_module_constant(monkeypatch):
-    """⚠️ **Inverted deliberately (upstream review, item 9).** This asserted
-    that an agency's image stayed at the real `/var/lib` while the plain one
-    followed `STORE_IMAGE` — which is precisely the bug: three tests then
-    created `/var/lib/atlas-agencya` for real, and as root on a box they would
-    have created it there. `derive` hardcodes the directory; `instance_paths`
-    rebases it, so redirecting the constant moves every instance."""
-    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/root')
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', '/mnt/elsewhere/store.img')
-
-    assert atlas.instance_paths(None, None)['image'] == '/mnt/elsewhere/store.img'
-    assert atlas.instance_paths(None, AGENCY)['image'] == (
-        '/mnt/atlas-agencya/store.img')
-
-
-def test_the_real_layout_is_unchanged_by_that_rebasing():
-    """⚠️ The other half: a running box must keep the paths it already has.
-    `/var/lib/atlas/store.img` has grandparent `/var/lib`, so an agency still
-    resolves under it and no deployed store moves."""
-    assert atlas.STORE_IMAGE == '/var/lib/atlas/store.img'
-    assert atlas.instance_paths(None, AGENCY)['image'] == (
-        '/var/lib/atlas-agencya/store.img')
+    assert (tmp_path / 'atlas' / 'store').is_dir()
 
 
 def test_no_instance_path_escapes_the_redirected_base(monkeypatch, tmp_path):
     """The guard that would have caught item 9 on any platform.
 
     ⚠️ On Windows `/var/lib/...` resolves to the drive root, so the tests
-    that created it passed here for weeks while creating them under the drive root.
-    Asserting containment does not care which platform it runs on.
+    that created it passed here for weeks while creating them under the drive
+    root. Asserting containment does not care which platform it runs on.
     """
     base = posix(tmp_path)
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: base + '/atlas')
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', base + '/var/atlas/store.img')
 
     for inst in (None, AGENCY):
         paths = atlas.instance_paths(None, inst)
-        for key in ('dir', 'mount', 'artifacts', 'cache', 'image', 'image_dir'):
+        for key in ('dir', 'store', 'artifacts', 'cache'):
             assert paths[key].startswith(base), (inst, key, paths[key])
-
-
-def test_reserving_blocks_targets_the_image_it_was_given(monkeypatch):
-    """`_reserve_blocks` used to know only one image. With N instances it has to
-    be told, or an agency's deploy would fill the plain instance's holes."""
-    runner = Runner()
-    monkeypatch.setattr(atlas, '_run_root', runner)
-    monkeypatch.setattr(atlas, 'allocated_bytes', lambda _p: 0)
-
-    atlas._reserve_blocks(4 * GIB, lambda *_: None, image='/var/lib/atlas-b/store.img')
-
-    assert '/var/lib/atlas-b/store.img' in runner.text()
 
 
 def test_binding_the_database_volume_targets_the_named_volume(monkeypatch):

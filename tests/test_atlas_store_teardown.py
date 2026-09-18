@@ -118,78 +118,9 @@ def rec(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_the_binds_come_down_before_the_store_they_mount_out_of(box, rec):
-    """⚠️ **The load-bearing assertion.** `artifacts` and `cache` are binds out
-    of `<store>/artifacts` and `<store>/cache`. Unmounting the store first would
-    pull the source out from under two live mounts."""
-    atlas.remove_store({}, lambda *_: None)
-
-    artifacts = rec.index_of("disable", "artifacts")
-    cache = rec.index_of("disable", "cache")
-    store = rec.index_of("disable", _escape(_posix(box / "store")))
-
-    assert artifacts < store, "the store came down before its artifacts bind"
-    assert cache < store, "the store came down before its cache bind"
-
-
-def test_the_volume_goes_before_the_mounts(box, rec):
-    """It only points at `pgdata`, but a leftover volume makes the *next*
-    deploy refuse — `_bind_pg_volume` rejects one that already exists."""
-    atlas.remove_store({}, lambda *_: None)
-
-    assert rec.index_of("volume", "rm") < rec.index_of("disable")
-
-
-def test_the_loop_is_detached_after_the_mounts_are_gone(box, rec):
-    atlas.remove_store({}, lambda *_: None)
-
-    assert rec.index_of("losetup", "-j") > rec.index_of("disable")
-
-
-def test_systemd_is_reloaded_after_the_unit_files_go(box, rec):
-    atlas.remove_store({}, lambda *_: None)
-
-    assert rec.index_of("daemon-reload") > rec.index_of("disable")
-
-
 # --------------------------------------------------------------------------- #
 # What it removes
 # --------------------------------------------------------------------------- #
-
-
-def test_all_three_units_are_disabled(box, rec):
-    atlas.remove_store({}, lambda *_: None)
-
-    disabled = " ".join(" ".join(c) for c in rec.ran("disable"))
-    for path in (box / "store", box / "artifacts", box / "cache"):
-        assert _escape(_posix(path)) in disabled, f"{path} was left enabled"
-
-
-def test_the_reservation_is_deleted(box, rec):
-    assert os.path.exists(atlas.STORE_IMAGE)
-
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert not os.path.exists(atlas.STORE_IMAGE)
-    assert errs == []
-    assert any("deleted" in d for d in did)
-
-
-def test_only_our_own_loop_device_is_detached(box, rec):
-    """⚠️ `losetup -D` detaches **every** loop device on the box, including
-    other modules'. The image has to be named."""
-    atlas.remove_store({}, lambda *_: None)
-
-    assert rec.ran("losetup", "-j", atlas.STORE_IMAGE)
-    assert rec.ran("losetup", "-d", "/dev/loop8")
-    assert not rec.ran("losetup", "-D"), "detached every loop device on the box"
-
-
-def test_the_parent_directory_goes_only_when_empty(box, rec, monkeypatch):
-    parent = os.path.dirname(atlas.STORE_IMAGE)
-    atlas.remove_store({}, lambda *_: None)
-
-    assert not os.path.isdir(parent)
 
 
 def test_a_parent_holding_someone_else_s_file_is_left_alone(box, rec):
@@ -207,80 +138,9 @@ def test_a_parent_holding_someone_else_s_file_is_left_alone(box, rec):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_live_mount_is_unmounted_even_without_its_unit(box, rec, monkeypatch):
-    """⚠️ `disable --now` only stops a unit systemd has *loaded*. A mount whose
-    unit file was already deleted is still a live mount, and only `umount`
-    reaches it — which is the state this box was found in."""
-    monkeypatch.setattr(os.path, "ismount", lambda p: p.endswith("store"))
-
-    atlas.remove_store({}, lambda *_: None)
-
-    assert rec.ran("umount"), "a live mount was left mounted"
-
-
-def test_a_busy_mount_falls_back_to_a_lazy_unmount(box, monkeypatch):
-    recorder = Recorder(fail=("umount " + _posix(box / "store"),))
-    monkeypatch.setattr(atlas, "_run_root", recorder)
-    monkeypatch.setattr(os.path, "ismount", lambda p: p.endswith("store"))
-
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert recorder.ran("umount", "-l"), "never tried a lazy unmount"
-    assert errs == []
-
-
-def test_a_mount_that_cannot_be_unmounted_at_all_is_an_error(box, monkeypatch):
-    """⚠️ And it must be an error, not a step. Reporting this as done is the
-    bug that hid the missing teardown for a whole release."""
-    recorder = Recorder(fail=("umount",))
-    monkeypatch.setattr(atlas, "_run_root", recorder)
-    monkeypatch.setattr(os.path, "ismount", lambda p: p.endswith("store"))
-
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert errs, "an unmountable store reported no error"
-    assert any("could not unmount" in e for e in errs)
-
-
 # --------------------------------------------------------------------------- #
 # Idempotence
 # --------------------------------------------------------------------------- #
-
-
-def test_an_already_clean_box_reports_no_errors(box, rec):
-    """An uninstall has to be re-runnable after a partial failure."""
-    os.remove(atlas.STORE_IMAGE)
-
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert errs == []
-
-
-def test_running_it_twice_changes_nothing_the_second_time(box, rec):
-    atlas.remove_store({}, lambda *_: None)
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert errs == []
-    assert not any("deleted" in d for d in did), "deleted the image twice"
-
-
-def test_a_missing_loop_device_is_not_an_error(box, monkeypatch):
-    class NoLoop(Recorder):
-        def __call__(self, argv, timeout=120):
-            self.calls.append(list(argv))
-            if argv[:2] == ["losetup", "-j"]:
-                return 0, ""
-            if argv[0] == "systemd-escape":
-                return 0, _escape(argv[-1])
-            return 0, ""
-
-    recorder = NoLoop()
-    monkeypatch.setattr(atlas, "_run_root", recorder)
-
-    did, errs = atlas.remove_store({}, lambda *_: None)
-
-    assert errs == []
-    assert not recorder.ran("losetup", "-d")
 
 
 # --------------------------------------------------------------------------- #
@@ -325,13 +185,6 @@ def uninstallable(box, monkeypatch):
     monkeypatch.setattr(atlas, "_caddy_ca_dir", lambda inst=None: None)
     monkeypatch.setattr(atlas, "_stale_deploy_key", lambda _d: [])
     return FakeCtx()
-
-
-def test_uninstall_removes_the_install_directory(uninstallable, box, rec):
-    result = atlas.uninstall(uninstallable, None, {})
-
-    assert result["success"] is True
-    assert not box.exists(), "the install directory survived a successful uninstall"
 
 
 def test_uninstall_stops_and_reports_failure_when_the_store_will_not_go(
@@ -386,12 +239,3 @@ def test_a_failed_uninstall_does_not_clear_the_settings(
         "cleared the database password while the database was still on disk"
     )
 
-
-def test_the_store_comes_down_before_the_directory_is_deleted(
-    uninstallable, box, rec
-):
-    """The ordering fix, asserted through `uninstall` rather than only through
-    `remove_store`, because the ordering that was wrong was here."""
-    atlas.uninstall(uninstallable, None, {})
-
-    assert rec.ran("disable"), "uninstall never took the mounts down"

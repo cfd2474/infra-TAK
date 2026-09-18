@@ -64,13 +64,28 @@ def test_no_host_yields_no_host():
 # --------------------------------------------------------------------------- #
 
 
+def posix(p):
+    return str(p).replace(chr(92), '/')
+
+
+def _stage(monkeypatch, tmp_path, *slugs):
+    """Put a device CA where Caddy would read it, under tmp_path."""
+    base = tmp_path / 'caddy'
+    monkeypatch.setattr(atlas, 'caddy_base', lambda: posix(base))
+    for slug in slugs:
+        d = base / ai.derive({'slug': slug} if slug else None)['name']
+        d.mkdir(parents=True, exist_ok=True)
+        (d / 'device-ca.crt').write_text('-----BEGIN CERTIFICATE-----\n',
+                                         encoding='utf-8')
+
+
 @pytest.fixture
 def one_deployment(monkeypatch, tmp_path):
     """A box with the single plain deployment, as every box has today."""
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(tmp_path / 'store.img'))
-    monkeypatch.setattr(atlas, 'sync_device_ca_for_caddy',
-                        lambda inst=None: '/var/lib/caddy/%s/device-ca.crt'
-                        % ai.derive(inst)['name'])
+    # ⚠️ `caddy_sites` no longer *writes* the trust pool — it reports one
+    # that is already staged (W230). So the fixture stages files instead of
+    # stubbing a writer, under `tmp_path` rather than a real `/var/lib/caddy`.
+    _stage(monkeypatch, tmp_path, None, 'agencya')
     return {'atlas_enabled': True}
 
 
@@ -89,7 +104,7 @@ def test_that_one_site_is_what_the_generator_used_before(one_deployment):
 
     assert site['host'] == 'atlas.leckliter.net'
     assert site['upstream'] == '127.0.0.1:8760'
-    assert site['ca_path'] == '/var/lib/caddy/atlas/device-ca.crt'
+    assert site['ca_path'].endswith('/caddy/atlas/device-ca.crt')
     assert site['slug'] is None
 
 
@@ -101,10 +116,10 @@ def test_nothing_installed_produces_no_sites(monkeypatch, tmp_path):
 
 @pytest.fixture
 def two_deployments(monkeypatch, tmp_path):
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(tmp_path / 'store.img'))
-    monkeypatch.setattr(atlas, 'sync_device_ca_for_caddy',
-                        lambda inst=None: '/var/lib/caddy/%s/device-ca.crt'
-                        % ai.derive(inst)['name'])
+    # ⚠️ `caddy_sites` no longer *writes* the trust pool — it reports one
+    # that is already staged (W230). So the fixture stages files instead of
+    # stubbing a writer, under `tmp_path` rather than a real `/var/lib/caddy`.
+    _stage(monkeypatch, tmp_path, None, 'agencya')
     return {
         'atlas_enabled': True,
         ai.INSTANCES_KEY: [
@@ -139,8 +154,8 @@ def test_each_deployment_has_its_own_device_ca(two_deployments):
 
     paths = [s['ca_path'] for s in sites]
 
-    assert paths == ['/var/lib/caddy/atlas/device-ca.crt',
-                     '/var/lib/caddy/atlas-agencya/device-ca.crt']
+    assert [p.split('/caddy/', 1)[1] for p in paths] == [
+        'atlas/device-ca.crt', 'atlas-agencya/device-ca.crt']
     assert len(set(paths)) == 2
 
 
@@ -155,8 +170,8 @@ def test_a_deployment_without_a_ca_reports_none(monkeypatch, tmp_path):
     """Caddy cannot verify devices without one, and the generator skips the
     device site rather than emitting a `pem_file` that does not exist — which
     stops Caddy from starting at all."""
-    monkeypatch.setattr(atlas, 'STORE_IMAGE', str(tmp_path / 'store.img'))
-    monkeypatch.setattr(atlas, 'sync_device_ca_for_caddy', lambda inst=None: None)
+    # Nothing staged: the pool is simply absent.
+    monkeypatch.setattr(atlas, 'caddy_base', lambda: posix(tmp_path / 'caddy'))
 
     site = atlas.caddy_sites({'atlas_enabled': True}, 'atlas.leckliter.net')[0]
 
@@ -170,27 +185,45 @@ def test_a_deployment_without_a_ca_reports_none(monkeypatch, tmp_path):
 
 def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     """⚠️ A shared `atlas/device-ca.crt` would have the last deployment to run
-    overwrite every other agency's trust pool."""
+    overwrite every other agency's trust pool — and Caddy would then verify
+    one agency's devices against another agency's CA.
+
+    ⚠️ **Asserted on the destination, not on a spied `os.makedirs`.** This
+    used to watch that call inside a `try/except: pass`, because the write
+    itself needed a real `/var/lib/caddy`. The write now goes through
+    `ctx['_write_priv']`, so the fake writer *is* the observation and nothing
+    has to be swallowed.
+    """
     src = tmp_path / 'atlas-agencya' / 'pki'
     src.mkdir(parents=True)
-    (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----\nx\n'
-                                '-----END CERTIFICATE-----', encoding='utf-8')
+    (src / 'ca.crt').write_text(
+        '-----BEGIN CERTIFICATE-----' + chr(10) + 'x' + chr(10)
+        + '-----END CERTIFICATE-----', encoding='utf-8')
     monkeypatch.setattr(atlas, 'install_base',
-                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    landed = {}
+                        lambda ctx=None: posix(tmp_path))
+    monkeypatch.setattr(atlas, 'caddy_base', lambda: posix(tmp_path / 'caddy'))
 
-    class FakePwd:
-        @staticmethod
-        def getpwnam(_name):
-            raise KeyError('no caddy user here')
+    written = {}
+    ctx = {'_write_priv': lambda path, body, **k: written.update(
+        {'path': path, 'body': body})}
 
-    monkeypatch.setitem(sys.modules, 'pwd', FakePwd)
-    monkeypatch.setattr(atlas.os, 'makedirs',
-                        lambda path, **k: landed.setdefault('dir', path))
+    dest = atlas.sync_device_ca_for_caddy(
+        ai.make('agencya', ai.MODE_FIXED, 50, 8761), ctx)
 
-    try:
-        atlas.sync_device_ca_for_caddy(ai.make('agencya', ai.MODE_FIXED, 50, 8761))
-    except Exception:
-        pass  # the copy itself needs a real /var/lib/caddy; the path is the point
+    assert dest.endswith('atlas-agencya/device-ca.crt'), dest
+    assert written['path'] == dest
+    assert 'BEGIN CERTIFICATE' in written['body']
 
-    assert landed.get('dir', '').endswith('atlas-agencya')
+
+def test_the_ca_is_not_written_without_a_privileged_writer(monkeypatch, tmp_path):
+    """⚠️ `/var/lib/caddy` is not the console's to write. With no
+    `_write_priv` in `ctx` there is nothing to do but say so — and `deploy`
+    turns that None into a refusal, because a device channel that silently
+    does not exist is worse than a deploy that stops."""
+    src = tmp_path / 'atlas' / 'pki'
+    src.mkdir(parents=True)
+    (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----', encoding='utf-8')
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: posix(tmp_path))
+    monkeypatch.setattr(atlas, 'caddy_base', lambda: posix(tmp_path / 'caddy'))
+
+    assert atlas.sync_device_ca_for_caddy(None, {}) is None

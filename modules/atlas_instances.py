@@ -236,11 +236,20 @@ def derive(instance, fqdn=None):
     """Every name this instance uses. One function, so there is one place to be
     wrong.
 
-    ⚠️ **The plain instance must derive exactly what is already deployed.** The
-    live box runs `/root/atlas`, `/var/lib/atlas/store.img`, compose project
-    `takmdm`, volume `takmdm_pgdata`, `/var/lib/caddy/atlas` and settings keyed
-    `atlas_*`. A refactor that quietly moved any of those would strand a running
-    deployment, so the slug-less branch reproduces them and a test pins it.
+    ⚠️ **The plain instance must derive exactly what is already deployed.**
+    compose project `takmdm`, volume `takmdm_pgdata`, `/var/lib/caddy/atlas`
+    and settings keyed `atlas_*`. A refactor that quietly moved any of those
+    would strand a running deployment, so the slug-less branch reproduces them
+    and a test pins it.
+
+    ⚠️ **`store` is a plain directory, and there is no image (W230).** It
+    was a loop-mounted ext4 file under `/var/lib/<name>/store.img`, which an
+    unprivileged console can neither create nor mount — and which upstream
+    rightly called *"exactly the kind of thing the broker exists to prevent"*:
+    a filesystem image the console can write, mounted by root, is an
+    escalation primitive. The key is named `store` rather than `mount` because
+    it is no longer a mount point, and a key that lies about that is how the
+    next reader loses an afternoon.
     """
     slug = (instance or {}).get('slug') or None
     name = 'atlas' if slug is None else f'atlas-{slug}'
@@ -254,9 +263,7 @@ def derive(instance, fqdn=None):
         # rejects anything else, and a colon here would fail at import.
         'job_key': name,
         'dir': directory,
-        'image': f'/var/lib/{name}/store.img',
-        'image_dir': f'/var/lib/{name}',
-        'mount': f'{directory}/store',
+        'store': f'{directory}/store',
         'artifacts': f'{directory}/artifacts',
         'cache': f'{directory}/cache',
         # ⚠️ Compose takes the project name from `-p`, which outranks the
