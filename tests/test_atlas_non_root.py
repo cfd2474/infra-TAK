@@ -155,6 +155,44 @@ def test_only_the_one_helper_chowns_and_it_asks_the_broker():
         'the non-root path must reach the broker, not the PATH shim')
 
 
+def test_only_the_one_helper_deletes_and_it_asks_the_broker():
+    """⚠️ **Deleting has the same problem as chowning, and it was found the
+    same way: on the box, by the operator.**
+
+    A deployment's trees are owned by its containers -- `pgdata` by uid 70,
+    `artifacts`, `cache` and `pki` by the application's uid -- so the console
+    can descend into them and cannot unlink their contents. Every teardown
+    path therefore has to go through `_rm_priv`, which falls back to the
+    broker. Two of them did not:
+
+      rm: cannot remove '.../store/pgdata': Permission denied
+      [Errno 13] Permission denied: 'pki'
+
+    ⚠️ `shutil.rmtree` is legitimate **inside** `_rm_priv`, as the first
+    attempt: it is correct for a root-era console and for anything the
+    console genuinely owns. Anywhere else is this bug.
+    """
+    code = STRIPPED
+
+    helper = code[code.index('def _rm_priv('):]
+    helper = helper[:helper.index(chr(10) + 'def ')]
+
+    assert 'shutil.rmtree' in helper, 'the direct attempt went missing'
+    assert code.count('shutil.rmtree') == helper.count('shutil.rmtree'), (
+        'shutil.rmtree is called outside _rm_priv; a tree a container owns '
+        'cannot be removed by the console')
+
+
+def test_the_privileged_removal_refuses_a_path_outside_its_directory():
+    """⚠️ It ends in `rm -rf` as root. The paths come from `instance_paths`
+    and slugs are `^[a-z]{1,32}$`, so this should be unreachable -- which is
+    when a guard is worth having."""
+    import modules.atlas as atlas
+
+    assert atlas._rm_priv('/etc/passwd', '/home/takwerx/atlas-x') is not None
+    assert atlas._rm_priv('/home/takwerx/atlas-xy', '/home/takwerx/atlas-x')         is not None, 'a sibling sharing a prefix must not count as inside'
+
+
 def test_nothing_writes_to_a_privileged_path_directly():
     """⚠️ `/etc/systemd/system` and `/var/lib/<anything>` are not the
     console's. The module wrote unit files there with a plain `open()`; the

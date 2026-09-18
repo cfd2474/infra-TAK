@@ -4020,14 +4020,27 @@ def remove_instance(ctx, inst, plog=None):
         except OSError:
             pass
 
-    for path, what in ((dirpath, 'install directory (device CA, artifacts, .env)'),
-                       (_caddy_ca_dir(inst), "Caddy's copy of the device CA")):
-        try:
-            if path and os.path.isdir(path):
-                shutil.rmtree(path)
-                note(f'{label}: {what} removed')
-        except OSError as exc:
-            errs.append(f'{label}: {what} could not be removed: {exc}')
+    # ⚠️ **Neither of these is the console's to delete, and both looked like
+    # they were.** The install directory holds `pki/`, which the application
+    # creates `drwx------` under its own uid — `shutil.rmtree` stops there
+    # with `Permission denied: 'pki'`, measured on the box. Caddy's copy lives
+    # under `/var/lib/caddy`, which the console cannot write at all. Both go
+    # through `_rm_priv`, which falls back to the broker.
+    #
+    # ⚠️ Each names the directory it must be inside, because this ends in
+    # `rm -rf` as root.
+    for path, inside, what in (
+            (dirpath, install_base(ctx),
+             'install directory (device CA, artifacts, .env)'),
+            (_caddy_ca_dir(inst), caddy_base(),
+             "Caddy's copy of the device CA")):
+        if not path or not os.path.isdir(path):
+            continue
+        err = _rm_priv(path, inside)
+        if err:
+            errs.append(f'{label}: {what} could not be removed: {err}')
+        else:
+            note(f'{label}: {what} removed')
 
     if errs:
         # ⚠️ **Nothing below this line may run.** Clearing
