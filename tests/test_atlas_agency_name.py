@@ -174,8 +174,8 @@ def test_the_pin_points_at_the_release_that_renders_it():
     """⚠️ The name reaching `.env` does nothing until the deployment runs a
     release that knows the setting. A fresh install lands on the pin, so the pin
     has to be that release or the feature ships invisible."""
-    assert atlas.ATLAS_TAG == 'v1.48.1'
-    assert atlas.ATLAS_SHA == '769a2889d0c46d9735fbb6bc5213022d1bdd0a46'
+    assert atlas.ATLAS_TAG == 'v1.49.0'
+    assert atlas.ATLAS_SHA == 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
 
 
 # --------------------------------------------------------------------------- #

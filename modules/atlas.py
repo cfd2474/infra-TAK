@@ -59,7 +59,7 @@ ATLAS_REPO_HTTPS = 'https://github.com/cfd2474/TAK-MDM.git'
 # which the public repository allows and which keeps any credential out of a
 # world-readable module file.
 ATLAS_REPO_API = 'https://api.github.com/repos/cfd2474/TAK-MDM'
-ATLAS_TAG = 'v1.48.1'
+ATLAS_TAG = 'v1.49.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -76,7 +76,7 @@ ATLAS_TAG = 'v1.48.1'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = '769a2889d0c46d9735fbb6bc5213022d1bdd0a46'
+ATLAS_SHA = 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -1645,7 +1645,158 @@ def _push_email_relay(ctx, dirpath, plog):
     return True
 
 
-def _arm_admin_gates(ctx, dirpath, plog):
+def admin_groups_for(inst=None, global_group=None):
+    """The groups that may administer one deployment, most specific first.
+
+    ⚠️ **Both, and in that order.** The agency's own administrators and the
+    global administrators are alternatives — never the same person — so
+    requiring both would mean nobody, and requiring only the global one would
+    turn every agency administrator away from the console Authentik had just
+    let them into.
+
+    ⚠️ The plain deployment gets only the global group, exactly as it has. Its
+    "agency" is the box, and inventing `atlas-admins` for it would be a group
+    nobody is in and a silent lockout on every deployed box.
+    """
+    names = []
+    slug = atlas_instances.derive(inst)['slug']
+    if slug:
+        names.append(atlas_instances.derive(inst)['admin_group'])
+    names.append(global_group or ADMIN_GROUP)
+    return names
+
+
+def global_admin_group(ak_url, ak_headers, plog=None):
+    """Authentik's superuser group, by what it *is* rather than what it is called.
+
+    ⚠️ **Resolved, not assumed.** `authentik Admins` is the default name and an
+    operator may rename it; every deployment on the box would then require a
+    group that does not exist, and the first one to notice would be an
+    administrator locked out of the console they would use to fix it. Falls back
+    to the name only when the question cannot be asked.
+    """
+    import urllib.request as _urlreq
+
+    try:
+        req = _urlreq.Request(f'{ak_url}/api/v3/core/groups/?page_size=200',
+                              headers=ak_headers)
+        body = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
+    except Exception:
+        return ADMIN_GROUP
+    for group in body.get('results', []):
+        if group.get('is_superuser'):
+            return group.get('name') or ADMIN_GROUP
+    return ADMIN_GROUP
+
+
+def _global_admin_group(ctx):
+    """Authentik's superuser group name, or the default when it cannot be asked.
+
+    ⚠️ Wrapped so `deploy` and `_run_update` do not each have to assemble an
+    Authentik client to ask one question — and so a box with no Authentik at all
+    still gets a sensible value rather than an exception on a path that has
+    nothing to do with identity.
+    """
+    try:
+        settings = ctx['load_settings']()
+        token = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not token:
+            return ADMIN_GROUP
+        return global_admin_group(
+            ctx['_get_authentik_api_url'](settings),
+            {'Authorization': 'Bearer %s' % token,
+             'Content-Type': 'application/json'})
+    except Exception:
+        return ADMIN_GROUP
+
+
+def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
+    """Create this deployment's admin group and let it into this deployment.
+
+    Returns the group's name, or None when there is nothing to do (the plain
+    deployment) or the work failed.
+
+    ⚠️ **Bound beside "Allow authentik Admins", never instead of it.** Measured
+    on the box: the ATLAS applications run with `policy_engine_mode: any`, so
+    bindings are alternatives — the global administrators keep their access and
+    the agency's gain theirs. Replacing the policy binding would lock the global
+    administrator out of every agency console at once.
+
+    ⚠️ **Empty on purpose.** Nobody is put in the group here; that is the
+    operator's decision and the only part of this that should be manual.
+    """
+    import urllib.request as _urlreq
+
+    def log(msg):
+        if plog:
+            plog(msg)
+
+    names = atlas_instances.derive(inst)
+    if not names['slug']:
+        return None
+    group_name = names['admin_group']
+
+    def api(path, data=None, method=None):
+        req = _urlreq.Request(
+            f'{ak_url}/api/v3/{path}',
+            data=json.dumps(data).encode() if data is not None else None,
+            headers=ak_headers, method=method)
+        return json.loads(_urlreq.urlopen(req, timeout=10).read().decode() or '{}')
+
+    # --- the group ---------------------------------------------------------- #
+    group_pk = None
+    try:
+        from urllib.parse import quote as _q
+        found = api('core/groups/?name=%s' % _q(group_name))
+        for group in found.get('results', []):
+            if group.get('name') == group_name:
+                group_pk = group.get('pk')
+                break
+    except Exception as exc:
+        log('  ⚠ Could not look up the agency admin group: %s' % str(exc)[:80])
+        return None
+
+    if group_pk:
+        log('  ✓ Admin group "%s" already exists' % group_name)
+    else:
+        try:
+            # ⚠️ `is_superuser` stays false. This group administers one ATLAS,
+            # not Authentik — a superuser group would hand every one of its
+            # members the identity provider itself.
+            group_pk = api('core/groups/', {'name': group_name,
+                                            'is_superuser': False},
+                           method='POST').get('pk')
+            log('  ✓ Admin group "%s" created — add this agency\'s '
+                'administrators to it' % group_name)
+        except Exception as exc:
+            log('  ⚠ Could not create the agency admin group: %s' % str(exc)[:80])
+            return None
+
+    # --- and its way in ----------------------------------------------------- #
+    try:
+        app = api('core/applications/%s/' % names['authentik_slug'])
+        target = app['pk']
+        bindings = api('policies/bindings/?target=%s&page_size=100' % target)
+        if any(str(b.get('group')) == str(group_pk)
+               for b in bindings.get('results', [])):
+            log('  ✓ "%s" already admitted to this deployment' % group_name)
+            return group_name
+        api('policies/bindings/', {
+            'target': target, 'group': group_pk,
+            # ⚠️ After the admins policy, which sits at 0. Order does not decide
+            # the outcome under `any`, but it keeps the list readable in
+            # Authentik's own UI.
+            'order': 10, 'negate': False, 'enabled': True, 'timeout': 30,
+        }, method='POST')
+        log('  ✓ "%s" admitted to this deployment only' % group_name)
+        return group_name
+    except Exception as exc:
+        log('  ⚠ Could not admit the agency admin group: %s' % str(exc)[:80])
+        return None
+
+
+def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     """Turn on ATLAS's own two admin checks, once it is safe to.
 
     Both are fail-open in ATLAS while unset, so writing them is what arms them.
@@ -1668,17 +1819,29 @@ def _arm_admin_gates(ctx, dirpath, plog):
     changed = False
 
     # --- H-1: ATLAS checks the group itself, not only Authentik's binding ---
-    if 'TAKMDM_ADMIN_GROUP=' + ADMIN_GROUP not in body:
+    #
+    # ⚠️ A *list* since W221, because an agency deployment has two ways in: its
+    # own administrators and the global ones. With a single name ATLAS rejected
+    # the agency's administrators with a 403 *after* Authentik had let them
+    # through — the confusing half of a lockout, where the proxy says yes and
+    # the application says no.
+    wanted = ','.join(admin_groups_for(inst, global_group))
+    if 'TAKMDM_ADMIN_GROUP=' + wanted not in body:
         lines = [l for l in body.splitlines()
                  if not l.startswith('TAKMDM_ADMIN_GROUP=')]
         lines.append('')
         lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
         lines.append('# first gate; this makes ATLAS check as well, so the binding being')
         lines.append('# removed is a lockout rather than a silent promotion of everyone.')
-        lines.append('TAKMDM_ADMIN_GROUP=' + ADMIN_GROUP)
+        lines.append('#')
+        lines.append('# Any one of these is sufficient (ATLAS >= 1.49.0). The agency\'s own')
+        lines.append('# administrators and the global ones are alternatives, never the')
+        lines.append('# same person.')
+        lines.append('TAKMDM_ADMIN_GROUP=' + wanted)
         body = '\n'.join(lines) + '\n'
         changed = True
-        plog('✓ ATLAS will require membership of "%s"' % ADMIN_GROUP)
+        plog('✓ ATLAS will require membership of %s'
+             % ' or '.join('"%s"' % n for n in admin_groups_for(inst, global_group)))
 
     # --- S-1: prove the identity headers came through Caddy -----------------
     if 'TAKMDM_PROXY_AUTH_SECRET=' not in body:
@@ -2674,7 +2837,11 @@ def deploy(ctx, job, params):
 
         # ⚠️ After generate_caddyfile above, because arming the header check
         # depends on reading the vhost it just wrote.
-        restart_api = _arm_admin_gates(ctx, dirpath, plog)
+        # ⚠️ `inst`, or the agency's own administrators are rejected by ATLAS
+        # with a 403 *after* Authentik has let them in — the confusing half of a
+        # lockout, where the proxy says yes and the application says no.
+        restart_api = _arm_admin_gates(ctx, dirpath, plog, inst=_inst,
+                                       global_group=_global_admin_group(ctx))
         restart_api = _push_email_relay(ctx, dirpath, plog) or restart_api
         if restart_api:
             _compose(ctx, 'up -d api', timeout=300, inst=_inst)
@@ -3039,6 +3206,11 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 else:
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
+            # ⚠️ **Before the outpost and the policy binding**, so the
+            # group exists by the time anything is bound to it — and so an
+            # operator reading the deploy log finds the name they have to add
+            # people to, beside everything else that deployment created.
+            ensure_agency_admin_group(ctx, inst, _ak_url, _ak_headers, plog=log)
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
             ctx['_authentik_application_open_in_new_tab'](
                 _ak_url, _ak_headers, _names['app_slug'], plog=log)
@@ -3331,6 +3503,26 @@ def get_version_info(ctx):
     return info
 
 
+def _reconcile_agency_group(ctx, inst, plog):
+    """Make sure this deployment's admin group exists and is admitted.
+
+    Best effort: a box with no Authentik has nothing to reconcile, and an
+    update must not fail over it.
+    """
+    try:
+        settings = ctx['load_settings']()
+        token = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not token:
+            return
+        ensure_agency_admin_group(
+            ctx, inst, ctx['_get_authentik_api_url'](settings),
+            {'Authorization': 'Bearer %s' % token,
+             'Content-Type': 'application/json'}, plog=plog)
+    except Exception as exc:
+        plog('  ⚠ Could not reconcile the agency admin group: %s' % str(exc)[:80])
+
+
 def _run_update(ctx, inst=None):
     """Fetch the newest release and rebuild in place. Data is never touched.
 
@@ -3411,6 +3603,9 @@ def _run_update(ctx, inst=None):
         # unbinding the policy. A check that only runs at install answers a
         # question about the past (H-1).
         _verify_access_control(ctx, plog=plog, inst=inst)
+        # ⚠️ Idempotent, and the only route by which a deployment made before
+        # W221 gets its group and its binding at all.
+        _reconcile_agency_group(ctx, inst, plog)
 
         # ⚠️ Re-emit the vhost. `deploy` does this and `update` did not, so a
         # change to what ATLAS's Caddy block contains reached the box and then
@@ -3426,7 +3621,12 @@ def _run_update(ctx, inst=None):
             plog('✓ Caddy vhost re-emitted')
             # ⚠️ Only now, with the freshly generated vhost on disk to check.
             # An install that predates these gates picks them up here.
-            changed = _arm_admin_gates(ctx, dirpath, plog)
+            # ⚠️ Reconciled on every update, which is the only way a
+            # deployment made before W221 gains its agency group — `deploy` is
+            # the one thing that rewrites `.env` wholesale, and an operator is
+            # not going to tear a working deployment down for a setting.
+            changed = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
+                                       global_group=_global_admin_group(ctx))
             changed = _push_email_relay(ctx, dirpath, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
