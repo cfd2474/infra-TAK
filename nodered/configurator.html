@@ -1519,6 +1519,51 @@ async function loadIconCatalog() {
   return state.iconCatalog;
 }
 
+// Resolve an iconsetpath ("<uid>/<group>/<file>.png") back to its base64 image.
+// The picker hands us icon.b when you choose one, but a config loaded from disk only
+// stores the path -- so the preview was hidden on every reload and you saw the filename
+// with no picture. Group names can contain "/", so split off uid and file, not by index.
+function _iconB64FromPath(cat, iconsetpath) {
+  var parts = String(iconsetpath || '').split('/');
+  if (parts.length < 3) return '';
+  var uid = parts[0];
+  var file = parts[parts.length - 1];
+  var grp = parts.slice(1, -1).join('/');
+  for (var setName in cat) {
+    var c = cat[setName];
+    if (!c || c.uid !== uid) continue;
+    var arr = (c.groups || {})[grp] || [];
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i].f === file) return arr[i].b || '';
+    }
+  }
+  return '';
+}
+
+// Quiet catalog fetch: loadIconCatalog() alert()s on failure, which is right when the
+// operator clicked "Pick icon" and wrong when we are just painting a preview during a
+// page load. Same cache, no popup.
+function _iconCatalogQuiet() {
+  if (state.iconCatalog) return Promise.resolve(state.iconCatalog);
+  return fetch('/arcgis-tak/icons')
+    .then(function(r) { return r.ok ? r.json() : {}; })
+    .then(function(d) { if (d && !d.error) state.iconCatalog = d; return state.iconCatalog || {}; })
+    .catch(function() { return {}; });
+}
+
+function _showPpIconPreview(iconsetpath) {
+  var prev = document.getElementById('ppPointIconPreview');
+  if (!prev) return;
+  if (!iconsetpath) { prev.removeAttribute('src'); prev.style.display = 'none'; return; }
+  _iconCatalogQuiet().then(function(cat) {
+    var b = _iconB64FromPath(cat, iconsetpath);
+    if (!b) { prev.removeAttribute('src'); prev.style.display = 'none'; return; }
+    if (state.ppUniformIcon) state.ppUniformIcon.b64 = b;
+    prev.src = 'data:image/png;base64,' + b;
+    prev.style.display = '';
+  });
+}
+
 function openIconPicker(classVal) {
   _iconPickerCallback = classVal;
   document.getElementById('iconPickerOverlay').style.display = '';
@@ -4086,10 +4131,12 @@ function _ppFillForm(cfg) {
     state.ppUniformIcon = { iconsetpath: u.iconsetpath, cotType: u.cotType || 'a-u-G', label: (u.iconsetpath||'').split('/').pop()||'Icon', b64: '' };
     var ct = document.getElementById('ppPointCotType'); if (ct) ct.value = state.ppUniformIcon.cotType;
     var lbl = document.getElementById('ppPointIconLabel'); if (lbl) lbl.textContent = state.ppUniformIcon.label;
+    _showPpIconPreview(state.ppUniformIcon.iconsetpath);
   } else {
     state.ppUniformIcon = null;
     var ct0 = document.getElementById('ppPointCotType'); if (ct0) ct0.value = 'a-u-G';
     var lbl0 = document.getElementById('ppPointIconLabel'); if (lbl0) lbl0.textContent = 'No icon selected — default caution marker will be used';
+    _showPpIconPreview(null);
   }
   var st = document.getElementById('ppDeployStatus'); if (st) { st.textContent = ''; }
 }
@@ -4303,8 +4350,7 @@ function loadPulsepointConfig() {
       if (ct) ct.value = state.ppUniformIcon.cotType;
       var lbl = document.getElementById('ppPointIconLabel');
       if (lbl) lbl.textContent = state.ppUniformIcon.label;
-      var prev = document.getElementById('ppPointIconPreview');
-      if (prev) { prev.removeAttribute('src'); prev.style.display = 'none'; }
+      _showPpIconPreview(state.ppUniformIcon.iconsetpath);
       var btn = document.getElementById('btnPpPointIcon');
       if (btn) btn.textContent = 'Change icon';
     } else {
