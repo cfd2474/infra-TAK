@@ -3076,16 +3076,44 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
     # fleet's identity one file-read away.
     pki_dir = os.path.join(base_dir, 'pki')
     bundle_parts = []
+    # ⚠️ **Read through the broker when the console cannot read it itself.**
+    # `pki/` is owned by the application's uid and created `drwx------`, so
+    # after the host-side chown the console is locked out of the very
+    # certificate it has to stage — a plain `open()` raises `PermissionError`,
+    # the loop swallowed it, the bundle came back empty and the device
+    # listener silently vanished. Measured: `drwx------ 1000 1000`.
+    #
+    # ⚠️ Certificates only, and that does not change. The private halves
+    # never leave the install directory: verification takes the public half,
+    # and a key readable by a web server is a fleet's identity one file-read
+    # away.
+    reader = (ctx or {}).get('_read_priv')
+    # ⚠️ **KNOWN GAP: `retired/` cannot be listed by the console.** The glob
+    # below runs as the console, and `pki/` is `drwx------` owned by the
+    # application's uid — so it returns nothing, silently, and a renewed CA
+    # would stage a trust pool without the retired intermediates. Devices
+    # whose certificates chain through one would stop being trusted at the
+    # edge, which is a fleet-wide outage with no error anywhere.
+    #
+    # `_read_priv` reads a *named* file; there is no brokered `listdir`, so
+    # this cannot be closed from the module side. It is on the list of seams
+    # to ask upstream for, with `_chown_priv`. Harmless until the first CA
+    # renewal, and it must not ship past one.
     for candidate in ([os.path.join(pki_dir, 'ca.crt'),
                        os.path.join(pki_dir, 'issuing.crt')] +
                       sorted(_glob(os.path.join(pki_dir, 'retired', '*.crt')))):
+        text = None
         try:
             with open(candidate, 'r') as fh:
                 text = fh.read().strip()
-            if text and text not in bundle_parts:
-                bundle_parts.append(text)
         except OSError:
-            continue
+            if reader is not None:
+                try:
+                    text = (reader(candidate) or '').strip()
+                except Exception:
+                    text = None
+        if text and text not in bundle_parts:
+            bundle_parts.append(text)
     if not bundle_parts:
         return None
     try:
