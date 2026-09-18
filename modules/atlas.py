@@ -860,6 +860,12 @@ def instances_payload(ctx, size_gb=None):
             for inst in load_instances(ctx)
         ],
         'capacity': capacity_facts(ctx, size_gb=size_gb),
+        # ⚠️ **The one job an operator has, asked at box level.** While a root
+        # key is on this server, anyone who reaches the machine can impersonate
+        # any of that deployment's devices and the only remedy is setting every
+        # tablet up again. A per-deployment banner is easy to scroll past; a
+        # list is not.
+        'root_keys': root_key_holders(ctx, projects),
     }
 
 
@@ -1741,13 +1747,81 @@ def _verify_access_control(ctx, plog=None, inst=None):
         return None
 
 
-def _pki_dir():
-    """Where this install keeps its PKI, or None if it is not here."""
-    for base in ('/root/atlas', os.path.expanduser('~/atlas')):
-        candidate = os.path.join(base, 'pki')
+def _pki_dir(ctx=None, inst=None):
+    """Where one deployment keeps its PKI, or None if it is not here.
+
+    ⚠️ **Per deployment, because the CAs are.** Every deployment issues its own
+    device certificates from its own root — that is the separation the whole
+    agency model rests on — and this probed `/root/atlas/pki` whatever it was
+    asked about. On a box whose only deployment is an agency it answered None,
+    so the console reported *"ATLAS is not installed here"* over a healthy,
+    split certificate authority.
+
+    ⚠️ The two legacy locations are still probed for the *plain* deployment: a
+    checkout that predates `install_base` lives at one of them, and dropping the
+    probe would strand its CA.
+    """
+    candidates = [posixpath.join(instance_paths(ctx, inst)['dir'], 'pki')]
+    if not atlas_instances.derive(inst)['slug']:
+        # ⚠️ `posixpath`, not `os.path`. These are paths on the box, and on a
+        # development machine `os.path.join` produces a separator no box uses —
+        # which has bitten this module before.
+        candidates += [posixpath.join('/root/atlas', 'pki'),
+                       posixpath.join(os.path.expanduser('~/atlas'), 'pki')]
+    for candidate in candidates:
         if os.path.isdir(candidate):
             return candidate
     return None
+
+
+def recovery_filename(settings, inst=None):
+    """What the saved root key is called on the operator's disk.
+
+    ⚠️ **It names the deployment, and that is the whole point.** Every
+    deployment on a box produced `atlas-recovery-<fqdn>.key` — the same name —
+    so three agencies meant three files distinguished only by the browser's
+    `(1)` and `(2)`. A mislabelled recovery file is indistinguishable from the
+    right one until the day it is needed, which is five years out, during an
+    outage, when `ca-verify-root` rejects it and nothing says which of the three
+    it should have been.
+    """
+    host = (settings or {}).get('fqdn') or 'server'
+    return '%s-%s.key' % (atlas_instances.derive(inst)['name'], host)
+
+
+def root_key_holders(ctx, projects=None):
+    """Deployments whose CA root key is still on this server, by name.
+
+    ⚠️ **The one job an operator has, and the one the console has to keep
+    asking.** While that key is here, anyone who reaches this machine can
+    impersonate any of that deployment's devices, and the only remedy is setting
+    every tablet up again. With several deployments the prompt has to be a list:
+    a per-deployment banner is easy to scroll past, and the box-level question —
+    "is there a root key on this server at all" — is the one that matters.
+
+    Best effort: a deployment that is not running cannot be asked, and is
+    reported as unknown rather than as safe.
+    """
+    holders, unknown = [], []
+    # ⚠️ Reuses the caller's `docker ps` when it has one. This is read on every
+    # poll of the deployments route, and a second process listing per poll would
+    # make the page slower the more agencies a box has.
+    if projects is None:
+        projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        name = atlas_instances.derive(inst)['name']
+        if not instance_is_built(ctx, inst, projects):
+            continue
+        pki = _pki_dir(ctx, inst)
+        if pki is None:
+            unknown.append(name)
+            continue
+        # ⚠️ The key file, not `is_split`. Those two come apart in exactly the
+        # state this is for: an intermediate exists *and* the root is still
+        # here (SEC_AUDIT S-2 / W185).
+        if os.path.exists(os.path.join(pki, 'ca.key')):
+            holders.append(name)
+    return {'holders': holders, 'unknown': unknown}
 
 
 def _write_root_key(path, pem):
@@ -3647,14 +3721,30 @@ def register(ctx):
         return jsonify({'lines': lines[-200:]})
 
     def ca_view():
-        """What the certificate authority looks like, for the page to render."""
-        r = _compose_exec(ctx, ['python', '-m', 'app.cli', 'ca-status'])
+        """What one deployment's certificate authority looks like.
+
+        ⚠️ Every deployment has its own root, its own issuing certificate and
+        its own expiry. Answering for the plain one whatever was asked reported
+        *"ATLAS is not running"* over a healthy, split CA on a box whose only
+        deployment was an agency.
+        """
+        inst, err = _requested_instance(default_first=True)
+        if err:
+            return jsonify({'ok': False, 'error': err}), 200
+        r = _compose_exec(ctx, ['python', '-m', 'app.cli', 'ca-status'], inst=inst)
         if r is None:
             return jsonify({'ok': False, 'error': 'ATLAS is not running'}), 200
         try:
-            return jsonify(json.loads(r))
+            body = json.loads(r)
         except Exception:
             return jsonify({'ok': False, 'error': 'could not read the CA status'}), 200
+        # ⚠️ Carried back so the page can label the block and the modals know
+        # which deployment they are about. Without it a page showing three CAs
+        # has three identical-looking panels.
+        names = atlas_instances.derive(inst)
+        body['slug'] = names['slug']
+        body['name'] = names['name']
+        return jsonify(body)
 
     def ca_renew_view():
         """Run the intermediate ceremony: take the root key, use it, destroy it.
@@ -3671,6 +3761,10 @@ def register(ctx):
         if err:
             return jsonify({'success': False, 'error': err}), 403
 
+        inst, bad = _requested_instance(default_first=True)
+        if bad:
+            return jsonify({'success': False, 'error': bad}), 404
+
         key_pem = (data.get('root_key') or '').strip()
         days = data.get('days') or 1825
         try:
@@ -3680,9 +3774,10 @@ def register(ctx):
         if days < 1 or days > 7300:
             return jsonify({'success': False, 'error': 'days must be 1-7300'}), 400
 
-        pki = _pki_dir()
+        pki = _pki_dir(ctx, inst)
         if pki is None:
-            return jsonify({'success': False, 'error': 'ATLAS is not installed here'}), 404
+            return jsonify({'success': False,
+                            'error': 'That deployment is not installed here'}), 404
         key_path = os.path.join(pki, 'ca.key')
 
         # ⚠️ A root key already present is the legacy state, not an error — the
@@ -3715,7 +3810,7 @@ def register(ctx):
             out = _compose_exec(
                 ctx,
                 ['python', '-m', 'app.cli', 'ca-issue-intermediate', '--days', str(days)],
-                timeout=120,
+                timeout=120, inst=inst,
             )
             if out is None:
                 return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
@@ -3740,13 +3835,17 @@ def register(ctx):
                                                        'certificate', 'steps': steps}), 500
 
         # The new trust bundle has to reach Caddy or devices fail at the edge.
-        staged = sync_device_ca_for_caddy()
+        # ⚠️ *This* deployment's bundle, into *this* deployment's Caddy
+        # directory. Staging the plain one would leave the renewed agency
+        # verifying devices against the certificate it just replaced.
+        staged = sync_device_ca_for_caddy(inst)
         steps.append('Trust bundle staged for Caddy' if staged
                      else '⚠ Could not stage the trust bundle for Caddy')
         ctx['_caddy_reload']()
 
-        r = _compose(ctx, 'restart api', timeout=180)
-        steps.append('ATLAS restarted' if r.returncode == 0 else '⚠ Restart failed')
+        r = _compose(ctx, 'restart api', timeout=180, inst=inst)
+        steps.append('%s restarted' % atlas_instances.derive(inst)['name']
+                     if r.returncode == 0 else '⚠ Restart failed')
         return jsonify({'success': True, 'steps': steps})
 
     def ca_recovery_view():
@@ -3763,7 +3862,12 @@ def register(ctx):
         if err:
             return jsonify({'success': False, 'error': err}), 403
 
-        rc, out = _compose_exec_rc(ctx, ['python', '-m', 'app.cli', 'ca-export-root'])
+        inst, bad = _requested_instance(default_first=True)
+        if bad:
+            return jsonify({'success': False, 'error': bad}), 404
+
+        rc, out = _compose_exec_rc(
+            ctx, ['python', '-m', 'app.cli', 'ca-export-root'], inst=inst)
         if rc is None:
             return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
         if rc != 0:
@@ -3774,7 +3878,7 @@ def register(ctx):
         return jsonify({
             'success': True,
             'key_pem': out,
-            'filename': 'atlas-recovery-%s.key' % (ctx['load_settings']().get('fqdn') or 'server'),
+            'filename': recovery_filename(ctx['load_settings'](), inst),
         })
 
     def ca_recovery_confirm_view():
@@ -3790,6 +3894,10 @@ def register(ctx):
         if err:
             return jsonify({'success': False, 'error': err}), 403
 
+        inst, bad = _requested_instance(default_first=True)
+        if bad:
+            return jsonify({'success': False, 'error': bad}), 404
+
         key_pem = (data.get('root_key') or '').strip()
         if not key_pem:
             return jsonify({'success': False, 'error': 'upload your recovery file first'}), 400
@@ -3798,6 +3906,7 @@ def register(ctx):
         rc, out = _compose_exec_rc(
             ctx, ['python', '-m', 'app.cli', 'ca-verify-root'],
             stdin=key_pem if key_pem.endswith('\n') else key_pem + '\n',
+            inst=inst,
         )
         if rc is None:
             return jsonify({'success': False, 'error': 'ATLAS is not running'}), 409
@@ -3806,7 +3915,11 @@ def register(ctx):
             # customer who uploads the wrong file must end up exactly where they
             # started, with a message that says which mistake they made.
             return jsonify({'success': False, 'error': out or 'that file does not match'}), 400
-        steps.append('✓ Recovery file checked against this server\'s certificate authority')
+        # ⚠️ Names the deployment. An operator holding three recovery
+        # files needs to be told which one this matched, not that 'a'
+        # file matched.
+        steps.append('✓ Recovery file checked against %s\'s certificate authority'
+                     % atlas_instances.derive(inst)['name'])
 
         # "Check my recovery file", years later, when the root is long gone.
         # ⚠️ Stops here deliberately. Running the delete would be a no-op and
@@ -3818,6 +3931,7 @@ def register(ctx):
 
         rc, out = _compose_exec_rc(
             ctx, ['python', '-m', 'app.cli', 'ca-delete-root'], timeout=60,
+            inst=inst,
         )
         if rc is None:
             return jsonify({'success': False, 'error': 'ATLAS stopped responding',

@@ -340,47 +340,36 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     </div>
   </div>
 
+  <!--
+    ⚠️ **One certificate authority per deployment, and one block each.** Every
+    deployment issues its own device certificates from its own root — that is
+    the separation the agency model rests on, and it means there is no such
+    thing as "the" CA on a box with three agencies. This card used to show one,
+    always the plain deployment's, and reported "ATLAS is not running" over a
+    healthy split CA whenever that deployment did not exist.
+
+    The blocks are built in `renderCa`; this is the shell they land in.
+  -->
   <div class="card" id="caCard" hidden>
-    <div class="card-title">Certificate authority</div>
-    <div id="caBody" class="mono" style="font-size:13px;line-height:1.7"></div>
-    <div id="caWarn" class="banner-bad" hidden style="margin-top:10px"></div>
+    <div class="card-title">Certificate authorities</div>
 
     <!--
-      The one job a customer has. Shown while the root key is still on the box
-      and nowhere else — which, after a fresh deploy, is always.
-
-      ⚠️ Driven by `root_key_on_server`, read from the key file, never from
-      whether an intermediate exists. Those two come apart in exactly the state
-      this banner is for (SEC_AUDIT S-2 / W185).
+      ⚠️ **The box-level question, asked once at the top.** "Is there a root key
+      on this server at all" is what matters, and a per-deployment banner three
+      screens down is easy to scroll past. While one is here, anyone who reaches
+      this machine can impersonate that deployment's devices.
     -->
-    <div id="caRecovery" hidden class="banner-bad" style="margin-top:12px">
-      <strong>Save your recovery file</strong>
+    <div id="caRootKeys" hidden class="banner-bad" style="margin-bottom:14px">
+      <strong>Root keys are still on this server</strong>
+      <p style="margin:6px 0 0;font-size:13px;line-height:1.6" id="caRootKeysBody"></p>
       <p style="margin:6px 0 0;font-size:13px;line-height:1.6">
-        Your certificate authority's master key is still on this server. Anyone
-        who reaches this machine can use it to impersonate any of your devices,
-        and the only fix would be setting up every tablet again.
+        Save each one below and we will remove it from here.
+        <strong>Nothing on any device changes.</strong> You will need those
+        files again in about five years — one per deployment, named for it.
       </p>
-      <p style="margin:6px 0 0;font-size:13px;line-height:1.6">
-        Download it, keep it somewhere safe, and we will remove it from here.
-        <strong>Nothing on any device changes.</strong> You will need the file
-        again in about five years.
-      </p>
-      <div style="margin-top:10px">
-        <button class="btn btn-primary" id="caRecoveryBtn" onclick="openRecovery()">
-          Save recovery file
-        </button>
-      </div>
     </div>
 
-    <div id="caSafe" hidden class="note" style="margin-top:12px;font-size:13px">
-      ✓ The master key is not on this server. Keep your recovery file safe —
-      renewing needs it.
-      <a href="#" onclick="openRecoveryCheck();return false">Check my recovery file</a>
-    </div>
-
-    <div style="margin-top:14px">
-      <button class="btn btn-secondary" id="caRenewBtn" onclick="openRenew()">Renew issuing certificate</button>
-    </div>
+    <div id="caBlocks"></div>
   </div>
 
   <div class="card" id="updateCard" hidden>
@@ -542,7 +531,7 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
 
 <div class="modal-overlay" id="renewModal">
   <div class="modal">
-    <h3>Renew the issuing certificate</h3>
+    <h3 id="renewTitle">Renew the issuing certificate</h3>
     <p style="color:var(--muted);font-size:13px;line-height:1.6">
       ATLAS signs device certificates with an <strong>issuing certificate</strong>.
       When it expires, every device stops authenticating. Renewing it needs the
@@ -1467,43 +1456,123 @@ refreshCapacity();
 //
 // \u26a0\ufe0f Polled on load only. The expiry moves once a day; refreshing it on a timer
 // would run a `docker exec` against ATLAS for a number that cannot have changed.
-async function loadCa(){
-  try {
-    const r = await fetch('/api/atlas/ca', {credentials:'same-origin'});
-    const d = await r.json();
-    const card = document.getElementById('caCard');
-    const body = document.getElementById('caBody');
-    const warn = document.getElementById('caWarn');
-    if (!d || !d.ok) {
-      // Not running, or mid-ceremony. Say so rather than showing nothing \u2014 the
-      // broken state is exactly when someone opens this page.
-      card.hidden = false;
-      body.textContent = (d && d.error) ? d.error : 'Certificate authority unavailable';
-      return;
-    }
-    card.hidden = false;
-    body.innerHTML =
-      'Signing with <strong>' + escapeHtml(d.issuing_subject || '?') + '</strong><br>' +
-      'Expires ' + escapeHtml(d.issuing_expires || '?') +
-      ' (' + d.issuing_days_left + ' days)<br>' +
-      'Device certificates ' + d.device_cert_validity_days + ' days, renewed automatically ' +
-      d.renew_within_days + ' days before expiry';
+//: The deployment each CA modal is acting on. ⚠️ Set when the modal opens and
+//: read when it submits, the same shape the removal confirmation uses — a modal
+//: that does not know which deployment it is about would renew or destroy the
+//: wrong certificate authority, and the operator would not find out until a
+//: fleet stopped checking in.
+let caTarget = null;
 
-    // ⚠️ One of these two is always shown, and which one is decided by the key
-    // file. `is_split` answers a different question and used to be used for this.
-    document.getElementById('caRecovery').hidden = !d.root_key_on_server;
-    document.getElementById('caSafe').hidden = !!d.root_key_on_server;
-    if (d.needs_attention) {
-      warn.hidden = false;
-      // ⚠️ Names the recovery file, because that is what renewing needs and
-      // the moment someone reads this is the moment to discover it is missing —
-      // not on the day the certificate expires.
-      warn.textContent = 'The issuing certificate expires in ' + d.issuing_days_left +
-        ' days. When it does, every device stops authenticating. Renewing needs ' +
-        'your recovery file \u2014 find it now, then use Renew below.';
-    }
-  } catch (e) { /* the card simply stays hidden */ }
+function caBlock(d){
+  const box = document.createElement('div');
+  box.className = 'mono';
+  box.style.cssText = 'font-size:13px;line-height:1.7;padding:12px 0;'
+    + 'border-top:1px solid rgba(255,255,255,.08)';
+
+  const title = document.createElement('div');
+  title.innerHTML = '<strong>' + escapeHtml(d.name || 'atlas') + '</strong>';
+  box.appendChild(title);
+
+  const body = document.createElement('div');
+  if (!d || !d.ok){
+    // Not running, or mid-ceremony. Say so rather than showing nothing — the
+    // broken state is exactly when someone opens this page.
+    body.textContent = (d && d.error) ? d.error : 'Certificate authority unavailable';
+    box.appendChild(body);
+    return box;
+  }
+  body.innerHTML =
+    'Signing with <strong>' + escapeHtml(d.issuing_subject || '?') + '</strong><br>' +
+    'Expires ' + escapeHtml(d.issuing_expires || '?') +
+    ' (' + d.issuing_days_left + ' days)<br>' +
+    'Device certificates ' + d.device_cert_validity_days + ' days, renewed automatically ' +
+    d.renew_within_days + ' days before expiry';
+  box.appendChild(body);
+
+  if (d.needs_attention){
+    const warn = document.createElement('div');
+    warn.className = 'banner-bad';
+    warn.style.marginTop = '10px';
+    // ⚠️ Names the recovery file, because that is what renewing needs and the
+    // moment someone reads this is the moment to discover it is missing — not
+    // on the day the certificate expires.
+    warn.textContent = 'The issuing certificate expires in ' + d.issuing_days_left +
+      ' days. When it does, every device on ' + (d.name || 'this deployment') +
+      ' stops authenticating. Renewing needs that deployment\'s recovery file — '
+      + 'find it now, then use Renew below.';
+    box.appendChild(warn);
+  }
+
+  const actions = document.createElement('div');
+  actions.style.marginTop = '10px';
+  // ⚠️ One of these two is always shown, and which one is decided by the key
+  // file. `is_split` answers a different question and used to be used for this.
+  if (d.root_key_on_server){
+    actions.appendChild(rowButton('Save ' + (d.name || 'this') + ' recovery file',
+                                  'btn-primary',
+                                  function(){ openRecovery(d); }));
+  } else {
+    const safe = document.createElement('span');
+    safe.className = 'note';
+    safe.style.marginRight = '8px';
+    safe.textContent = '✓ The master key is not on this server. ';
+    actions.appendChild(safe);
+    actions.appendChild(rowButton('Check my recovery file', 'btn-secondary',
+                                  function(){ openRecoveryCheck(d); }));
+  }
+  actions.appendChild(rowButton('Renew issuing certificate', 'btn-secondary',
+                                function(){ openRenew(d); }));
+  box.appendChild(actions);
+  return box;
 }
+
+function renderRootKeys(info){
+  const panel = document.getElementById('caRootKeys');
+  const body = document.getElementById('caRootKeysBody');
+  if (!panel || !body) return;
+  const holders = (info && info.holders) || [];
+  panel.hidden = holders.length === 0;
+  if (!holders.length) return;
+  body.textContent =
+    (holders.length === 1
+      ? 'The certificate authority master key for ' + holders[0] + ' is'
+      : 'The certificate authority master keys for ' + holders.join(', ') + ' are')
+    + ' still on this server. Anyone who reaches this machine can use '
+    + (holders.length === 1 ? 'it' : 'them')
+    + ' to impersonate any of those deployments\' devices, and the only fix '
+    + 'would be setting up every tablet again.';
+}
+
+async function loadCa(){
+  // ⚠️ One request per deployment, because each has its own certificate
+  // authority to ask about. The list comes from the deployments route, so a
+  // deployment that is not finished is never asked — it has no container.
+  const card = document.getElementById('caCard');
+  const blocks = document.getElementById('caBlocks');
+  if (!card || !blocks) return;
+  let data;
+  try {
+    const r = await fetch('/api/atlas/instances', {credentials:'same-origin'});
+    data = await r.json();
+  } catch (e) { return; }
+  renderRootKeys(data.root_keys);
+  const built = (data.instances || []).filter(i => i.built);
+  if (!built.length) return;
+  card.hidden = false;
+  blocks.innerHTML = '';
+  for (const inst of built){
+    let d = {name: inst.name, slug: inst.slug, ok: false,
+             error: 'Certificate authority unavailable'};
+    try {
+      const q = inst.slug ? ('?slug=' + encodeURIComponent(inst.slug)) : '';
+      const r = await fetch('/api/atlas/ca' + q, {credentials:'same-origin'});
+      const got = await r.json();
+      if (got) d = Object.assign(d, got, {name: got.name || inst.name});
+    } catch (e) { /* the block says unavailable */ }
+    blocks.appendChild(caBlock(d));
+  }
+}
+
 
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({
@@ -1511,7 +1580,23 @@ function escapeHtml(s){
   }[c]));
 }
 
-function openRenew(){ document.getElementById('renewModal').classList.add('open'); }
+function caName(){
+  // ⚠️ The deployment a CA modal is acting on, by the name the page shows. Used
+  // in every title, because three identical dialogs over three certificate
+  // authorities is how the wrong one gets renewed.
+  return (caTarget && caTarget.name) || 'ATLAS';
+}
+
+function caSlug(){
+  return (caTarget && caTarget.slug) || null;
+}
+
+function openRenew(d){
+  caTarget = d || null;
+  const title = document.getElementById('renewTitle');
+  if (title) title.textContent = 'Renew ' + caName() + "'s issuing certificate";
+  document.getElementById('renewModal').classList.add('open');
+}
 function closeRenew(){ document.getElementById('renewModal').classList.remove('open'); }
 
 async function doRenew(){
@@ -1529,6 +1614,7 @@ async function doRenew(){
       headers: {'Content-Type': 'application/json'},
       credentials: 'same-origin',
       body: JSON.stringify({
+        slug: caSlug(),
         password: document.getElementById('renewPw').value,
         root_key: document.getElementById('renewKey').value,
         days: parseInt(document.getElementById('renewDays').value, 10) || 1825,
@@ -1580,9 +1666,11 @@ function showRenewSteps(steps){
 
 let recoveryCheckOnly = false;
 
-function openRecovery(){
+function openRecovery(d){
+  if (d) caTarget = d;
   recoveryCheckOnly = false;
-  document.getElementById('recoveryTitle').textContent = 'Save your recovery file';
+  document.getElementById('recoveryTitle').textContent =
+    'Save ' + caName() + "'s recovery file";
   document.getElementById('recoveryStep1').hidden = false;
   document.getElementById('recoveryStep2').hidden = true;
   document.getElementById('recoveryDone').hidden = true;
@@ -1594,10 +1682,11 @@ function openRecovery(){
 // The same modal, for "is the file I saved years ago still the right one?".
 // ⚠️ This works *because* verification compares against the CA certificate
 // rather than the key — the key is long gone by the time anyone asks.
-function openRecoveryCheck(){
-  openRecovery();
+function openRecoveryCheck(d){
+  openRecovery(d);
   recoveryCheckOnly = true;
-  document.getElementById('recoveryTitle').textContent = 'Check your recovery file';
+  document.getElementById('recoveryTitle').textContent =
+    'Check ' + caName() + "'s recovery file";
   document.getElementById('recoveryStep1').hidden = true;
   document.getElementById('recoveryStep2').hidden = false;
 }
@@ -1614,7 +1703,8 @@ async function doRecoveryDownload(){
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       credentials: 'same-origin',
-      body: JSON.stringify({password: document.getElementById('recoveryPw').value}),
+      body: JSON.stringify({slug: caSlug(),
+                            password: document.getElementById('recoveryPw').value}),
     });
     const d = await r.json();
     if (!d.success) {
@@ -1669,6 +1759,7 @@ async function doRecoveryConfirm(){
       headers: {'Content-Type': 'application/json'},
       credentials: 'same-origin',
       body: JSON.stringify({
+        slug: caSlug(),
         password: document.getElementById('recoveryPw2').value
                   || document.getElementById('recoveryPw').value,
         root_key: text,
