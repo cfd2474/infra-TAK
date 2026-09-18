@@ -1590,7 +1590,7 @@ def _shred(path):
         return False
 
 
-def _compose_exec(ctx, argv, timeout=60, stdin=None):
+def _compose_exec(ctx, argv, timeout=60, stdin=None, inst=None):
     """Run a command inside the API container. Returns its output, or None.
 
     ⚠️ `stdin` exists so the recovery file can be checked **without ever being
@@ -1601,9 +1601,14 @@ def _compose_exec(ctx, argv, timeout=60, stdin=None):
     """
     argv = list(argv)
     flags = ['-i'] if stdin is not None else []
+    # ⚠️ Each deployment has its own container, named from its compose project.
+    # `API_CONTAINER` is the plain one, so an agency exec would land in another
+    # deployment's database — or, more often, in nothing at all.
+    container = API_CONTAINER if not (inst or {}).get('slug') else (
+        f"{instance_paths(ctx, inst)['compose_project']}-api-1")
     try:
         r = subprocess.run(
-            ['docker', 'exec'] + flags + [API_CONTAINER] + argv,
+            ['docker', 'exec'] + flags + [container] + argv,
             capture_output=True, text=True, timeout=timeout,
             input=stdin if stdin is not None else None,
         )
@@ -1973,18 +1978,36 @@ def deploy(ctx, job, params):
         store_bytes = params.get('store_bytes')
         if store_bytes:
             plog('')
-            plog('━━━ Reserving the ATLAS store ━━━')
-            plog(f'  {store_bytes / GIB:.1f} GB, allocated up front so nothing else')
-            plog('  on this box can claim it.')
-            plog('  ⚠ `df` will show this space as used from now on — that is the')
-            plog('  reservation working, not a leak.')
+            # ⚠️ The prose follows the mode. It said "allocated up front so
+            # nothing else on this box can claim it" for a *dynamic* deployment,
+            # which claims nothing up front — an operator reading that would
+            # expect `df` to move and be right to call it a bug when it did not.
+            if params.get('mode') == atlas_instances.MODE_DYNAMIC:
+                plog('━━━ Preparing the ATLAS store ━━━')
+                plog(f'  Up to {store_bytes / GIB:.1f} GB, shared with the rest of')
+                plog('  this box and taken only as it is used.')
+                plog('  ⚠ `df` will not move now. It moves as this deployment')
+                plog('  stores things, and moves back when they are deleted.')
+            else:
+                plog('━━━ Reserving the ATLAS store ━━━')
+                plog(f'  {store_bytes / GIB:.1f} GB, allocated up front so nothing else')
+                plog('  on this box can claim it.')
+                plog('  ⚠ `df` will show this space as used from now on — that is the')
+                plog('  reservation working, not a leak.')
             err = ensure_store(ctx, store_bytes, plog,
                                mode=params.get('mode'), inst=_inst)
             if err:
                 raise RuntimeError(f'Reserved store: {err}')
-            facts = store_facts(ctx)
-            plog(f'  ✓ {facts["usable_gb"]} GB usable inside a '
-                 f'{facts["reserved_gb"]} GB reservation')
+            # ⚠️ Asked about *this* deployment. Without the instance it read
+            # the plain store, which on this box does not exist — hence
+            # "0 GB usable inside a 0 GB reservation" after a store had just
+            # been built successfully.
+            facts = store_facts(ctx, mode=params.get('mode'), inst=_inst)
+            if params.get('mode') == atlas_instances.MODE_DYNAMIC:
+                plog(f'  ✓ {facts["usable_gb"]} GB usable, sharing this box\'s disk')
+            else:
+                plog(f'  ✓ {facts["usable_gb"]} GB usable inside a '
+                     f'{facts["reserved_gb"]} GB reservation')
             plog('  ⚠ Compose will warn that the Postgres volume "was not created')
             plog('  by Docker Compose". Expected: it is backed by the store.')
 
@@ -2057,7 +2080,7 @@ def deploy(ctx, job, params):
         # `api` alone: it depends_on db and the one-shot migration step, and
         # naming it keeps ATLAS's own nginx out of a deployment where Caddy is
         # the only thing that should be terminating TLS.
-        r = _compose(ctx, 'up -d --build api', timeout=1800)
+        r = _compose(ctx, 'up -d --build api', timeout=1800, inst=_inst)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed:\n{(r.stderr or "")[-500:]}')
         plog('✓ Containers built and started')
@@ -2068,7 +2091,7 @@ def deploy(ctx, job, params):
         # deploy, rather than staying wide until somebody happens to update
         # (SEC_AUDIT.md S-1).
         if _set_trusted_proxies(dirpath, plog):
-            r2 = _compose(ctx, 'up -d api', timeout=600)
+            r2 = _compose(ctx, 'up -d api', timeout=600, inst=_inst)
             if r2.returncode != 0:
                 plog('  ⚠ Could not restart with the narrowed range; it applies on '
                      'the next update')
@@ -2102,7 +2125,7 @@ def deploy(ctx, job, params):
         restart_api = _arm_admin_gates(ctx, dirpath, plog)
         restart_api = _push_email_relay(ctx, dirpath, plog) or restart_api
         if restart_api:
-            _compose(ctx, 'up -d api', timeout=300)
+            _compose(ctx, 'up -d api', timeout=300, inst=_inst)
 
         # ── The certificate authority is split before anyone can use it ──────
         #
@@ -2118,6 +2141,7 @@ def deploy(ctx, job, params):
         plog('━━━ Securing the certificate authority ━━━')
         out = _compose_exec(
             ctx, ['python', '-m', 'app.cli', 'ca-issue-intermediate'], timeout=120,
+            inst=_inst,
         )
         if out and 'issuing CA' in out:
             plog('✓ Issuing certificate created — the root key is now only needed')
@@ -3166,9 +3190,16 @@ def register(ctx):
             size = _rq.args.get('size_gb', type=float)
             found = load_instances(ctx)
             return jsonify({
+                # ⚠️ `built` is the difference between a deployment and a
+                # record of one. A deploy that fails partway leaves the record
+                # behind — that is deliberate, so the slug and port stay claimed
+                # — but without this the page cannot tell the two apart and
+                # offers no way to finish the job.
                 'instances': [
-                    dict(i, paths={k: instance_paths(ctx, i)[k]
-                                   for k in ('dir', 'vhost', 'compose_project')})
+                    dict(i,
+                         built=os.path.isdir(instance_paths(ctx, i)['dir']),
+                         paths={k: instance_paths(ctx, i)[k]
+                                for k in ('dir', 'vhost', 'compose_project')})
                     for i in found
                 ],
                 'capacity': capacity_facts(ctx, size_gb=size),

@@ -103,6 +103,8 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     -->
     <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
 
+    <div id="retryRow" hidden style="margin-top:14px"></div>
+
     <button class="btn btn-primary" id="addInstanceBtn"
             onclick="openAddInstance()" style="margin-top:16px">
       Deploy instance
@@ -643,9 +645,31 @@ function renderInstances(data){
   const rows = (data.instances || []).map(i => {
     const name = i.slug ? i.slug : 'general (no slug)';
     const held = i.mode === 'fixed' ? 'reserved' : 'maximum';
+    // ⚠️ An unfinished deployment says so. The record is written before the
+    // build so the slug is held while it runs; when the build then fails, the
+    // record is all that is left and it must not read as a working deployment.
+    const state = i.built ? i.mode : i.mode + '  (not finished)';
     return '  ' + name.padEnd(24) + String(i.size_gb || 0).padStart(5) +
-           ' GB ' + held.padEnd(9) + ' ' + i.mode;
+           ' GB ' + held.padEnd(9) + ' ' + state;
   });
+
+  // ⚠️ A deployment that never finished needs a way forward. Without this the
+  // only route was to re-create it, and the form refuses the slug as a
+  // duplicate — leaving the operator with a claimed name and no button.
+  const unfinished = (data.instances || []).filter(i => !i.built);
+  const retry = document.getElementById('retryRow');
+  if (retry){
+    retry.hidden = unfinished.length === 0;
+    retry.innerHTML = '';
+    unfinished.forEach(i => {
+      const b = document.createElement('button');
+      b.className = 'btn btn-primary';
+      b.style.marginRight = '8px';
+      b.textContent = 'Finish deploying ' + (i.slug || 'the general ATLAS');
+      b.onclick = () => startDeployFor(i);
+      retry.appendChild(b);
+    });
+  }
   list.textContent = rows.length
     ? 'Deployments on this box:\n' + rows.join('\n')
     : 'No ATLAS deployment on this box yet.';

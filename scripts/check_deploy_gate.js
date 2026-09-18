@@ -66,7 +66,9 @@ function harness(capacity) {
       // exactly like a bug in the page. Faithful beats convenient.
       const node = {
         id, style: {}, textContent: "", innerHTML: "", _value: "",
-        disabled: false, checked: false,
+        disabled: false, checked: false, hidden: false, children: [],
+        className: "", onclick: null,
+        appendChild(child) { this.children.push(child); return child; },
         classList: { _s: new Set(),
           add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
           contains(c) { return this._s.has(c); } },
@@ -83,8 +85,20 @@ function harness(capacity) {
   const radios = { dynamic: el("radio-dynamic"), fixed: el("radio-fixed") };
   radios.dynamic.checked = true;
 
+  // ⚠️ `createElement` and `appendChild` exist because the page builds the
+  // "finish deploying" buttons rather than toggling markup. A fake DOM that
+  // lacks them fails with a stack trace rather than a failed check, which is
+  // still the harness doing its job — it found the gap the moment the page
+  // started creating nodes.
+  const made = [];
   global.document = {
     getElementById: el,
+    createElement(tag) {
+      const node = el("made-" + tag + "-" + made.length);
+      node.tag = tag;
+      made.push(node);
+      return node;
+    },
     querySelector(sel) {
       const m = /value="(\w+)"/.exec(sel);
       return m ? radios[m[1]] || null : null;
@@ -323,6 +337,36 @@ function harness(capacity) {
   check("a general deployment names the plain host",
     h.el("instanceConfirmSummary").textContent.includes("atlas.leckliter.net"),
     h.el("instanceConfirmSummary").textContent);
+}
+
+// --- an unfinished deployment can be finished ------------------------------- //
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ slug: "corona", mode: "dynamic", size_gb: 354.6,
+                           built: false }],
+             capacity: { ...CAPACITY, may_deploy_plain: true } });
+  check("an unfinished deployment is labelled as such",
+    h.el("instanceList").textContent.includes("not finished"),
+    h.el("instanceList").textContent);
+  check("and offers a way to finish it",
+    h.el("retryRow").hidden === false
+    && h.el("retryRow").children.length === 1,
+    "hidden=" + h.el("retryRow").hidden);
+  check("naming the deployment it would finish",
+    (h.el("retryRow").children[0] || {}).textContent === "Finish deploying corona",
+    (h.el("retryRow").children[0] || {}).textContent);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.render({ instances: [{ slug: "corona", mode: "dynamic", size_gb: 354.6,
+                           built: true }],
+             capacity: { ...CAPACITY } });
+  check("a finished deployment offers nothing to finish",
+    h.el("retryRow").hidden === true);
+  check("and is not labelled unfinished",
+    !h.el("instanceList").textContent.includes("not finished"),
+    h.el("instanceList").textContent);
 }
 
 console.log(fails === 0

@@ -282,3 +282,49 @@ def test_binding_the_database_volume_targets_the_named_volume(monkeypatch):
                           volume='takmdm-b_pgdata')
 
     assert 'takmdm-b_pgdata' in runner.text()
+
+
+# --------------------------------------------------------------------------- #
+# Threading a parameter half-way
+# --------------------------------------------------------------------------- #
+
+
+def _function_source(name):
+    """The source of one top-level function in the module."""
+    text = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
+    start = text.index(chr(10) + 'def %s(' % name) + 1
+    end = text.index(chr(10) + 'def ', start + 1)
+    return text[start:end]
+
+
+def test_every_compose_call_in_deploy_names_its_instance():
+    """⚠️ **The bug this is here for.** `deploy` resolved the instance for its
+    directory and its store and then left every `_compose` call on the default,
+    which is the plain deployment. On a box whose plain ATLAS had been
+    uninstalled, compose ran against `/root/atlas` — a directory that does not
+    exist — and answered *"no configuration file provided: not found"* after
+    three steps had already reported success.
+
+    Threading half a parameter is worse than not threading it at all: the half
+    that works hides the half that does not.
+    """
+    import re
+
+    source = _function_source('deploy')
+    # ⚠️ Whole call expressions, not lines: one of these spans four lines, and a
+    # line-based check reports the opening parenthesis as the offender — which
+    # is true but unhelpful, and would pass the moment someone reflowed it.
+    calls = re.findall(r'_compose(?:_exec)?\((?:[^()]|\([^()]*\))*\)', source)
+
+    assert calls, 'deploy no longer runs compose at all'
+    for call in calls:
+        flat = ' '.join(call.split())
+        assert 'inst=' in flat, f'this call still targets the plain deployment: {flat}'
+
+
+def test_deploy_resolves_the_instance_from_the_recorded_list():
+    """So a deploy cannot build a deployment nobody registered."""
+    source = _function_source('deploy')
+
+    assert 'load_instances(ctx)' in source
+    assert 'instance_paths(ctx, _inst)' in source
