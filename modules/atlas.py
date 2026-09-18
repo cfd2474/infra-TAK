@@ -817,6 +817,52 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
     }
 
 
+#: Every field a deployment row carries, declared rather than implied.
+#:
+#: ⚠️ **A missing one is `undefined` in the browser, not an error.** JavaScript
+#: renders it falsy and moves on, so the page said "stopped  version unknown"
+#: over a deployment that was up — for as long as it took somebody to notice and
+#: say so. A name in this list is a promise the route keeps and the page may
+#: rely on; `test_atlas_route_contract.py` holds both halves to it.
+INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
+                   'running', 'version', 'running_version', 'paths')
+
+
+def instances_payload(ctx, size_gb=None):
+    """Exactly what the deployments card needs to draw itself.
+
+    ⚠️ **`instance_status` existed and the route did not use it.** Chunk 8 wired
+    it into `detect` and `version_drift` and left `instances_view` returning the
+    bare record plus `built` — so every row rendered *"stopped  version
+    unknown"* over a deployment that was up, healthy and reachable. Measured on
+    the box 2026-09-18: `takmdm-corona-api-1` up 8 minutes, `docker inspect`
+    saying `true`, `VERSION` reading 1.47.3, and the page saying stopped.
+
+    ⚠️ **The node harness could not catch it**, and that is the lesson. It feeds
+    `renderInstances` a hand-written object carrying `running` and `version` —
+    a contract the server did not keep. A harness that invents its input tests
+    the page against a server that does not exist, so the guard for this is a
+    test that reads the page's own property accesses and checks them against
+    *this* function's output.
+    """
+    projects = compose_projects_present(ctx)
+    return {
+        'instances': [
+            dict(inst,
+                 # ⚠️ No `probe_version`: this route is polled while the page is
+                 # open, and an HTTP round-trip per deployment with a
+                 # five-second timeout would make the card slower the more
+                 # agencies a box has. The checkout's version is what the row
+                 # shows; the drift table asks the containers.
+                 **instance_status(ctx, inst, projects),
+                 paths={k: instance_paths(ctx, inst)[k]
+                        for k in ('dir', 'vhost', 'compose_project')})
+            for inst in load_instances(ctx)
+        ],
+        'capacity': capacity_facts(ctx, size_gb=size_gb),
+    }
+
+
 def caddy_sites(settings, plain_host):
     """One entry per deployment, for the console's Caddyfile generator (W216).
 
@@ -3793,24 +3839,8 @@ def register(ctx):
         """
         try:
             from flask import request as _rq
-            size = _rq.args.get('size_gb', type=float)
-            found = load_instances(ctx)
-            _projects = compose_projects_present(ctx)
-            return jsonify({
-                # ⚠️ `built` is the difference between a deployment and a
-                # record of one. A deploy that fails partway leaves the record
-                # behind — that is deliberate, so the slug and port stay claimed
-                # — but without this the page cannot tell the two apart and
-                # offers no way to finish the job.
-                'instances': [
-                    dict(i,
-                         built=instance_is_built(ctx, i, _projects),
-                         paths={k: instance_paths(ctx, i)[k]
-                                for k in ('dir', 'vhost', 'compose_project')})
-                    for i in found
-                ],
-                'capacity': capacity_facts(ctx, size_gb=size),
-            })
+            return jsonify(instances_payload(
+                ctx, size_gb=_rq.args.get('size_gb', type=float)))
         except Exception as exc:
             return jsonify({'error': str(exc)}), 500
 

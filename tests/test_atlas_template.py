@@ -623,3 +623,44 @@ def test_the_deploy_log_appears_when_the_deploy_starts(idle):
     reveal = function_body(idle, 'showDeployCard')
     assert "getElementById('deployCard')" in reveal
     assert "style.display = ''" in reveal
+
+
+# --------------------------------------------------------------------------- #
+# When the deploy log card stands down (2026-09-18)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **The condition was `deploy_log`**, which is the registry's job log and
+# stays populated until the *next* deploy starts. So a successful deployment
+# left its own log pinned to the top of the page through every refresh, above
+# the deployment it had just created. Operator: *"the logs are still on the
+# screen, even after refresh"*.
+
+
+def test_the_log_card_is_up_while_a_deploy_runs():
+    html = render(installed=False, deploy_log=['[03:14] Step 1/7'],
+                  deploy_running=True, deploy_error=False)
+
+    assert 'display:none' not in (attrs_of(html, 'deployCard') or '')
+
+
+def test_the_log_card_stays_up_after_a_failure():
+    """⚠️ Deliberately. That log is the only account of what went wrong, and it
+    has to survive the refresh an operator reaches for first."""
+    html = render(installed=False, deploy_log=['[03:14] ERROR: boom'],
+                  deploy_running=False, deploy_error=True)
+
+    assert 'display:none' not in (attrs_of(html, 'deployCard') or '')
+
+
+def test_the_log_card_steps_aside_after_a_deploy_that_worked():
+    html = render(installed=True, deploy_log=['[03:14] ✓ ATLAS deployed.'],
+                  deploy_running=False, deploy_error=False)
+
+    assert 'display:none' in (attrs_of(html, 'deployCard') or '')
+
+
+def test_a_box_that_has_never_deployed_shows_no_log_card():
+    html = render(installed=False, deploy_log=[], deploy_running=False,
+                  deploy_error=False)
+
+    assert 'display:none' in (attrs_of(html, 'deployCard') or '')
