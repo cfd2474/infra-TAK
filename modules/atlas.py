@@ -1192,6 +1192,54 @@ STORE_PG_GID = 70
 STORE_PG_VOLUME = 'takmdm_pgdata'
 
 
+def _broker_script():
+    """The privileged broker, found the way `CONFIG_DIR` is: relative to here.
+
+    `modules/atlas.py` sits one directory below the console, so the broker is
+    `../broker/takwerx_broker.py`. Returns None on a box that has none, which
+    is every root-era install.
+    """
+    console = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(console, 'broker', 'takwerx_broker.py')
+    return path if os.path.isfile(path) else None
+
+
+def _chown_priv(path, uid, gid):
+    """Give `path` to `uid:gid`. Returns an error string, or None.
+
+    ⚠️ **The PATH shim is not enough, and assuming it was cost two failed
+    deploys.** `/opt/infratak/.shims/chown` only routes arguments under
+    `/etc /opt /usr /var /run /boot /swapfile`; a path in the console's own
+    home falls straight through to `/usr/bin/chown`, which cannot give a
+    directory away. The broker itself *does* allow it — verified by calling
+    it directly — so the fix is to stop going through the shim for this.
+
+    ⚠️ **`os.chown` first, for a root-era console**, where there is no
+    broker at all and the direct call is correct.
+
+    ⚠️ There is no `ctx` seam for this yet. Upstream is already exporting
+    `ctx['_proxy_auth_secret']` after the same kind of gap; this belongs on
+    the same list, and the PR body asks for it.
+    """
+    try:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            os.chown(path, uid, gid)
+            return None
+    except OSError as exc:
+        return 'could not set ownership on %s: %s' % (path, exc)
+
+    broker = _broker_script()
+    if broker is None:
+        return ('%s must be owned by uid %d and this console is neither root '
+                'nor has a broker to ask.' % (path, uid))
+    rc, out = _run_root(
+        ['python3', broker, 'exec', '--', 'chown', '-R',
+         '%d:%d' % (uid, gid), path], timeout=120)
+    if rc != 0:
+        return 'could not set ownership on %s: %s' % (path, out.strip()[:200])
+    return None
+
+
 def _run_root(argv, timeout=120):
     """(rc, output). Runs as the console already does — root, no shell."""
     try:
@@ -2740,11 +2788,7 @@ def deploy(ctx, job, params):
         # Caddy's upstream for the second one points at the first.
         ctx['_write_priv'](
             os.path.join(dirpath, 'docker-compose.override.yml'),
-            _COMPOSE_OVERRIDE.format(app_port=_app_port,
-                                     app_uid=os.getuid() if hasattr(os, 'getuid')
-                                     else APP_UID,
-                                     app_gid=os.getgid() if hasattr(os, 'getgid')
-                                     else APP_GID),
+            _COMPOSE_OVERRIDE.format(app_port=_app_port),
         )
         plog(f'✓ .env and docker-compose.override.yml written (app on 127.0.0.1:{_app_port})')
         # ⚠️ Checked against the release that was just checked out, because a
@@ -2758,17 +2802,24 @@ def deploy(ctx, job, params):
             plog('    them, so the application will never see them. Whatever')
             plog('    they configure is not configured.')
 
-        # ⚠️ **Created, not chowned (W230).** This used to `os.chown` each
-        # directory and then walk it chowning every entry, so that the
-        # container's baked-in uid 1000 could write them. Both are `EPERM` for
-        # a non-root console — and the recursive one was unguarded, so every
-        # deploy stopped there (upstream review, item 1). The container now
-        # runs as this console's uid, so creating them is enough and they are
-        # owned by the only user that needs them.
+        # ⚠️ **Chowned through the broker, because the image's uid is not
+        # negotiable.** Running the container as the console's uid instead was
+        # tried and failed on the box: ATLAS's image is `USER takmdm` (1000)
+        # and cannot fix `/pki` itself, so the init step died with
+        # `PermissionError: /pki/ca.crt`. The ownership has to be right on the
+        # host before the container starts.
+        #
+        # ⚠️ Recursive, and that matters on a re-deploy: files the previous
+        # run left behind need the same owner, or the application can read its
+        # own CA and not renew it.
         for name in WRITABLE_DIRS:
-            os.makedirs(os.path.join(dirpath, name), exist_ok=True)
-        plog('✓ %s created (the container runs as this console, not as root)'
-             % ', '.join(WRITABLE_DIRS))
+            path = os.path.join(dirpath, name)
+            os.makedirs(path, exist_ok=True)
+            err = _chown_priv(path, APP_UID, APP_GID)
+            if err:
+                raise RuntimeError(err)
+        plog('✓ %s owned by uid %d (the container is not root)'
+             % (', '.join(WRITABLE_DIRS), APP_UID))
 
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
@@ -4166,27 +4217,15 @@ services:
   api:
     ports:
       - "127.0.0.1:{app_port}:8000"
-    # ⚠️ **The application runs as the console's own uid (W230).** The
-    # image bakes in `USER takmdm` (uid 1000), so `pki/`, `artifacts/` and
-    # `cache/` had to be chowned to 1000 on the host — three `os.chown` calls
-    # that are `EPERM` for a non-root console, and which on a cloud image
-    # handed the device CA private keys to `ubuntu` or `rocky`, the default
-    # login user (upstream review, item 5).
-    #
-    # Running as the console instead means those directories are simply owned
-    # by whoever created them, and the chowns disappear rather than moving to
-    # the broker. `user:` overrides the image's USER; the numeric form is
-    # required, because the container has no passwd entry for this uid.
-    user: "{app_uid}:{app_gid}"
 
-  # ⚠️ **The database runs as the console's uid too.** `postgres:16-alpine`
-  # is uid 70 and will not start unless it owns its data directory — which
-  # used to mean chowning that directory to 70 from the host. The console
-  # cannot do that for a path in its own home (the broker's `chown` shim only
-  # routes system paths), and widening the shim to cover `/home` would be a
-  # large grant for a small need. Running as the owner is the smaller answer.
-  db:
-    user: "{app_uid}:{app_gid}"
+  # ⚠️ **No `user:` here, and that was tried.** Running the containers as
+  # the console's own uid would have removed the host-side chown entirely,
+  # which is why it was attempted — and both images refused. Postgres could
+  # not chmod its data directory (*"initdb: could not change permissions"*)
+  # and ATLAS's image is `USER takmdm`, so its init step died with
+  # `PermissionError: /pki/ca.crt`. Each image expects to own what it writes.
+  # The ownership is therefore fixed on the host, through the broker, before
+  # anything starts.
 
   # No self-signed server certificate. Caddy holds a publicly-issued one, and a
   # local CA here would end up pinned in provisioning QRs that then fail.

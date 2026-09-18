@@ -208,16 +208,24 @@ def test_the_database_directory_is_not_chowned_at_all(box, tmp_path):
     assert 'chown' not in box.text(), box.text()
 
 
-def test_the_override_runs_both_containers_as_the_console(tmp_path):
-    """⚠️ Both services, not just the api one. The database was the service
-    that actually needed the ownership, and it was the one left out."""
-    body = atlas._COMPOSE_OVERRIDE.format(app_port=8760, app_uid=997, app_gid=997)
+def test_the_override_does_not_override_either_container_user(tmp_path):
+    """⚠️ **Tried, and both images refused.**
 
-    assert body.count('user: "997:997"') == 2, body
-    api = body.index('api:')
-    db = body.index('db:')
-    assert 'user:' in body[api:db], 'the api service has no user'
-    assert 'user:' in body[db:], 'the db service has no user'
+    Running the containers as the console's own uid would have removed the
+    host-side chown entirely. Measured on the box: Postgres could not chmod
+    its data directory (*"initdb: could not change permissions"*) and ATLAS's
+    image is `USER takmdm`, so its init step died with
+    `PermissionError: /pki/ca.crt`. Each image expects to own what it writes,
+    so the ownership is fixed on the host instead, through the broker.
+    """
+    body = atlas._COMPOSE_OVERRIDE.format(app_port=8760)
+
+    # ⚠️ A *key*, not the word. The comment above it in the template
+    # explains why there is no `user:` -- matching the prose would have this
+    # fail on the explanation for its own absence.
+    keys = [line.strip() for line in body.split(chr(10))
+            if not line.strip().startswith('#')]
+    assert not [k for k in keys if k.startswith('user:')], body
 
 
 def test_nothing_reaches_for_a_loop_device_or_a_mount(box):

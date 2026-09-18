@@ -32,6 +32,13 @@ MODULE_PATH = ROOT / 'modules' / 'atlas.py'
 SOURCE = io.open(MODULE_PATH, encoding='utf-8').read()
 TREE = ast.parse(SOURCE)
 
+#: Source with comments and docstrings removed. ⚠️ Every guard
+#: below matches against this, never against the prose: this file's own
+#: history is written in those comments, and matching them would make
+#: the guards unfailable by editing a sentence.
+STRIPPED = re.sub(r'"""[\s\S]*?"""', '',
+                  re.sub(r'#[^\n]*', '', SOURCE))
+
 
 #: Binaries the console can actually run, from `/opt/infratak/.shims` on the
 #: converted box. ⚠️ Adding a name here is a claim about that directory, not a
@@ -122,15 +129,30 @@ def test_no_retired_binary_is_named_anywhere_in_the_module():
             % (binary, hit.start(), RETIRED[binary]))
 
 
-def test_nothing_chowns_through_the_python_api():
-    """⚠️ `os.chown` is `EPERM` for a non-root console, and the recursive one
-    in `deploy` was unguarded — so every deploy stopped there. The one chown
-    that remains (Postgres's data directory, uid 70) goes through the shimmed
-    binary instead."""
-    code = re.sub(r'#[^\n]*', '', SOURCE)
-    code = re.sub(r'"""[\s\S]*?"""', '', code)
+def test_only_the_one_helper_chowns_and_it_asks_the_broker():
+    """⚠️ **`os.chown` is EPERM for a non-root console**, and the recursive
+    one in `deploy` was unguarded, so every deploy stopped there.
 
-    assert 'os.chown' not in code
+    ⚠️ It is legitimate in exactly one place: `_chown_priv` tries it first
+    for a **root-era** console, where there is no broker and the direct call
+    is correct, then falls back to asking the broker. Anywhere else is the
+    bug this guard exists for.
+
+    ⚠️ And the broker must be asked *directly*, not through the PATH shim:
+    `/opt/infratak/.shims/chown` only routes `/etc /opt /usr /var /run /boot
+    /swapfile`, so a path in the console's own home falls through to the real
+    binary. Two deploys failed on that before it was measured.
+    """
+    code = STRIPPED
+
+    helper = code[code.index('def _chown_priv('):]
+    helper = helper[:helper.index(chr(10) + 'def ')]
+
+    assert 'os.chown' in helper, 'the root-era path went missing'
+    assert code.count('os.chown') == helper.count('os.chown'), (
+        'os.chown is called outside _chown_priv')
+    assert '_broker_script' in code, (
+        'the non-root path must reach the broker, not the PATH shim')
 
 
 def test_nothing_writes_to_a_privileged_path_directly():
