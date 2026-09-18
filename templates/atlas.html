@@ -667,14 +667,42 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
       cannot be re-adopted — each needs a factory reset, in person. Other
       deployments on this box are untouched.
     </p>
-    <p class="note" style="margin-top:10px" id="removePrompt"></p>
-    <input type="text" id="removeConfirm" autocomplete="off" spellcheck="false"
-           oninput="refreshRemoveGate()">
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn btn-secondary" onclick="closeRemove()">Cancel</button>
-      <button class="btn btn-danger" id="removeGo" disabled
-              onclick="doRemove()">Remove deployment</button>
+    <div id="removeAsk">
+      <p class="note" style="margin-top:10px" id="removePrompt"></p>
+      <input type="text" id="removeConfirm" autocomplete="off" spellcheck="false"
+             oninput="refreshRemoveGate()">
+      <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-secondary" onclick="closeRemove()">Cancel</button>
+        <button class="btn btn-danger" id="removeGo" disabled
+                onclick="doRemove()">Remove deployment</button>
+      </div>
     </div>
+
+    <!--
+      ⚠️ **The dialog stays open and says it is working.** A teardown is a
+      `docker compose down -v`, three unmounts, a loop device and an `rmtree`
+      over a store — a minute or more. Closing the dialog and leaving the log to
+      appear in a card further down the page meant the only honest reading of
+      the moment after the click was that it had missed. Same answer the
+      uninstall dialog already had.
+
+      ⚠️ No Cancel here, deliberately. Once `down -v` has run there is nothing
+      to go back to, and a button that cannot do what it says is worse than no
+      button.
+    -->
+    <div id="removeBusy" hidden style="margin-top:14px">
+      <div class="spinner-row">
+        <span class="spinner"></span>
+        <span id="removeBusyText">Removing… please wait.</span>
+      </div>
+      <p class="note" style="margin-top:8px">
+        Stopping containers, releasing the store and deleting the certificate
+        authority. This page reloads itself when it is done.
+      </p>
+    </div>
+
+    <div id="removeSteps" hidden class="log-box"
+         style="height:150px;margin-top:12px"></div>
     <div id="removeError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
   </div>
 </div>
@@ -1022,6 +1050,14 @@ function openRemove(i){
   if (prompt) prompt.textContent = 'Type ' + name + ' to confirm.';
   if (field){ field.value = ''; field.placeholder = name; }
   if (err) err.style.display = 'none';
+  // ⚠️ Reset, because the dialog is reused. Opening it after a failed removal
+  // would otherwise show the previous attempt's log above a fresh prompt.
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const steps = document.getElementById('removeSteps');
+  if (ask) ask.hidden = false;
+  if (busy) busy.hidden = true;
+  if (steps){ steps.hidden = true; steps.textContent = ''; }
   refreshRemoveGate();
   document.getElementById('instanceRemoveModal').classList.add('open');
 }
@@ -1043,28 +1079,72 @@ function refreshRemoveGate(){
 
 let removePolling = false;
 
+function removeAskAgain(message){
+  // ⚠️ Back to a usable dialog. A refusal — an update running, a busy mount —
+  // has to be retryable without reopening, and the typed name is still there.
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const err = document.getElementById('removeError');
+  if (busy) busy.hidden = true;
+  if (ask) ask.hidden = false;
+  if (err && message){ err.textContent = message; err.style.display = ''; }
+  refreshRemoveGate();
+}
+
 function doRemove(){
   if (!removeTarget) return;
   const slug = removeTarget.slug || 'atlas';
   const name = removeName(removeTarget);
-  const go = document.getElementById('removeGo');
-  if (go) go.disabled = true;
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const text = document.getElementById('removeBusyText');
+  const err = document.getElementById('removeError');
+  if (err) err.style.display = 'none';
+  // The dialog stays open; the prompt gives way to the spinner.
+  if (ask) ask.hidden = true;
+  if (text) text.textContent = 'Removing ' + name + '… please wait.';
+  if (busy) busy.hidden = false;
   fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove',
         {method: 'POST', credentials: 'same-origin',
          headers: {'Content-Type': 'application/json'},
          body: JSON.stringify({confirm: name})})
     .then(function(r){ return r.json(); })
     .then(function(d){
-      if (d.error){
-        const err = document.getElementById('removeError');
-        if (err){ err.textContent = d.error; err.style.display = ''; }
-        if (go) go.disabled = false;
-        return;
-      }
-      closeRemove();
+      if (d.error){ removeAskAgain(d.error); return; }
       removePolling = slug;
       pollRemove();
-    }).catch(function(){ if (go) go.disabled = false; });
+    }).catch(function(){
+      removeAskAgain('The removal request did not reach the console.');
+    });
+}
+
+function renderRemoval(d){
+  // ⚠️ **What the dialog shows, separated from the loop that asks.** Everything
+  // here used to live inside a `.then`, which no test could reach without the
+  // request settling — three mutations survived the sweep for exactly that
+  // reason. The polling loop keeps the timing; this keeps the decision, and
+  // returns which of the three states the operator is now looking at.
+  const steps = document.getElementById('removeSteps');
+  if (steps){
+    steps.hidden = false;
+    steps.textContent = (d.entries || []).join(String.fromCharCode(10));
+    steps.scrollTop = steps.scrollHeight;
+  }
+  if (d.complete && !d.error){
+    const busy = document.getElementById('removeBusy');
+    const text = document.getElementById('removeBusyText');
+    if (text) text.textContent = 'Removed. Reloading…';
+    if (busy) busy.hidden = true;
+    return 'done';
+  }
+  // ⚠️ A failed removal does not reload, and the log stays on screen. Its
+  // record and settings are left in place deliberately so it can be retried,
+  // and that log is the only account of what is still on disk.
+  if (d.error && !d.running){
+    removeAskAgain('The removal did not finish — see the log above.');
+    return 'failed';
+  }
+  return 'running';
 }
 
 function pollRemove(){
@@ -1074,27 +1154,17 @@ function pollRemove(){
         {credentials: 'same-origin'})
     .then(function(r){ return r.json(); })
     .then(function(d){
-      const card = document.getElementById('updateCard');
-      const title = document.getElementById('updateLogTitle');
-      const box = document.getElementById('updateLog');
-      if (card) card.hidden = false;
-      // ⚠️ Says *removal*. The same card carries update logs, and a teardown
-      // shown under "update log" is how an operator comes to believe a
-      // deployment was updated when it was destroyed.
-      if (title) title.textContent = 'Removal log — ' + slug;
-      if (box){
-        box.textContent = (d.entries || []).join(String.fromCharCode(10));
-        box.scrollTop = box.scrollHeight;
-      }
-      if (d.complete && !d.error){
+      // ⚠️ In the dialog the operator is looking at, not in a card further down
+      // the page. The update-log card is for updates; a teardown shown under
+      // "update log" is how somebody comes to believe a deployment was updated
+      // when it was destroyed.
+      const outcome = renderRemoval(d);
+      if (outcome === 'done'){
         removePolling = false;
-        setTimeout(function(){ location.reload(); }, 1500);
+        setTimeout(function(){ location.reload(); }, 1800);
         return;
       }
-      // ⚠️ A failed removal does not reload. Its record and settings are left
-      // in place deliberately so it can be retried, and the log is the only
-      // place that says what is still on disk.
-      if (d.error && !d.running){ removePolling = false; return; }
+      if (outcome === 'failed'){ removePolling = false; return; }
       setTimeout(pollRemove, 2000);
     }).catch(function(){ setTimeout(pollRemove, 4000); });
 }

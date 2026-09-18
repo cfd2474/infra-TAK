@@ -664,3 +664,91 @@ def test_a_box_that_has_never_deployed_shows_no_log_card():
                   deploy_error=False)
 
     assert 'display:none' in (attrs_of(html, 'deployCard') or '')
+
+
+# --------------------------------------------------------------------------- #
+# The removal dialog's busy state (W218)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ A teardown is a `docker compose down -v`, three unmounts, a loop device and
+# an `rmtree` over a store — a minute or more. The dialog used to close on click
+# and leave the log to appear in a card further down the page, so the only
+# honest reading of the moment after the click was that it had missed. Operator:
+# *"i want the modal to show a removing placeholder that will dismiss when the
+# removal is complete"*.
+
+
+def test_the_removal_dialog_ships_a_busy_state(idle):
+    assert attrs_of(idle, "removeBusy") is not None
+    assert attrs_of(idle, "removeBusyText") is not None
+
+
+def test_it_starts_hidden(idle):
+    """The prompt is what an operator sees first; the spinner replaces it only
+    once they have committed."""
+    assert "hidden" in (attrs_of(idle, "removeBusy") or "")
+
+
+def test_the_prompt_is_a_block_that_can_stand_down(idle):
+    """⚠️ Hiding the field and the buttons *together* is what keeps a Cancel
+    button from sitting beside a running teardown — there is nothing to go back
+    to once `down -v` has run."""
+    assert attrs_of(idle, "removeAsk") is not None
+
+
+def test_the_steps_land_in_the_dialog_not_in_the_update_card(idle):
+    """⚠️ The update-log card is for updates. A teardown shown under "update
+    log" is how somebody comes to believe a deployment was updated when it was
+    destroyed."""
+    assert attrs_of(idle, "removeSteps") is not None
+    assert "log-box" in (attrs_of(idle, "removeSteps") or "")
+
+
+def test_it_promises_the_reload_it_performs(idle):
+    """⚠️ The dialog says the page reloads itself, and `pollRemove` is what
+    makes that true. A promise the code does not keep is how an operator comes
+    to sit waiting on a dialog that has finished."""
+    assert "reloads itself when it is done" in idle
+    assert "location.reload()" in idle
+
+
+def test_the_spinner_is_the_one_the_uninstall_dialog_uses(idle):
+    """The operator asked for the pattern they already know. A second spinner
+    with its own markup would drift from it."""
+    busy = idle[idle.index('id="removeBusy"'):][:600]
+
+    assert 'class="spinner-row"' in busy
+    assert 'class="spinner"' in busy
+
+
+def _js_function(html, name):
+    """The body of one top-level page function.
+
+    ⚠️ Used only for the thin `.then` bodies the node harness cannot execute —
+    the polling wiring, not the decisions. `renderRemoval` exists precisely so
+    that everything worth asserting is reachable behaviourally; these two cover
+    what is left, and both were mutations that survived.
+    """
+    start = html.index("function %s(" % name)
+    end = html.index(chr(10) + "}" + chr(10), start)
+    return html[start:end]
+
+
+def test_the_removal_dialog_is_not_closed_on_click(idle):
+    """⚠️ The operator's complaint, in one assertion. `doRemove` used to close
+    the dialog and leave the log to appear in a card further down the page, so
+    the moment after the click looked exactly like a click that had missed."""
+    body = _js_function(idle, "doRemove")
+
+    assert "closeRemove(" not in body, \
+        "doRemove closes the dialog it is supposed to keep open"
+
+
+def test_a_finished_removal_reloads_the_page(idle):
+    """⚠️ The dialog promises it — *"this page reloads itself when it is
+    done"* — and a promise the code does not keep leaves an operator waiting on
+    a dialog that has finished."""
+    body = _js_function(idle, "pollRemove")
+    done = body[body.index("'done'"):]
+
+    assert "location.reload()" in done, done[:200]

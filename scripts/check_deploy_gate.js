@@ -116,6 +116,10 @@ function harness(capacity) {
   // `polling is not defined` — which is the harness doing its job: the page
   // grew a dependency and said so.
   global.polling = false;
+  // ⚠️ A request that never settles, so the state the page shows *while* it is
+  // waiting can be asserted. That moment is the whole subject: before this, the
+  // dialog closed and the operator was left with no sign anything was happening.
+  global.fetch = () => new Promise(() => {});
 
   const ctx = {};
   // eslint-disable-next-line no-eval
@@ -125,7 +129,9 @@ function harness(capacity) {
     + "ctx.onMode = onModeChanged; ctx.preview = previewSlug;"
     + "ctx.open = openInstanceConfirm; ctx.close = closeInstanceConfirm;"
     + "ctx.openRemove = openRemove; ctx.removeGate = refreshRemoveGate;"
-    + "ctx.openName = openNameDeployment;");
+    + "ctx.openName = openNameDeployment;"
+    + "ctx.doRemove = doRemove; ctx.askAgain = removeAskAgain;"
+    + "ctx.renderRemoval = renderRemoval;");
 
   return {
     el,
@@ -133,6 +139,9 @@ function harness(capacity) {
     render: ctx.render,
     openRemove: ctx.openRemove,
     openName: ctx.openName,
+    doRemove: ctx.doRemove,
+    askAgain: ctx.askAgain,
+    renderRemoval: ctx.renderRemoval,
     typeConfirm(v) { el("removeConfirm").value = v; ctx.removeGate(); },
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
@@ -711,6 +720,145 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
   check("and says so in the title",
     h.el("nameTitle").textContent === "Name redlands",
     h.el("nameTitle").textContent);
+}
+
+// --- the removal dialog says it is working --------------------------------- //
+//
+// ⚠️ A teardown is a `docker compose down -v`, three unmounts, a loop device
+// and an `rmtree` over a store — a minute or more. The dialog used to close on
+// click and leave the log to appear in a card further down the page, so the only
+// honest reading of the moment after the click was that it had missed.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+
+  check("the prompt gives way while the removal runs",
+    h.el("removeAsk").hidden === true);
+  check("a spinner takes its place",
+    h.el("removeBusy").hidden === false);
+  check("and it names what is being removed",
+    h.el("removeBusyText").textContent === "Removing corona\u2026 please wait.",
+    h.el("removeBusyText").textContent);
+  // ⚠️ The whole point: it does not close. Asserted against the class the
+  // page actually toggles, not against `true`.
+  check("the dialog stays open",
+    h.el("instanceRemoveModal").classList.contains("open"));
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+  h.askAgain("An update is running \u2014 wait for it to finish");
+
+  check("a refusal brings the prompt back",
+    h.el("removeAsk").hidden === false && h.el("removeBusy").hidden === true);
+  check("and says why",
+    h.el("removeError").textContent.includes("An update is running"),
+    h.el("removeError").textContent);
+  // ⚠️ The typed name survives, so retrying does not mean typing it again.
+  check("with the typed name still there",
+    h.el("removeConfirm").value === "corona", h.el("removeConfirm").value);
+  check("and the button still enabled for it",
+    h.el("removeGo").disabled === false);
+}
+
+{
+  // ⚠️ The dialog is reused. Opening it after a failed removal must not show
+  // the previous attempt's log above a fresh prompt.
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+  h.el("removeSteps").hidden = false;
+  h.el("removeSteps").textContent = "[03:14] STOPPED \u2014 mounts busy";
+
+  h.openRemove(STOPPED);
+
+  check("reopening clears the last attempt",
+    h.el("removeSteps").hidden === true
+    && h.el("removeSteps").textContent === "",
+    h.el("removeSteps").textContent);
+  check("and starts from the prompt again",
+    h.el("removeAsk").hidden === false && h.el("removeBusy").hidden === true);
+}
+
+// --- and what it shows as the removal progresses --------------------------- //
+//
+// ⚠️ `renderRemoval` exists so these are reachable at all. The same logic
+// inside the poll's `.then` needed a settled request to run, and three
+// mutations survived the sweep because of it — a removal that never reloaded,
+// one that reloaded over its own failure log, and one that wrote the log into
+// the update card.
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+
+  const outcome = h.renderRemoval({
+    running: true, complete: false, error: false,
+    entries: ["[03:14] atlas-corona: containers removed"],
+  });
+
+  check("a removal in progress stays in progress", outcome === "running");
+  check("its log appears in the dialog",
+    h.el("removeSteps").hidden === false
+    && h.el("removeSteps").textContent.includes("containers removed"),
+    h.el("removeSteps").textContent);
+  check("and the spinner is still turning",
+    h.el("removeBusy").hidden === false);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+
+  const outcome = h.renderRemoval({
+    running: false, complete: true, error: false,
+    entries: ["[03:14] \u2713 atlas-corona removed."],
+  });
+
+  check("a finished removal reports done", outcome === "done");
+  check("the spinner stops", h.el("removeBusy").hidden === true);
+  check("and it says the page is reloading",
+    h.el("removeBusyText").textContent.includes("Reloading"),
+    h.el("removeBusyText").textContent);
+  check("with the steps left on screen to read",
+    h.el("removeSteps").textContent.includes("removed."),
+    h.el("removeSteps").textContent);
+}
+
+{
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.doRemove();
+
+  const outcome = h.renderRemoval({
+    running: false, complete: false, error: true,
+    entries: ["[03:14] ERROR: could not unmount"],
+  });
+
+  check("a failed removal reports failed", outcome === "failed");
+  // ⚠️ Not a reload. Its record and settings are left in place so it can be
+  // retried, and this log is the only account of what is still on disk.
+  check("the prompt comes back so it can be retried",
+    h.el("removeAsk").hidden === false && h.el("removeBusy").hidden === true);
+  check("the failure log stays on screen",
+    h.el("removeSteps").hidden === false
+    && h.el("removeSteps").textContent.includes("could not unmount"),
+    h.el("removeSteps").textContent);
+  check("and says where to look",
+    h.el("removeError").textContent.includes("see the log above"),
+    h.el("removeError").textContent);
 }
 
 console.log(fails === 0
