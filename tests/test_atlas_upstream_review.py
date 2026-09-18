@@ -267,3 +267,116 @@ def test_a_write_that_changes_nothing_is_still_False(tmp_path):
     env.write_text('K=v\n', encoding='utf-8')
 
     assert atlas.write_env_value(str(env), 'K', 'v') is False
+
+
+# --------------------------------------------------------------------------- #
+# Item 1 — a box converted from root to non-root (W230)
+# --------------------------------------------------------------------------- #
+#
+# Measured on the converted box: the console runs as `takwerx` (uid 997) from
+# /opt/infratak, `/root` is drwx------, and as that user
+# `glob('/root/atlas*/.git')` returns [] while both deployments are up and
+# serving. Every filesystem question answers as though nothing is installed.
+
+
+@pytest.fixture
+def converted(monkeypatch, tmp_path):
+    """A box whose ATLAS containers run somewhere the console cannot look."""
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'compose_projects_present',
+                        lambda c=None: {'takmdm', 'takmdm-corona'})
+    return ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+
+
+def test_containers_up_with_no_reachable_directory_is_stranded(converted):
+    """⚠️ The signature of the conversion, and the one thing the unprivileged
+    console can still ask: Docker does not care who it is."""
+    assert atlas.instance_is_stranded(None, converted) is True
+
+
+def test_stranded_is_not_the_same_as_unfinished(converted, tmp_path):
+    """⚠️ Opposite actions. Unfinished wants Deploy; stranded must never be
+    offered it, because the containers are already there."""
+    assert atlas.instance_is_built(None, converted) is False
+
+    (tmp_path / 'atlas-corona').mkdir()
+
+    assert atlas.instance_is_stranded(None, converted) is False
+    assert atlas.instance_is_built(None, converted) is True
+
+
+def test_a_deployment_with_no_containers_is_not_stranded(monkeypatch, tmp_path):
+    """A slug recorded and never built is simply not built."""
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'compose_projects_present', lambda c=None: set())
+
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+
+    assert atlas.instance_is_stranded(None, inst) is False
+
+
+def test_deploy_refuses_to_build_a_second_copy(converted, monkeypatch):
+    """⚠️ **The foot-gun this exists for.** Without it the deploy proceeds and
+    builds under the home with the same compose project, the same ports and
+    the same database volume name as the deployment still serving."""
+    monkeypatch.setattr(atlas, 'load_instances', lambda c: [converted])
+    monkeypatch.setattr(atlas, '_plog', lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError) as refused:
+        atlas.deploy({}, None, {'slug': 'corona'})
+
+    said = str(refused.value)
+    assert 'cannot reach its files' in said
+    assert 'second copy' in said
+
+
+def test_deploy_still_works_where_nothing_is_stranded(monkeypatch, tmp_path):
+    """The refusal must not block an ordinary deploy."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'compose_projects_present', lambda c=None: set())
+    monkeypatch.setattr(atlas, 'load_instances', lambda c: [inst])
+    monkeypatch.setattr(atlas, '_plog', lambda *a, **k: None)
+
+    with pytest.raises(Exception) as stopped:
+        atlas.deploy({}, None, {'slug': 'corona'})
+
+    assert 'cannot reach its files' not in str(stopped.value)
+
+
+def test_the_row_carries_stranded_so_the_page_can_say_so(converted, monkeypatch):
+    """⚠️ Declared in INSTANCE_FIELDS, so the page may rely on it. Absent, it
+    is `undefined` in the browser — falsy, and the row would read as a
+    deployment that was never finished."""
+    monkeypatch.setattr(atlas, '_installed_version', lambda c, i=None: None)
+
+    row = atlas.instance_status({'probe_run': lambda *a, **k: None}, converted)
+
+    assert row['stranded'] is True
+    assert 'stranded' in atlas.INSTANCE_FIELDS
+
+
+def test_the_install_base_answers_the_home_when_root_is_unreadable(monkeypatch):
+    """⚠️ Right answer for anything new, and deliberately not an attempt to
+    tell "empty" from "not allowed to look" — that question is answered by
+    Docker instead. `expanduser` reads HOME, which the console's environment
+    sets to /home/takwerx even though passwd says /nonexistent."""
+    monkeypatch.setattr(atlas, '_glob', lambda pattern: [])
+    # ⚠️ `expanduser` is patched rather than `HOME`, because on Windows it
+    # reads `USERPROFILE` and the assertion would be about this machine instead
+    # of about the module. What is being pinned is "install_base answers the
+    # home"; which environment variable supplies it is the platform's business.
+    monkeypatch.setattr(atlas.os.path, 'expanduser',
+                        lambda p: '/home/takwerx' if p == '~' else p)
+
+    assert atlas.install_base(None) == '/home/takwerx'
+
+
+def test_a_root_era_box_still_resolves_to_root(monkeypatch):
+    """The other half: a box that has not been converted must not move."""
+    monkeypatch.setattr(atlas, '_glob', lambda pattern: ['/root/atlas/.git'])
+
+    assert atlas.install_base(None) == '/root'

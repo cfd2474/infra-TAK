@@ -789,7 +789,12 @@ function renderInstances(data){
   // ⚠️ A deployment that never finished needs a way forward. Without this the
   // only route was to re-create it, and the form refuses the slug as a
   // duplicate — leaving the operator with a claimed name and no button.
-  const unfinished = (data.instances || []).filter(i => !i.built);
+  // ⚠️ A stranded deployment is **not** unfinished, and must not be offered
+  // the finish-deploying button. Its containers are up; that button would
+  // build a second copy with the same compose project, ports and database
+  // volume. The module refuses it server-side too — this keeps the operator
+  // from meeting that refusal without knowing why.
+  const unfinished = (data.instances || []).filter(i => !i.built && !i.stranded);
   const retry = document.getElementById('retryRow');
   if (retry){
     retry.hidden = unfinished.length === 0 || polling;
@@ -890,6 +895,12 @@ function renderInstances(data){
 }
 
 function stateLabel(i){
+  // ⚠️ Four states now. "Stranded" is containers up with the files out of
+  // reach — what a box converted from a root install to a non-root one looks
+  // like. It must not read as "not finished", because the action that state
+  // offers is Deploy, and deploying would build a second copy of something
+  // already serving.
+  if (i.stranded) return 'running, but this console cannot reach its files';
   // ⚠️ Three states, not two. "Stopped" and "never finished" both mean "not
   // serving" and need opposite actions — start it, or deploy it — so a page
   // that collapsed them would offer the wrong button for the one an operator

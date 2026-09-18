@@ -1024,6 +1024,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
     """
     names = atlas_instances.derive(inst)
     built = instance_is_built(ctx, inst, projects)
+    # ⚠️ Asked with the same project set, so one docker call answers both.
+    stranded = instance_is_stranded(ctx, inst, projects)
     running = False
     if built:
         try:
@@ -1043,6 +1045,10 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
         'port': names['port'],
         'built': built,
         'running': running,
+        # ⚠️ **Containers up, files unreachable.** Without this the row reads
+        # "not deployed" over a deployment that is serving, and the only
+        # control offered is the one that would build a second copy of it.
+        'stranded': stranded,
         # ⚠️ Both versions, when asked. They agree on a healthy deployment;
         # when they do not, the running one is the truth and the difference is a
         # rebuild that did not take.
@@ -1064,8 +1070,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
 #: say so. A name in this list is a promise the route keeps and the page may
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
-                   'running', 'version', 'running_version', 'agency_name',
-                   'latest', 'update_available', 'paths')
+                   'running', 'stranded', 'version', 'running_version',
+                   'agency_name', 'latest', 'update_available', 'paths')
 
 
 def update_available_for(installed, latest):
@@ -2427,11 +2433,50 @@ def install_base(ctx=None):
     settles it, which is why the glob is wider than the plain instance: a box
     holding only agency deployments must still resolve to `/root`.
 
-    For the box deployed today this returns `/root`, exactly as before.
+    ⚠️ **On a converted box the probe cannot tell "empty" from "not allowed
+    to look", and it must not have to.** `/root` is `drwx------`; measured as
+    `takwerx`, the glob returns `[]` and `os.path.isdir('/root/atlas-corona')`
+    is `False` while both deployments are up and serving. So this answers the
+    home — which is right for anything *new* — and the question "is something
+    already running somewhere I cannot reach" is answered separately by
+    [stranded_deployments], which asks Docker instead of the filesystem.
+    Without that split, a box converted from root reads as having no ATLAS at
+    all and the next deploy builds a second one on top of the first.
+
+    ⚠️ **`expanduser` reads `HOME`, not passwd, and that is what makes this
+    work.** The console user's passwd home is `/nonexistent`; its *environment*
+    carries `HOME=/home/takwerx`, which is also the convention every other
+    module follows on disk and the one the broker allowlists.
     """
     if _glob(posixpath.join('/root', KEY + '*', '.git')):
         return '/root'
     return os.path.expanduser('~')
+
+
+def instance_is_stranded(ctx, inst, projects=None):
+    """Containers running, and the console cannot reach their directory.
+
+    ⚠️ **The signature of a box converted from root to non-root.** The
+    deployment keeps serving — Docker does not care who the console is — while
+    `/root/atlas-*` becomes unreadable to it. Every filesystem question then
+    answers as though nothing is installed, which is the dangerous reading:
+    `instance_is_built` says False, the page offers to deploy, and the deploy
+    would build a second copy under the home with the same compose project,
+    the same ports and the same database volume name as the one still running.
+
+    Docker is the authority here precisely because it is the one thing the
+    unprivileged console can still ask.
+    """
+    paths = instance_paths(ctx, inst)
+    known = projects if projects is not None else compose_projects_present(ctx)
+    return paths['compose_project'] in known and not os.path.isdir(paths['dir'])
+
+
+def stranded_deployments(ctx):
+    """Every recorded deployment whose containers we can see and files we cannot."""
+    projects = compose_projects_present(ctx)
+    return [inst for inst in load_instances(ctx)
+            if instance_is_stranded(ctx, inst, projects)]
 
 
 def atlas_dir(ctx=None):
@@ -2778,6 +2823,24 @@ def deploy(ctx, job, params):
             'No deployment is registered with the slug "%s". Refusing to '
             'deploy: an unrecognised slug would otherwise build over the '
             'plain deployment.' % _requested_slug)
+
+    # ⚠️ **Refusing to build a second copy of something already running.**
+    # On a box converted from root to non-root the console loses access to
+    # `/root/atlas-*` while those containers keep serving. Every filesystem
+    # question then answers "nothing installed", so without this the deploy
+    # proceeds and builds under the home with the *same* compose project, the
+    # same ports and the same database volume name as the deployment still
+    # running — two ATLAS instances fighting over one identity, and the
+    # operator's first sign of it is whichever one loses.
+    if instance_is_stranded(ctx, _inst):
+        _me_name = atlas_instances.derive(_inst)['name']
+        raise RuntimeError(
+            '%s is already running on this box, but the console cannot reach '
+            'its files — which is what a conversion from a root install to a '
+            'non-root one looks like. Refusing to deploy: it would build a '
+            'second copy with the same compose project, ports and database '
+            'volume as the one still serving. Move the deployment under the '
+            "console's home first." % _me_name)
     # ⚠️ Resolved once, before anything is written. Every value below was a
     # module constant that quietly meant "the plain deployment". A deploy that
     # builds in the right directory and then configures itself with another
