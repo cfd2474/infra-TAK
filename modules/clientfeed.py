@@ -61,6 +61,12 @@ STORE_NAME = 'clientfeed.json'
 
 # Fleet-uniform constants — no per-customer knobs (CLAUDE.md fleet-uniform config).
 DEFAULT_STALE_MINUTES = 5          # matches Tablet Command's own AVL stale concept
+# The service name in the Esri layout (/feed/<token>/rest/services/<name>/FeatureServer).
+# ArcGIS Online classifies a service from its URL before reading the payload and rejects the
+# short /feed/<token>/FeatureServer form with 'This service type is not supported'
+# (2026-09-17 on test6, 2026-09-18 on CORAZ with the URL the console itself handed out).
+# Any name works server-side; this one is what AGOL shows as the layer name.
+ESRI_SERVICE_NAME = 'TAKClients'
 MAX_STALE_MINUTES = 60
 SNAPSHOT_CACHE_TTL = 15            # seconds; N tokens on one channel set = 1 query
 MAX_RECORD_COUNT = 2000
@@ -909,7 +915,8 @@ def register(ctx):
                      'label=%s channels=%s' % (entry['label'], ','.join(channels)),
                      force=True)
         return jsonify({'success': True, 'id': entry['id'], 'token': secret,
-                        'path': '/feed/%s/FeatureServer' % secret})
+                        'path': '/feed/%s/FeatureServer' % secret,
+                        'esri_path': '/feed/%s/rest/services/%s/FeatureServer' % (secret, ESRI_SERVICE_NAME)})
 
     def revoke_view():
         d = request.get_json(silent=True) or {}
@@ -956,7 +963,8 @@ def register(ctx):
                                                       entry.get('rotations')),
                      force=True)
         return jsonify({'success': True, 'id': entry['id'], 'token': secret,
-                        'path': '/feed/%s/FeatureServer' % secret})
+                        'path': '/feed/%s/FeatureServer' % secret,
+                        'esri_path': '/feed/%s/rest/services/%s/FeatureServer' % (secret, ESRI_SERVICE_NAME)})
 
     def preview_view():
         """What a given token currently returns — so the operator can see the
