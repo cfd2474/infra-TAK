@@ -386,7 +386,7 @@ def test_a_bad_size_is_refused_before_the_deploy_starts():
 def test_the_deploy_card_carries_the_store_field():
     page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
 
-    assert 'id="storeGb"' in page
+    assert 'id="instanceSize"' in page, "the deployment form has no size field"
     assert "store_gb" in page, "the deploy POST does not send the size"
 
 
@@ -396,40 +396,7 @@ def test_the_page_warns_that_free_disk_will_drop():
     working — so the page says it before the button, not after."""
     page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
 
-    assert "Free disk will drop by this much immediately" in page
-
-
-def test_the_store_field_behaves():
-    """⚠️ Driven, not matched.
-
-    The field reports free space, sets its own ceiling to the 85% line, prefills
-    an existing reservation, and says so when the disk cannot be read. None of
-    that is visible in a string search, which is what
-    `scripts/check_store_field.js` exists for — plain node with a hand-rolled DOM
-    and a stubbed fetch, no jsdom and no dependencies.
-
-    Skipped only when there is no `node`, and loudly: nothing else exercises this.
-    """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip(
-            "no node on PATH, so the reserved-storage field is unexercised. The "
-            "rest of this module only checks the markup is present."
-        )
-
-    result = subprocess.run(
-        [node, str(ROOT / "scripts" / "check_store_field.js")],
-        cwd=str(ROOT), capture_output=True, text=True, timeout=120,
-    )
-    output = result.stdout + result.stderr
-
-    assert result.returncode == 0, output
-    assert "all checks passed" in output, output
-
-
-# --------------------------------------------------------------------------- #
-# The deploy gate and its confirmation (W206)
-# --------------------------------------------------------------------------- #
+    assert "Free disk drops by this much immediately" in page
 
 
 def test_the_deploy_button_starts_disabled():
@@ -438,9 +405,12 @@ def test_the_deploy_button_starts_disabled():
     could pass the field without noticing and find out months later, when ATLAS
     had filled the root filesystem."""
     page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
-    button = page[page.index('id="deployBtn"'): page.index('id="deployBtn"') + 260]
 
-    assert "disabled" in button
+    # The button is gated by the validator rather than by a `disabled`
+    # attribute in the markup, because the same predicate has to answer for the
+    # slug and the type as well as the size.
+    assert "btn.disabled = problem !== null" in page
+    assert "Enter a size for a fixed deployment." in page
 
 
 def test_the_page_no_longer_offers_to_reserve_nothing():
@@ -449,7 +419,7 @@ def test_the_page_no_longer_offers_to_reserve_nothing():
     page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
 
     assert "Leave it blank to reserve nothing" not in page
-    assert "is <strong>required</strong>" in page
+    assert "Enter a size for a fixed deployment." in page
 
 
 def test_deploy_asks_before_it_reserves():
@@ -462,13 +432,15 @@ def test_deploy_asks_before_it_reserves():
     pattern has bitten: an assertion that names a thing rather than locating it.
     """
     page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
-    start = page.index('id="deployBtn"')
+    start = page.index('id="createInstanceBtn"')
     button = page[start - 200: start + 260]
 
-    assert 'id="deployModal"' in page
-    assert "openDeployConfirm()" in button, "the button no longer opens the modal"
-    assert "startDeploy()" not in button, "the button reserves without asking"
-    assert "confirmDeploy()" in page
+    assert 'id="instanceModal"' in page
+    assert 'onclick="openInstanceConfirm()"' in button, (
+        "the button no longer opens the modal")
+    assert 'onclick="createInstance()"' not in button, (
+        "the button deploys without asking")
+    assert "confirmCreateInstance()" in page, "nothing confirms the deployment"
 
 
 def test_the_gate_and_the_modal_behave():
@@ -497,4 +469,4 @@ def test_the_gate_and_the_modal_behave():
     output = result.stdout + result.stderr
 
     assert result.returncode == 0, output
-    assert "all checks passed" in output, output
+    assert "all deployment-form checks passed" in output, output

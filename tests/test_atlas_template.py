@@ -140,18 +140,18 @@ def function_body(js, name):
 def test_a_refused_deploy_restores_the_install_card(idle):
     """The server said no — the operator needs the field back to correct it."""
     refusal = re.search(r"if \(d\.error\) \{([^}]*)\}",
-                        function_body(idle, "startDeploy"))
+                        function_body(idle, "startDeployFor"))
 
-    assert refusal, "startDeploy has no refusal branch"
+    assert refusal, "startDeployFor has no refusal branch"
     assert "setInstallCard(true)" in refusal.group(1)
 
 
 def test_a_network_failure_restores_the_install_card(idle):
     """The request never landed, so nothing is running and nothing is hidden."""
     caught = re.search(r"\.catch\(\(\) => \{([^}]*)\}\)",
-                       function_body(idle, "startDeploy"))
+                       function_body(idle, "startDeployFor"))
 
-    assert caught, "startDeploy does not handle a failed request"
+    assert caught, "startDeployFor does not handle a failed request"
     assert "setInstallCard(true)" in caught.group(1)
 
 
@@ -241,14 +241,14 @@ def test_a_failed_deploy_stops_promising_a_refresh(idle):
 
 def test_a_refused_deploy_stops_promising_a_refresh(idle):
     refusal = re.search(r"if \(d\.error\) \{([^}]*)\}",
-                        function_body(idle, "startDeploy"))
+                        function_body(idle, "startDeployFor"))
 
-    assert refusal, "startDeploy has no refusal branch"
+    assert refusal, "startDeployFor has no refusal branch"
     assert "setDeployNote(false)" in refusal.group(1)
 
 
 def test_an_accepted_deploy_puts_the_note_up(idle):
-    body = function_body(idle, "startDeploy")
+    body = function_body(idle, "startDeployFor")
 
     assert "setDeployNote(true)" in body, (
         "the note never appears for a deploy started from this page"

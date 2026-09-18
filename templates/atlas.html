@@ -66,6 +66,12 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       ⏳ Leave this page open — it refreshes itself once ATLAS has deployed.
     </p>
     <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+    <!--
+      ⚠️ The failure banner lives with the log now. It used to sit on the Install
+      card, which was retired when the two deploy paths merged — and `pollDeploy`
+      still reveals it, so leaving it out made a failed deploy silent.
+    -->
+    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log above.</div>
   </div>
 
   <!--
@@ -197,53 +203,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       ⏳ The first deploy clones the repository and builds images — allow 5–10 minutes.
     </p>
 
-    <!--
-      Reserved storage (W205).
 
-      ⚠️ The numbers are fetched, never rendered once. Free space changes as
-      other modules grow, and a ceiling baked into the page at load would offer
-      an operator space that has since gone — they would then be refused by a
-      validator quoting a different figure than the line above the box.
-    -->
-    <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
-      <label for="storeGb" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
-        Reserved storage
-      </label>
-      <p class="note" id="storeHelp" style="margin:0 0 8px">Reading this box&hellip;</p>
-      <input type="number" id="storeGb" min="2" step="1" placeholder="e.g. 40"
-             style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
-      <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
-      <p class="note" style="margin:10px 0 0">
-        ATLAS keeps its uploads, its caches and its database inside this space and
-        cannot exceed it. The space is claimed up front, so nothing else on the
-        box can take it.
-      </p>
-      <p class="note" style="margin:6px 0 0">
-        ⚠️ <strong>Free disk will drop by this much immediately</strong> — that
-        is the reservation working, not a leak. A size is <strong>required</strong>:
-        ATLAS will not deploy without one.
-      </p>
-      <p class="note" id="storeState" style="margin:6px 0 0;display:none"></p>
-    </div>
-
-    <!--
-      ⚠️ **Disabled until the store size is a number this box can honour.**
-      Deploying without one used to be allowed and meant "share the disk as
-      before" — an operator could pass the field without noticing it, and find
-      out months later when ATLAS had filled the root filesystem. The size is
-      required now, so the button waits for it.
-
-      Disabled for a value that is *out of range* too, not only for a blank one.
-      The server refuses those before the deploy starts, so allowing the click
-      would trade a greyed-out button for a red banner — and the reason sits
-      beside the button either way.
-    -->
-    <button class="btn btn-primary" id="deployBtn" onclick="openDeployConfirm()"
-            style="margin-top:16px" disabled>Deploy ATLAS</button>
-    <p class="note" id="deployGate" style="margin:8px 0 0">
-      Enter a reserved storage size above to enable this.
-    </p>
-    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log above.</div>
   </div>
 
   <!--
@@ -595,25 +555,6 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
   here, in the operator's own units, after they have typed it and before
   anything is allocated.
 -->
-<div class="modal-overlay" id="deployModal">
-  <div class="modal">
-    <h3>Deploy ATLAS</h3>
-    <p class="note">
-      ATLAS will reserve <strong id="deployConfirmSize">—</strong> of this box&rsquo;s
-      disk for its uploads, caches and database.
-    </p>
-    <p class="note" style="margin-top:10px">
-      ⚠️ <strong>Free disk drops by this much straight away.</strong> The space
-      is claimed up front so nothing else on the box can take it — that is what
-      makes it a reservation rather than a limit.
-    </p>
-    <p class="note" id="deployConfirmRoom" style="margin-top:10px"></p>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn btn-secondary" onclick="closeDeployConfirm()">Cancel</button>
-      <button class="btn btn-primary" onclick="confirmDeploy()">Reserve &amp; deploy</button>
-    </div>
-  </div>
-</div>
 
 <!--
   ⚠️ The summary an operator approves before anything is built. Same shape as
@@ -672,105 +613,10 @@ cd /root/atlas &amp;&amp; docker compose up -d api</div>
 <script>
 let polling = false;
 
-// Reserved storage (W205): the box's real numbers, read live.
-function loadStoreFacts(){
-  const help = document.getElementById('storeHelp');
-  const state = document.getElementById('storeState');
-  const field = document.getElementById('storeGb');
-  if (!help || !field) return;
-  fetch('/api/atlas/store', {credentials: 'same-origin'})
-    .then(r => r.json())
-    .then(d => {
-      if (d.error) { help.textContent = 'Could not read this box\u2019s disk.'; return; }
-      // \u26a0\ufe0f max is the 85% line, not the disk. The field refuses above it
-      // for the same reason the server does - and the server still checks,
-      // because a number typed past a browser control is not a validation.
-      field.max = d.max_gb;
-      field.min = d.min_gb;
-      storeLimits = {min: d.min_gb, max: d.max_gb, free: d.disk_free_gb};
-      help.textContent = d.disk_free_gb + ' GB free on this box \u00b7 at most '
-        + d.max_gb + ' GB may be reserved (85%).';
-      if (d.mounted) {
-        state.style.display = '';
-        state.innerHTML = '\u2713 Reserved: <strong>' + d.usable_gb + ' GB</strong> usable, '
-          + d.used_gb + ' GB in use.';
-        if (!field.value) field.value = d.reserved_gb;
-      }
-      // \u26a0\ufe0f After the numbers land, not before. The gate runs once at page
-      // load with no limits known, and a prefilled reservation arrives later -
-      // without this the button stays greyed out on a box that already has a
-      // store, which reads as the page being broken.
-      refreshDeployGate();
-    })
-    .catch(() => { help.textContent = 'Could not read this box\u2019s disk.'; });
-}
-loadStoreFacts();
-
-// \u26a0\ufe0f The ceiling and floor the field was given by loadStoreFacts. Held here
-// so the gate can explain a refusal in the same words the server would, rather
-// than greying the button out for a reason nobody can see.
-let storeLimits = {min: 2, max: null};
-
-function storeSizeProblem(){
-  const field = document.getElementById('storeGb');
-  if (!field) return null;
-  const raw = (field.value || '').trim();
-  if (raw === '') return 'Enter a reserved storage size above to enable this.';
-  const gb = Number(raw);
-  if (!isFinite(gb)) return 'Reserved storage must be a number of gigabytes.';
-  if (gb < storeLimits.min){
-    return 'Reserve at least ' + storeLimits.min + ' GB \u2014 ATLAS ships about 570 MB '
-      + 'of applications and indexes before anything is uploaded.';
-  }
-  if (storeLimits.max !== null && gb > storeLimits.max){
-    return 'This box can offer at most ' + storeLimits.max + ' GB (85% of what is free).';
-  }
-  return null;
-}
-
-// \u26a0\ufe0f Disabled is not a security control - the server validates the same
-// number again before it allocates anything. This exists so the operator is
-// told now rather than after a deploy starts and stops.
-function refreshDeployGate(){
-  const btn = document.getElementById('deployBtn');
-  const note = document.getElementById('deployGate');
-  if (!btn) return;
-  const problem = storeSizeProblem();
-  btn.disabled = problem !== null;
-  if (note){
-    note.textContent = problem || '';
-    note.style.display = problem ? '' : 'none';
-  }
-}
-
-document.addEventListener('input', function(e){
-  if (e.target && e.target.id === 'storeGb') refreshDeployGate();
-});
-refreshDeployGate();
-
-function openDeployConfirm(){
-  if (storeSizeProblem() !== null) return;   // the button should already be off
-  const gb = Number(document.getElementById('storeGb').value);
-  document.getElementById('deployConfirmSize').textContent = gb + ' GB';
-  const room = document.getElementById('deployConfirmRoom');
-  if (room && storeLimits.free !== undefined && storeLimits.free !== null){
-    const left = Math.round((storeLimits.free - gb) * 10) / 10;
-    room.textContent = 'This box has ' + storeLimits.free + ' GB free; '
-      + left + ' GB will remain for everything else.';
-  } else if (room){
-    room.textContent = '';
-  }
-  document.getElementById('deployModal').classList.add('open');
-}
-
-function closeDeployConfirm(){
-  document.getElementById('deployModal').classList.remove('open');
-}
-
-function confirmDeploy(){
-  closeDeployConfirm();
-  startDeploy();
-}
+// ⚠️ The box's storage numbers are no longer fetched here. They arrive with
+// `capacity_facts` on `/api/atlas/instances`, which the one remaining
+// deployment form already reads — a second fetch of the same figures is a
+// second place for them to disagree.
 
 // The Install card stands down while a deploy runs: nothing on it can be acted
 // on, and the log above it is the only thing worth the screen.
@@ -888,6 +734,19 @@ function addInstanceProblem(){
     const size = document.getElementById('instanceSize');
     if (!size || size.value === '' || Number(size.value) <= 0)
       return 'Enter a size for a fixed deployment.';
+    // ⚠️ The bounds the retired Install card enforced, carried across rather
+    // than dropped when the two paths merged. A deployment under the floor
+    // fills before it is useful — ATLAS ships about 570 MB of applications and
+    // indexes before anything is uploaded — and one over the ceiling would take
+    // the disk the rest of the box needs.
+    const gb = Number(size.value);
+    const min = capacityState && capacityState.min_gb;
+    const max = capacityState && capacityState.max_gb;
+    if (min && gb < min)
+      return 'Reserve at least ' + min + ' GB — ATLAS ships about 570 MB of '
+        + 'applications and indexes before anything is uploaded.';
+    if (max && gb > max)
+      return 'This box can offer at most ' + max + ' GB (85% of what is free).';
   }
   return null;
 }
@@ -1024,26 +883,6 @@ function startDeployFor(inst){
   }).catch(() => { setInstallCard(true); setDeployNote(false); });
 }
 
-function startDeploy(){
-  const btn = document.getElementById('deployBtn');
-  const field = document.getElementById('storeGb');
-  const body = {};
-  if (field && field.value !== '') body.store_gb = field.value;
-  btn.disabled = true;
-  fetch('/api/atlas/deploy', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-    credentials: 'same-origin'
-  }).then(r => r.json()).then(d => {
-    // ⚠️ Hidden only once the deploy is actually accepted, never on the click.
-    // Doing it up front blanks the card for a request the server then refuses.
-    if (d.error) { btn.disabled = false; setInstallCard(true); setDeployNote(false); alert(d.error); return; }
-    setInstallCard(false);
-    setDeployNote(true);
-    polling = true; pollDeploy();
-  }).catch(() => { btn.disabled = false; setInstallCard(true); setDeployNote(false); });
-}
 
 function renderLog(entries){
   const card = document.getElementById('deployCard');

@@ -642,6 +642,12 @@ def capacity_facts(ctx, size_gb=None):
         'dynamic_instances': dynamic,
         'reserved_gb': round(reserved / gb, 1),
         'floor_gb': atlas_instances.DEFAULT_FLOOR_GB,
+        # ⚠️ The bounds the single-instance card used to enforce, carried
+        # across rather than dropped when the two paths merged: a floor
+        # because ATLAS ships ~570 MB before anything is uploaded, and the
+        # 85% ceiling so a reservation cannot take the whole disk.
+        'min_gb': int(STORE_MIN_BYTES / gb),
+        'max_gb': round(store_ceiling_bytes(free, 0) / gb, 1),
         'disk_free_gb': round(free / gb, 1),
         'ram_total_gb': round(ram_total / gb, 1),
         'ram_available_gb': round(ram_available / gb, 1),
