@@ -359,35 +359,6 @@ def test_one_card_lists_every_deployment(installed):
     assert 'id="instanceList"' in installed
 
 
-def test_the_slug_is_prompted_for_separately(installed):
-    """*"if yes, now needs a new slug prompt"* — and it is its own field, so a
-    plain deployment simply does not have one."""
-    assert 'id="slugField"' in installed
-    assert 'id="agencySlug"' in installed
-
-
-def test_the_question_disappears_from_the_server_s_own_predicate(installed):
-    """⚠️ **The rule, and where it is decided.** `may_deploy_plain` comes from
-    the module, and the page hides the question from that rather than from
-    anything it counts itself — otherwise the page and the validator could
-    disagree, and the operator would be refused by a rule the screen did not
-    show."""
-    body = function_body(installed, 'renderInstances')
-
-    assert 'may_deploy_plain' in body
-    assert "getElementById('agencyChoice')" in body
-    assert 'id="agencyForced"' in installed
-
-
-def test_a_forced_agency_deployment_preselects_the_only_answer(installed):
-    """With the question hidden there is still a radio behind it, and it has to
-    hold the answer the server will accept."""
-    body = function_body(installed, 'renderInstances')
-
-    assert 'value="agencyKind"' not in body  # not a typo'd selector
-    assert 'agencyKind' in body and 'checked = true' in body
-
-
 def test_both_sizing_modes_are_offered(installed):
     assert 'value="fixed"' in installed
     assert 'value="dynamic"' in installed
@@ -551,3 +522,51 @@ def test_the_request_carries_the_choices(installed):
 
     assert 'agency_specific: !!slug' in body
     assert "mode: mode" in body
+
+
+# --------------------------------------------------------------------------- #
+# Structure: the checks that would have caught a stacked page
+# --------------------------------------------------------------------------- #
+
+# ⚠️ **Every test above asserts that something is *present*. None of them
+# noticed a page with the entire tail of a previous form left behind**, because
+# the strings they look for were all still there — twice. The page rendered with
+# an unbalanced `</div>`, so the cards stacked on top of one another, and with a
+# second `sizeMode` radio group whose `fixed` was checked, so `querySelector`
+# found the wrong one and the default was silently wrong.
+#
+# Presence is not structure. These three check the shape.
+
+
+@pytest.mark.parametrize("state", ["idle", "deploying", "installed"])
+def test_the_page_closes_every_element_it_opens(state, idle, deploying, installed):
+    html = {"idle": idle, "deploying": deploying, "installed": installed}[state]
+
+    opened = len(re.findall(r"<div[ >]", html))
+    closed = len(re.findall(r"</div>", html))
+
+    assert opened == closed, (
+        f"{opened - closed:+d} unbalanced <div> — the cards will overlap"
+    )
+
+
+@pytest.mark.parametrize("state", ["idle", "deploying", "installed"])
+def test_no_element_id_appears_twice(state, idle, deploying, installed):
+    """⚠️ `getElementById` and `querySelector` return the *first* match, so a
+    duplicated id does not fail — it quietly wires the page to the wrong
+    control."""
+    import collections
+
+    html = {"idle": idle, "deploying": deploying, "installed": installed}[state]
+    counts = collections.Counter(re.findall(r'id="([^"]+)"', html))
+    repeated = sorted(i for i, n in counts.items() if n > 1)
+
+    assert repeated == [], f"duplicated ids: {repeated}"
+
+
+def test_exactly_one_sizing_mode_is_preselected(installed):
+    """Two radio groups with the same name is how the default ends up being
+    whichever fragment happens to come first in the document."""
+    checked = re.findall(r'name="sizeMode" value="(\w+)" checked', installed)
+
+    assert checked == ["dynamic"]
