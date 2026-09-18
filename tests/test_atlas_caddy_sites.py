@@ -206,6 +206,14 @@ def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     written = {}
     ctx = {'_write_priv': lambda path, body, **k: written.update(
         {'path': path, 'body': body})}
+    # ⚠️ Recorded rather than run. The broker's `write` does NOT create
+    # parent directories -- measured against the live broker, a write to a
+    # missing parent returns FileNotFoundError -- so the module makes the
+    # directory first. Letting the real `mkdir` run here would make this test
+    # depend on the host having a POSIX one.
+    ran = []
+    monkeypatch.setattr(atlas, '_run_root',
+                        lambda argv, timeout=120: (ran.append(argv), (0, ''))[1])
 
     dest = atlas.sync_device_ca_for_caddy(
         ai.make('agencya', ai.MODE_FIXED, 50, 8761), ctx)
@@ -213,6 +221,24 @@ def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     assert dest.endswith('atlas-agencya/device-ca.crt'), dest
     assert written['path'] == dest
     assert 'BEGIN CERTIFICATE' in written['body']
+    assert ['mkdir', '-p', posix(tmp_path / 'caddy' / 'atlas-agencya')] in ran, ran
+
+
+def test_the_ca_is_not_staged_when_its_directory_cannot_be_made(monkeypatch, tmp_path):
+    """⚠️ **The failure that cost a deploy.** The comment here used to claim
+    `_write_priv` creates the parent; it does not, and nothing else did once
+    the old `os.makedirs` was removed. A staging that cannot happen must
+    report None so `deploy` refuses -- not write into nowhere."""
+    src = tmp_path / 'atlas' / 'pki'
+    src.mkdir(parents=True)
+    (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----', encoding='utf-8')
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: posix(tmp_path))
+    monkeypatch.setattr(atlas, 'caddy_base', lambda: posix(tmp_path / 'caddy'))
+    monkeypatch.setattr(atlas, '_run_root',
+                        lambda argv, timeout=120: (1, 'Permission denied'))
+
+    assert atlas.sync_device_ca_for_caddy(
+        None, {'_write_priv': lambda *a, **k: None}) is None
 
 
 def test_the_ca_is_not_written_without_a_privileged_writer(monkeypatch, tmp_path):

@@ -3154,6 +3154,22 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
         # devices against another agency's CA.
         dest = device_ca_path(inst)
         body = chr(10).join(bundle_parts) + chr(10)
+        # ⚠️ **The broker's `write` does not create parent directories, and
+        # assuming it did cost a deploy.** The comment here used to say "and
+        # it creates the parent" — that was never checked. Measured against
+        # the live broker: a write to a missing parent returns
+        # `FileNotFoundError`, and a write into an existing directory
+        # succeeds. The `os.makedirs` this replaced was removed at the same
+        # time as the switch to `_write_priv`, so nothing created it at all.
+        #
+        # `mkdir` is shimmed *and* `/var/lib/...` is one of the prefixes the
+        # shim routes, so this one genuinely does reach the broker through
+        # PATH — unlike a path in the console's own home.
+        rc, out = _run_root(['mkdir', '-p', os.path.dirname(dest)])
+        if rc != 0:
+            print('[' + KEY + '] could not create ' + os.path.dirname(dest)
+                  + ': ' + out.strip()[:200], flush=True)
+            return None
         # ⚠️ **Through the broker (W230).** `/var/lib/caddy` is not the
         # console's to write, and the chowns to the `caddy` user were
         # `EPERM` besides. `_write_priv` is the seam the console already
