@@ -533,3 +533,94 @@ def test_the_mode_is_read_before_the_size_is_judged(monkeypatch):
     params, err = atlas.deploy_validate({'store_gb': 354.6, 'mode': 'elastic'})
 
     assert err and 'sizing mode' in err, err
+
+
+# --------------------------------------------------------------------------- #
+# Recorded is not deployed
+# --------------------------------------------------------------------------- #
+
+
+def test_a_checkout_alone_is_not_a_deployment(monkeypatch, tmp_path):
+    """⚠️ **The check that was too weak.** The first version asked only whether
+    the install directory existed — true the moment the clone succeeds — so a
+    deploy that cloned and then failed at `docker compose up` reported itself as
+    built, and the page offered no way to finish it. That is precisely the state
+    a failed deploy leaves behind, so it is the one case the check has to get
+    right."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    (tmp_path / 'atlas-corona').mkdir()
+
+    assert atlas.instance_is_built(None, inst, projects=set()) is False
+
+
+def test_containers_make_it_a_deployment(monkeypatch, tmp_path):
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    (tmp_path / 'atlas-corona').mkdir()
+
+    assert atlas.instance_is_built(
+        None, inst, projects={'takmdm-corona'}) is True
+
+
+def test_another_deployment_s_containers_do_not_count(monkeypatch, tmp_path):
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    (tmp_path / 'atlas-corona').mkdir()
+
+    assert atlas.instance_is_built(
+        None, inst, projects={'takmdm', 'takmdm-other'}) is False
+
+
+def test_no_checkout_is_not_a_deployment_whatever_is_running(monkeypatch, tmp_path):
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+
+    assert atlas.instance_is_built(
+        None, inst, projects={'takmdm-corona'}) is False
+
+
+def test_the_projects_are_read_once_for_every_deployment(monkeypatch):
+    """⚠️ Read on every poll of the instances route, so a subprocess per agency
+    would make the page slower the more agencies a box has."""
+    calls = []
+    monkeypatch.setattr(atlas, '_run_root',
+                        lambda argv, **k: calls.append(argv) or (0, 'takmdm'))
+
+    atlas.compose_projects_present(None)
+
+    assert len(calls) == 1
+    assert 'docker' in calls[0][0]
+
+
+def test_a_failing_docker_call_reports_no_projects(monkeypatch):
+    """⚠️ **The error text is not a project name.** `_run_root` returns the
+    command's output whether it succeeded or not, so a docker daemon that is
+    down hands back something like
+    `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`.
+    Parsing that as a list of compose projects would invent a project named
+    after the error — and on a box whose deployment happened to be called
+    `Cannot` it would claim the deployment is built while docker is not even
+    running. An empty set is the honest answer: nothing is known to exist, so
+    every recorded deployment shows as unfinished until docker answers again.
+    """
+    monkeypatch.setattr(
+        atlas, '_run_root',
+        lambda argv, **k: (1, 'Cannot connect to the Docker daemon'))
+
+    assert atlas.compose_projects_present(None) == set()
+
+
+def test_docker_being_down_never_claims_a_deployment_is_built(monkeypatch, tmp_path):
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    (tmp_path / 'atlas-corona').mkdir()
+    monkeypatch.setattr(atlas, '_run_root',
+                        lambda argv, **k: (1, 'takmdm-corona: no such thing'))
+
+    assert atlas.instance_is_built(None, inst) is False

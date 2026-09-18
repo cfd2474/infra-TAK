@@ -792,6 +792,38 @@ def caddy_sites(settings, plain_host):
         })
     return sites
 
+
+def compose_projects_present(ctx=None):
+    """Compose projects that have containers on this box, running or not.
+
+    ⚠️ **One docker call for every deployment, not one each.** This is read on
+    every poll of the instances route, and a subprocess per agency would make
+    the page slower the more agencies a box has — exactly backwards.
+    """
+    rc, out = _run_root(
+        ['docker', 'ps', '-a', '--format', '{{.Label "com.docker.compose.project"}}'])
+    if rc != 0:
+        return set()
+    return {line.strip() for line in (out or '').splitlines() if line.strip()}
+
+
+def instance_is_built(ctx, inst, projects=None):
+    """Whether a recorded deployment actually exists, rather than merely being
+    recorded.
+
+    ⚠️ **A directory is not a deployment.** The first version asked only whether
+    the install directory existed, which is true the moment the clone succeeds —
+    so a deploy that cloned and then failed at `docker compose up` reported
+    itself as built, and the page offered no way to finish it. The containers are
+    the thing that makes it a deployment; the checkout is a step along the way.
+    """
+    paths = instance_paths(ctx, inst)
+    if not os.path.isdir(paths['dir']):
+        return False
+    known = projects if projects is not None else compose_projects_present(ctx)
+    return paths['compose_project'] in known
+
+
 def _store_mount(ctx, inst=None):
     return instance_paths(ctx, inst)['mount']
 
@@ -3189,6 +3221,7 @@ def register(ctx):
             from flask import request as _rq
             size = _rq.args.get('size_gb', type=float)
             found = load_instances(ctx)
+            _projects = compose_projects_present(ctx)
             return jsonify({
                 # ⚠️ `built` is the difference between a deployment and a
                 # record of one. A deploy that fails partway leaves the record
@@ -3197,7 +3230,7 @@ def register(ctx):
                 # offers no way to finish the job.
                 'instances': [
                     dict(i,
-                         built=os.path.isdir(instance_paths(ctx, i)['dir']),
+                         built=instance_is_built(ctx, i, _projects),
                          paths={k: instance_paths(ctx, i)[k]
                                 for k in ('dir', 'vhost', 'compose_project')})
                     for i in found
