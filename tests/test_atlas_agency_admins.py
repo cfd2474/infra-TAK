@@ -28,6 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
+from atlas_pin import pin_at_least  # noqa: E402
 from modules import atlas_instances as ai  # noqa: E402
 
 
@@ -336,8 +337,14 @@ def test_a_renamed_superuser_group_reaches_the_env_line(tmp_path, monkeypatch):
 def test_the_pin_is_the_release_that_accepts_a_list():
     """⚠️ A list written into an ATLAS older than 1.49.0 is compared as one
     literal group name and matches nobody — every administrator locked out. The
-    pin is what keeps a fresh install on a release that understands it."""
-    assert atlas.ATLAS_TAG == 'v1.49.0'
+    pin is what keeps a fresh install on a release that understands it.
+
+    ⚠️ **At least, not exactly.** This used to assert equality, which made
+    it fail on every promotion for a reason it had nothing to say about.
+    """
+    ok, why = pin_at_least('v1.49.0')
+
+    assert ok, why
 
 
 # --------------------------------------------------------------------------- #

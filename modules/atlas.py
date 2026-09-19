@@ -94,9 +94,8 @@ CHANNEL_BLURB = {
 #: affected by this value.
 #:
 #: So this moves when a release is **promoted**, not when it is published.
-#: v1.51.0 is on `dev` as of 2026-09-19 and this stays at the head of `main`
-#: until it is promoted.
-ATLAS_TAG = 'v1.49.0'
+#: v1.51.0 was published to `dev` and promoted to `main` on 2026-09-19.
+ATLAS_TAG = 'v1.51.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -113,7 +112,7 @@ ATLAS_TAG = 'v1.49.0'
 # Take it from the mirror, never from the working copy you are standing in:
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
+ATLAS_SHA = 'd2419ee63c37c48c85687b457127815312e51ff5'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and

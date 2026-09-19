@@ -32,6 +32,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
+from atlas_pin import PROMOTED, PROMOTED_SHA  # noqa: E402
 from modules import atlas_instances as ai  # noqa: E402
 
 
@@ -739,5 +740,18 @@ def test_the_install_pin_is_a_tag_and_a_commit():
 
 def test_the_pin_names_the_stable_release():
     """Fresh installs land on what has been promoted, whichever channel the box
-    follows afterwards."""
-    assert atlas.ATLAS_TAG == 'v1.49.0'
+    follows afterwards.
+
+    ⚠️ **This is the one guard a promotion is supposed to change**, and
+    the only one that means equality. `PROMOTED` is written down separately
+    rather than read from `ATLAS_TAG`: a test that computes its expectation
+    from the value under test passes for every value.
+    """
+    assert atlas.ATLAS_TAG == PROMOTED, (
+        'the pin is %s and the promoted release is %s. If a release was just '
+        'promoted, both move together; if not, a fresh install is about to '
+        'land on something that has not been.' % (atlas.ATLAS_TAG, PROMOTED))
+    assert atlas.ATLAS_SHA == PROMOTED_SHA, (
+        "the tag moved and the commit did not, or the other way round. "
+        "⚠️ The SHA is the MIRROR's commit for that tag, never this "
+        "repository's -- every release has two.")

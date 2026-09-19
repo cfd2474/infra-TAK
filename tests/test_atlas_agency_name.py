@@ -21,6 +21,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
+from atlas_pin import pin_at_least  # noqa: E402
 from modules import atlas_instances as ai
 from atlas_layout import deployment_dir  # noqa: E402
 
@@ -178,9 +179,17 @@ def test_deploy_writes_the_name_it_resolved():
 def test_the_pin_points_at_the_release_that_renders_it():
     """⚠️ The name reaching `.env` does nothing until the deployment runs a
     release that knows the setting. A fresh install lands on the pin, so the pin
-    has to be that release or the feature ships invisible."""
-    assert atlas.ATLAS_TAG == 'v1.49.0'
-    assert atlas.ATLAS_SHA == 'a41bf448c9e811eeb261fd64eb663e8bbaf7a246'
+    has to be that release or the feature ships invisible.
+
+    ⚠️ **At least, not exactly**, and the SHA is not asserted here at all:
+    this test is about a capability, and a commit hash says nothing about one.
+    Whether the pin matches the promoted release is
+    `test_the_pin_names_the_stable_release`, which is the single place a
+    promotion touches.
+    """
+    ok, why = pin_at_least('v1.49.0')
+
+    assert ok, why
 
 
 # --------------------------------------------------------------------------- #
