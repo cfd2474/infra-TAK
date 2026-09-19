@@ -2205,6 +2205,55 @@ def recovery_filename(settings, inst=None):
     return '%s-%s.key' % (atlas_instances.derive(inst)['name'], host)
 
 
+#: `ca-status` answers, by deployment name, with the time they were read.
+#: ⚠️ **A `docker compose exec` per deployment on every poll is far dearer
+#: than the `stat` this replaced**, and the deployments route reads it each
+#: time. The TTL is short because the answer only changes when somebody runs
+#: the ceremony or deletes the root key, and both of those go through this
+#: console and clear the entry explicitly.
+_ca_status_cache = {}
+CA_STATUS_TTL = 30.0
+
+
+def _forget_ca_status(inst=None):
+    """Drop a cached answer, or all of them. Call after changing a CA."""
+    if inst is None:
+        _ca_status_cache.clear()
+    else:
+        _ca_status_cache.pop(atlas_instances.derive(inst)['name'], None)
+
+
+def _ca_status(ctx, inst=None, use_cache=True):
+    """What the deployment says about its own certificate authority, or None.
+
+    ⚠️ **Asked of the container, because the console cannot answer it.**
+    `pki/` is `drwx------` owned by the container's uid, so every
+    `os.path.exists()` inside it returns False for the console while the file
+    is sitting there. Three call sites believed that answer, and the worst of
+    them told the operator no root key was on the server while three were.
+
+    The container runs as the user that owns those files, so it can simply
+    look. None means it could not be asked -- not running, or not answering
+    -- which is a different thing from "no", and callers must keep it
+    different.
+    """
+    name = atlas_instances.derive(inst)['name']
+    now = time.time()
+    if use_cache:
+        hit = _ca_status_cache.get(name)
+        if hit and now - hit[0] < CA_STATUS_TTL:
+            return hit[1]
+    raw = _compose_exec(ctx, ['python', '-m', 'app.cli', 'ca-status'], inst=inst)
+    if raw is None:
+        return None
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return None
+    _ca_status_cache[name] = (now, body)
+    return body
+
+
 def root_key_holders(ctx, projects=None):
     """Deployments whose CA root key is still on this server, by name.
 
@@ -2228,38 +2277,67 @@ def root_key_holders(ctx, projects=None):
         name = atlas_instances.derive(inst)['name']
         if not instance_is_built(ctx, inst, projects):
             continue
-        pki = _pki_dir(ctx, inst)
-        if pki is None:
+        # ⚠️ **Asked of the deployment, never stat'd (W235).** This read
+        # `os.path.exists(pki/ca.key)` as the console, and `pki/` is
+        # `drwx------` owned by the container's uid: the answer was False for
+        # every deployment on a non-root box, whatever was actually there.
+        # Measured on 2026-09-19 with three root keys on disk, this returned
+        # `{'holders': [], 'unknown': []}` -- the console asserting the safe
+        # state while the dangerous one was true, which is the one direction
+        # this function must never be wrong in.
+        status = _ca_status(ctx, inst=inst)
+        if status is None:
             unknown.append(name)
             continue
         # ⚠️ The key file, not `is_split`. Those two come apart in exactly the
         # state this is for: an intermediate exists *and* the root is still
         # here (SEC_AUDIT S-2 / W185).
-        if os.path.exists(os.path.join(pki, 'ca.key')):
+        if status.get('root_key_on_server'):
             holders.append(name)
     return {'holders': holders, 'unknown': unknown}
 
 
-def _write_root_key(path, pem):
-    """Put the root key on disk for the length of one command.
+def _write_root_key(path, pem, ctx=None):
+    """Put the root key on disk for the length of one command. Error, or None.
 
-    ⚠️ Created 0600 by `os.open`, not written and chmod'd after — the same
-    reasoning as ATLAS's own key writer. A world-readable window on *this* key is
-    the worst one in the system.
+    ⚠️ Created 0600, never world-readable for an instant — the same
+    reasoning as ATLAS's own key writer. A window on *this* key is the worst
+    one in the system.
 
-    ⚠️ **No chown any more (W230).** This used to hand the file to the
-    container's baked-in uid 1000, wrapped in a bare `except` — so on a
-    non-root console the `EPERM` was swallowed and the ceremony failed later,
-    inside the container, with a permission error nobody could place. The
-    container now runs as this console's uid, so a file the console creates is
-    already readable by the only process that needs it.
+    ⚠️ **It goes into `pki/`, which the console can neither write nor
+    read (W235).** That directory is `drwx------` owned by the container's
+    uid, so the plain `os.open` this used raised `PermissionError` and
+    supplying a root key by hand could not work at all on a non-root box.
+
+    ⚠️ **The uid claim this carried was false.** It said "the container
+    now runs as this console's uid, so a file the console creates is already
+    readable by the only process that needs it" — and the code rested on it.
+    Measured on the box 2026-09-19: the container is uid 1000 (`APP_UID`),
+    the console is 997. The ceremony reads this file *inside* the container,
+    so it has to be handed over, which is why the chown is back. It is the
+    brokered one, so the `EPERM` that made W230 remove it does not return.
     """
     body = pem if pem.endswith(chr(10)) else pem + chr(10)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, body.encode())
-    finally:
-        os.close(fd)
+    writer = (ctx or {}).get('_write_priv')
+    if writer is None:
+        # Root-era console: it owns everything and can simply write.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, body.encode())
+        finally:
+            os.close(fd)
+    else:
+        try:
+            writer(path, body, mode=0o600)
+        except Exception as exc:
+            return 'could not stage the key: %s' % exc
+    err = _chown_priv(path, APP_UID, APP_GID)
+    if err:
+        # ⚠️ Staged but unreadable by the process that needs it. Leaving it
+        # there would be the exposure with none of the benefit.
+        _shred(path)
+        return 'could not hand the staged key to the container: %s' % err
+    return None
 
 
 def _shred(path):
@@ -4639,13 +4717,12 @@ def register(ctx):
         inst, err = _requested_instance(default_first=True)
         if err:
             return jsonify({'ok': False, 'error': err}), 200
-        r = _compose_exec(ctx, ['python', '-m', 'app.cli', 'ca-status'], inst=inst)
-        if r is None:
+        # ⚠️ Uncached: this is the panel an operator is *looking at*, and
+        # they open it to see the effect of something they just did. The
+        # cache exists for the box-wide banner, which is polled.
+        body = _ca_status(ctx, inst=inst, use_cache=False)
+        if body is None:
             return jsonify({'ok': False, 'error': 'ATLAS is not running'}), 200
-        try:
-            body = json.loads(r)
-        except Exception:
-            return jsonify({'ok': False, 'error': 'could not read the CA status'}), 200
         # ⚠️ Carried back so the page can label the block and the modals know
         # which deployment they are about. Without it a page showing three CAs
         # has three identical-looking panels.
@@ -4692,9 +4769,23 @@ def register(ctx):
         # ceremony is exactly how it stops being present. But it must not be
         # silently replaced by whatever was pasted: that would be a way to swap the
         # CA of a running fleet through a web form.
+        # ⚠️ **Ask the deployment, do not stat (W235).** This probed
+        # `os.path.exists(key_path)` as the console. `pki/` is `drwx------`
+        # owned by the container's uid, so the answer was False whatever was
+        # on disk: with the root key sitting right there, the empty-field
+        # path refused with "no root key on the server and none supplied"
+        # and the supplied-key path tried to write into a directory the
+        # console cannot write. Renewal was impossible on a non-root box by
+        # either route. Found by the operator, on the box.
+        status = _ca_status(ctx, inst=inst, use_cache=False)
+        if status is None:
+            return jsonify({'success': False,
+                            'error': 'ATLAS is not running'}), 409
+        on_server = bool(status.get('root_key_on_server'))
+
         supplied = False
         if key_pem:
-            if os.path.exists(key_path):
+            if on_server:
                 return jsonify({
                     'success': False,
                     'error': 'a root key is already on the server; leave the field '
@@ -4703,11 +4794,13 @@ def register(ctx):
             if 'PRIVATE KEY' not in key_pem:
                 return jsonify({'success': False, 'error': 'that is not a PEM private key'}), 400
             try:
-                _write_root_key(key_path, key_pem)
-                supplied = True
+                staging_err = _write_root_key(key_path, key_pem, ctx)
             except Exception as exc:
-                return jsonify({'success': False, 'error': 'could not stage the key: %s' % exc}), 500
-        elif not os.path.exists(key_path):
+                staging_err = 'could not stage the key: %s' % exc
+            if staging_err:
+                return jsonify({'success': False, 'error': staging_err}), 500
+            supplied = True
+        elif not on_server:
             return jsonify({
                 'success': False,
                 'error': 'no root key on the server and none supplied',
@@ -4746,6 +4839,11 @@ def register(ctx):
         # ⚠️ *This* deployment's bundle, into *this* deployment's Caddy
         # directory. Staging the plain one would leave the renewed agency
         # verifying devices against the certificate it just replaced.
+        # ⚠️ The CA just changed, so the cached `ca-status` is stale and the
+        # banner would go on reporting the pre-ceremony answer for up to the
+        # TTL -- including "the root key is still here" after a delete.
+        _forget_ca_status(inst)
+
         staged = sync_device_ca_for_caddy(inst, ctx)
         steps.append('Trust bundle staged for Caddy' if staged
                      else '⚠ Could not stage the trust bundle for Caddy')
@@ -4847,6 +4945,7 @@ def register(ctx):
         if rc != 0:
             return jsonify({'success': False, 'error': out or 'could not remove the key',
                             'steps': steps}), 500
+        _forget_ca_status(inst)
         steps.append('✓ Root key removed from this server')
         steps.append('Nothing on any device changes. Keep the file somewhere safe —')
         steps.append('you will need it to renew, in about five years.')

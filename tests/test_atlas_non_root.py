@@ -226,6 +226,49 @@ def test_every_deployment_directory_is_inside_the_one_allowlisted_root():
                 % (field, got[field], root))
 
 
+def test_nothing_stats_a_path_inside_the_pki_directory():
+    """⚠️ **The console cannot look inside `pki/`, and False is the answer
+    it gets when it tries (W235).**
+
+    That directory is `drwx------` owned by the container's uid. Every
+    `os.path.exists()` under it returns False for the console whatever is
+    actually on disk, and three call sites believed it. The worst reported
+    that no deployment was holding its CA root key — measured on the box
+    2026-09-19 with three root keys present, `root_key_holders` returned
+    `{'holders': [], 'unknown': []}`. That is the console asserting the safe
+    state while the dangerous one is true, and `root_key_on_server` exists
+    (SEC_AUDIT S-2) precisely to stop an operator believing it.
+
+    ⚠️ A stat of the directory *itself* is fine and is not matched here:
+    `_pki_dir` does exactly that, and it works, because the parent is the
+    console's own. It is going *inside* that cannot be done.
+
+    The answer is to ask the container, which owns the files — `_ca_status`,
+    over `ca-status`, which already reports `root_key_on_server`.
+    """
+    code = STRIPPED
+
+    bad = re.findall(
+        r'os\.path\.(?:exists|isfile|getsize|getmtime)\([^)]*(?:pki|ca\.key|ca\.crt|issuing|retired)[^)]*\)', code)
+
+    assert bad == [], (
+        'these ask the filesystem about a path the console cannot read; the '
+        'answer is always False. Ask the container instead: %s' % bad)
+
+
+def test_the_root_key_question_is_asked_of_the_container():
+    """The positive half — a guard that only forbids can be satisfied by
+    deleting the check altogether."""
+    code = STRIPPED
+
+    holders = code[code.index('def root_key_holders('):]
+    holders = holders[:holders.index(chr(10) + 'def ')]
+
+    assert '_ca_status(' in holders, (
+        'root_key_holders must ask the deployment, not the filesystem')
+    assert 'root_key_on_server' in holders
+
+
 def test_nothing_writes_to_a_privileged_path_directly():
     """⚠️ `/etc/systemd/system` and `/var/lib/<anything>` are not the
     console's. The module wrote unit files there with a plain `open()`; the

@@ -141,7 +141,22 @@ def test_a_box_with_no_domain_still_produces_a_usable_name():
 # --------------------------------------------------------------------------- #
 
 
-def _holder_box(monkeypatch, tmp_path, deployments, with_key=(), built=None):
+def _holder_box(monkeypatch, tmp_path, deployments, with_key=(), built=None,
+                silent=()):
+    """A box where each deployment answers `ca-status` for itself.
+
+    ⚠️ **It stubs the container, not the filesystem, and that change is
+    the whole of W235.** This used to create `pki/ca.key` on disk and let
+    `root_key_holders` stat it. That made every test here pass while the
+    function was wrong on every real box: `pki/` is `drwx------` owned by
+    the container's uid, the console cannot traverse it, and the stat came
+    back False with three root keys sitting in it. A double that can answer
+    a question the real console cannot ask is not a double, it is a
+    different program.
+
+    `silent` names deployments whose container does not answer — "we could
+    not look", which must never be reported as "there is no key here".
+    """
     monkeypatch.setattr(atlas, 'install_base',
                         lambda c=None: str(tmp_path).replace(chr(92), '/'))
     names = {ai.derive(i)['name']: i for i in deployments}
@@ -149,12 +164,21 @@ def _holder_box(monkeypatch, tmp_path, deployments, with_key=(), built=None):
                 if built is None else set(built))
     monkeypatch.setattr(atlas, 'compose_projects_present',
                         lambda c=None: projects)
+    # The checkout, because `instance_is_built` wants a directory as well as
+    # a container. Nothing is put *inside* `pki/` -- that is the point.
     for name in names:
-        pki = deployment_dir(name) / 'pki'
-        pki.mkdir(parents=True, exist_ok=True)
-        (pki / 'ca.crt').write_text('cert', encoding='utf-8')
-        if name in with_key:
-            (pki / 'ca.key').write_text('key', encoding='utf-8')
+        (deployment_dir(name) / 'pki').mkdir(parents=True, exist_ok=True)
+
+    def status(c, inst=None, use_cache=True):
+        name = ai.derive(inst)['name']
+        if name in silent:
+            return None
+        return {'root_certificate': True,
+                'root_key_on_server': name in with_key,
+                'is_split': False}
+    monkeypatch.setattr(atlas, '_ca_status', status)
+    atlas._forget_ca_status()
+
     settings = {'atlas_enabled': True, ai.INSTANCES_KEY: list(deployments)}
     return {'load_settings': lambda: dict(settings)}
 
@@ -191,12 +215,19 @@ def test_the_key_file_decides_not_whether_an_intermediate_exists(monkeypatch,
                                                                  tmp_path):
     """⚠️ `is_split` answers a different question, and those two come apart in
     exactly the state this is for: an issuing certificate exists **and** the
-    root is still here (SEC_AUDIT S-2 / W185)."""
-    ctx = _holder_box(monkeypatch, tmp_path,
-                      [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
-                      with_key=['atlas-corona'])
-    (tmp_path / 'atlas' / 'corona' / 'pki' / 'issuing.crt').write_text(
-        'intermediate', encoding='utf-8')
+    root is still here (SEC_AUDIT S-2 / W185). Measured on the box
+    2026-09-19: `is_split: True` *and* `root_key_on_server: True`, together,
+    on all three deployments."""
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'compose_projects_present',
+                        lambda c=None: {'takmdm-corona'})
+    deployment_dir('atlas-corona').mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(atlas, '_ca_status', lambda c, inst=None, use_cache=True: {
+        'root_certificate': True, 'root_key_on_server': True, 'is_split': True})
+    ctx = {'load_settings': lambda: {
+        'atlas_enabled': True,
+        ai.INSTANCES_KEY: [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)]}}
 
     assert atlas.root_key_holders(ctx)['holders'] == ['atlas-corona']
 
@@ -211,20 +242,109 @@ def test_an_unfinished_deployment_is_not_asked(monkeypatch, tmp_path):
     assert atlas.root_key_holders(ctx)['holders'] == []
 
 
-def test_a_deployment_with_no_pki_directory_is_unknown_not_safe(monkeypatch,
-                                                                tmp_path):
+def test_a_deployment_that_cannot_be_asked_is_unknown_not_safe(monkeypatch,
+                                                               tmp_path):
     """⚠️ **Not safe.** "We could not look" and "there is no key here" are
     different answers, and reporting the first as the second would tell an
     operator the one job they have is already done."""
     ctx = _holder_box(monkeypatch, tmp_path,
-                      [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)])
-    import shutil
-    shutil.rmtree(tmp_path / 'atlas' / 'corona' / 'pki')
+                      [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
+                      silent=['atlas-corona'])
 
     answer = atlas.root_key_holders(ctx)
 
     assert answer['holders'] == []
     assert answer['unknown'] == ['atlas-corona']
+
+
+def test_a_key_the_console_cannot_stat_is_still_reported(monkeypatch, tmp_path):
+    """⚠️ **The inversion, reproduced.** The filesystem says there is no
+    root key -- because the console cannot read the directory -- and the
+    container says there is. The container wins, every time. On the box this
+    was three root keys reported as none.
+    """
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda c=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'compose_projects_present',
+                        lambda c=None: {'takmdm-corona'})
+    deployment_dir('atlas-corona').mkdir(parents=True, exist_ok=True)
+    # Nothing on disk at all: exactly what the console sees through a
+    # directory it cannot traverse.
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda c, argv, timeout=60, stdin=None, inst=None:
+                        '{"root_key_on_server": true, "is_split": true}')
+    atlas._forget_ca_status()
+    ctx = {'load_settings': lambda: {'atlas_enabled': True,
+                                     ai.INSTANCES_KEY: [inst]}}
+
+    assert atlas.root_key_holders(ctx)['holders'] == ['atlas-corona']
+
+
+def test_the_answer_is_cached_but_a_ceremony_clears_it(monkeypatch, tmp_path):
+    """⚠️ A `docker compose exec` per deployment on every poll is far
+    dearer than the stat it replaced, so it is cached -- but a cached "the
+    root key is still here" surviving a delete would keep warning about a
+    key that has gone, and a cached "it is gone" surviving a renewal is
+    worse."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    calls = []
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda c, argv, timeout=60, stdin=None, inst=None:
+                        calls.append(1) or '{"root_key_on_server": true}')
+    atlas._forget_ca_status()
+
+    atlas._ca_status({}, inst=inst)
+    atlas._ca_status({}, inst=inst)
+
+    assert len(calls) == 1, 'the second read should have been cached'
+
+    atlas._forget_ca_status(inst)
+    atlas._ca_status({}, inst=inst)
+
+    assert len(calls) == 2, 'clearing the entry must force a fresh read'
+
+
+def test_an_uncached_read_always_asks(monkeypatch):
+    """The panel an operator is looking at, right after they changed
+    something, must not be answered from a cache."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    calls = []
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda c, argv, timeout=60, stdin=None, inst=None:
+                        calls.append(1) or '{"root_key_on_server": false}')
+    atlas._forget_ca_status()
+
+    atlas._ca_status({}, inst=inst)
+    atlas._ca_status({}, inst=inst, use_cache=False)
+
+    assert len(calls) == 2
+
+
+def test_a_container_that_cannot_be_asked_is_not_cached(monkeypatch):
+    """⚠️ Caching None would turn a momentary restart into half a minute
+    of "unknown" -- and, worse, would keep answering None after the
+    deployment came back."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    answers = [None, '{"root_key_on_server": true}']
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda c, argv, timeout=60, stdin=None, inst=None:
+                        answers.pop(0))
+    atlas._forget_ca_status()
+
+    assert atlas._ca_status({}, inst=inst) is None
+    assert atlas._ca_status({}, inst=inst) == {'root_key_on_server': True}
+
+
+def test_unparseable_output_is_unknown_not_safe(monkeypatch):
+    """⚠️ A container that answers something that is not JSON has not
+    said "no key"."""
+    inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda c, argv, timeout=60, stdin=None, inst=None: 'boom')
+    atlas._forget_ca_status()
+
+    assert atlas._ca_status({}, inst=inst) is None
 
 
 def test_the_holders_travel_with_the_deployments(monkeypatch, tmp_path):
@@ -266,11 +386,29 @@ MODULE = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
 PAGE = (ROOT / 'templates' / 'atlas.html').read_text(encoding='utf-8')
 
 
+def _view_code(name):
+    """A view's source with comments and docstrings removed.
+
+    ⚠️ **Match executable code, never prose.** The guard below forbids
+    `os.path.exists` in the renewal, and the comment explaining *why* it is
+    forbidden contains that very phrase -- so the first version of the guard
+    failed on the fixed code. It is the mirror of the mistake
+    `test_atlas_non_root` already warns about: match comments and a guard
+    becomes unfailable by editing a sentence; match them here and it becomes
+    unpassable by explaining yourself.
+    """
+    source = _view_source(name)
+    source = re.sub(TRIPLE + r'[\s\S]*?' + TRIPLE, '', source)
+    return re.sub(r'#[^\n]*', '', source)
+
+
 def _view_source(name):
     start = MODULE.index('    def %s(' % name)
     end = MODULE.index(chr(10) + '    def ', start + 1)
     return MODULE[start:end]
 
+
+TRIPLE = chr(34) * 3
 
 CA_VIEWS = ('ca_view', 'ca_renew_view', 'ca_recovery_view',
             'ca_recovery_confirm_view')
@@ -291,13 +429,126 @@ def test_every_container_call_in_a_ca_view_names_its_deployment(view):
     agency's root key to another's operator, or delete a root that was never
     saved."""
     source = _view_source(view)
+    # ⚠️ `_ca_status` is a container call too (W235). It wraps
+    # `_compose_exec` so the pattern above stopped matching `ca_view`
+    # entirely, and a guard that matches nothing passes forever -- which is
+    # how this one nearly stopped watching the view it was written for.
     calls = re.findall(
-        r'_compose(?:_exec|_exec_rc)?\((?:[^()]|\([^()]*\))*\)', source)
+        r'(?<![A-Za-z0-9_])(?:_compose(?:_exec|_exec_rc)?|_ca_status)\((?:[^()]|\([^()]*\))*\)',
+        source)
 
     assert calls, '%s no longer reaches a container' % view
     for call in calls:
         flat = ' '.join(call.split())
         assert 'inst=' in flat, '%s: %s' % (view, flat)
+
+
+def test_the_renewal_asks_the_container_whether_a_root_key_is_there():
+    """⚠️ **A source guard, because a view needs Flask and the suite has
+    none.** Weaker than exercising it, and it is what killed the mutant that
+    put `os.path.exists` back: on the box that probe returns False through a
+    directory the console cannot traverse, and the renewal then refuses with
+    "no root key on the server and none supplied" while the key is sitting
+    there. Reported by the operator; unreachable by any test that stubs the
+    filesystem.
+    """
+    source = _view_code('ca_renew_view')
+
+    assert '_ca_status(' in source
+    assert 'os.path.exists' not in source, (
+        'the console cannot stat inside pki/ -- the answer is always False')
+
+
+def test_the_renewal_says_not_running_rather_than_no_key():
+    """⚠️ Two different answers, and conflating them sends the operator
+    hunting for a key that is present on a deployment that is merely
+    stopped."""
+    source = _view_source('ca_renew_view')
+    head = source[:source.index('on_server =')]
+
+    assert 'ATLAS is not running' in head, (
+        'an unreachable container must not be read as "no root key"')
+
+
+def test_the_ceremony_clears_the_cached_status_before_restaging():
+    """⚠️ The CA has just changed. A cached answer surviving it means the
+    banner reports the pre-ceremony state for up to the TTL -- including
+    "the root key is still here" after it has gone."""
+    source = _view_source('ca_renew_view')
+
+    assert '_forget_ca_status(inst)' in source
+    assert source.index('_forget_ca_status(inst)') <         source.index('sync_device_ca_for_caddy(')
+
+
+def test_the_ca_panel_is_never_answered_from_the_cache():
+    """It is opened to see the effect of something just done."""
+    source = _view_source('ca_view')
+
+    assert 'use_cache=False' in source
+
+
+# --------------------------------------------------------------------------- #
+# Staging a supplied root key (W235)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_supplied_root_key_is_written_through_the_broker(tmp_path,
+                                                           monkeypatch):
+    """⚠️ `pki/` is not the console's to write. The plain `os.open` this
+    used raised PermissionError, so supplying the key by hand could not work
+    on a non-root box either -- both routes through the renewal were dead."""
+    wrote = {}
+    monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: None)
+    ctx = {'_write_priv': lambda path, body, **k: wrote.update(
+        {'path': path, 'body': body, 'mode': k.get('mode')})}
+
+    err = atlas._write_root_key(str(tmp_path / 'pki' / 'ca.key'), 'KEYPEM', ctx)
+
+    assert err is None
+    assert wrote['path'].endswith('ca.key')
+    assert wrote['body'] == 'KEYPEM' + chr(10)
+    assert wrote['mode'] == 0o600
+
+
+def test_the_staged_key_is_handed_to_the_container(tmp_path, monkeypatch):
+    """⚠️ The ceremony reads it *inside* the container, which runs as
+    uid 1000 while the console is 997. The docstring here used to claim the
+    two were the same and the code rested on that; measured on the box, they
+    are not."""
+    chowned = []
+    monkeypatch.setattr(atlas, '_chown_priv',
+                        lambda p, u, g: chowned.append((p, u, g)))
+    ctx = {'_write_priv': lambda path, body, **k: None}
+
+    atlas._write_root_key('/x/pki/ca.key', 'KEYPEM', ctx)
+
+    assert chowned == [('/x/pki/ca.key', atlas.APP_UID, atlas.APP_GID)]
+
+
+def test_a_key_that_cannot_be_handed_over_is_not_left_lying_there(monkeypatch):
+    """⚠️ **The worst secret in the system.** Staged but unreadable by the
+    only process that needs it is the exposure with none of the benefit, and
+    the caller's `finally` only shreds what it believes it staged."""
+    shredded = []
+    monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: 'EPERM')
+    monkeypatch.setattr(atlas, '_shred', lambda p: shredded.append(p) or True)
+    ctx = {'_write_priv': lambda path, body, **k: None}
+
+    err = atlas._write_root_key('/x/pki/ca.key', 'KEYPEM', ctx)
+
+    assert err and 'hand the staged key' in err
+    assert shredded == ['/x/pki/ca.key']
+
+
+def test_a_root_era_console_still_writes_it_directly(tmp_path, monkeypatch):
+    """No broker on a root-era box, and none needed: it owns the directory."""
+    monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: None)
+    path = tmp_path / 'ca.key'
+
+    err = atlas._write_root_key(str(path), 'KEYPEM', None)
+
+    assert err is None
+    assert path.read_text(encoding='utf-8') == 'KEYPEM' + chr(10)
 
 
 def test_the_renewed_trust_bundle_is_staged_for_its_own_deployment():
