@@ -552,13 +552,23 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     </p>
 
     <div id="renewForm">
-      <label style="font-size:13px">Root private key (PEM)</label>
-      <textarea id="renewKey" rows="6" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
-                style="width:100%;font-family:monospace;font-size:12px"></textarea>
+      <label style="font-size:13px">Root key file</label>
+      <!--
+        ⚠️ **A file, not a paste (W236).** The operator has this as a file
+        already -- "Save ... recovery file" downloaded it -- so asking them to
+        open it in an editor and paste the PEM was friction at the one moment
+        they are handling the most dangerous secret in the system.
+
+        Same control, same `accept`, same read-to-text as the "check my
+        recovery file" step below: this modal was simply the one that never
+        got it. The request body is unchanged, so nothing on the server moved.
+      -->
+      <input type="file" id="renewKeyFile" accept=".key,.pem,text/plain">
       <p style="color:var(--muted);font-size:12px;margin-top:4px">
-        Leave empty if the root key is still on this server. It is written for the
-        length of one command and removed immediately afterwards, whether the
-        command succeeds or fails.
+        Choose nothing if the root key is still on this server &mdash; that is the
+        usual case, and the console will use the key it already has. A file you
+        choose is written for the length of one command and removed immediately
+        afterwards, whether the command succeeds or fails.
       </p>
 
       <label style="font-size:13px;margin-top:10px;display:block">Valid for (days)</label>
@@ -1842,8 +1852,27 @@ async function doRenew(){
   const err = document.getElementById('renewError');
   const buttons = document.getElementById('renewButtons');
   const busy = document.getElementById('renewBusy');
+  const picker = document.getElementById('renewKeyFile');
 
   err.style.display = 'none';
+
+  // ⚠️ **No file means "use the key already on the server"**, and that is
+  // the normal path -- W235 is what made the console able to see that key at
+  // all. Treating an empty picker as an error would undo it.
+  let keyPem = '';
+  if (picker && picker.files && picker.files[0]) {
+    keyPem = await picker.files[0].text();
+    // ⚠️ Checked here so that picking the wrong file does not send its
+    // contents to the server at all. The server checks too -- this is in
+    // front of that, never instead of it.
+    if (keyPem.indexOf('PRIVATE KEY') < 0) {
+      err.textContent = 'That file is not a PEM private key. Choose the '
+                      + 'recovery file you saved.';
+      err.style.display = 'block';
+      return;
+    }
+  }
+
   buttons.hidden = true;
   busy.hidden = false;
 
@@ -1855,7 +1884,7 @@ async function doRenew(){
       body: JSON.stringify({
         slug: caSlug(),
         password: document.getElementById('renewPw').value,
-        root_key: document.getElementById('renewKey').value,
+        root_key: keyPem,
         days: parseInt(document.getElementById('renewDays').value, 10) || 1825,
       }),
     });
@@ -1871,10 +1900,12 @@ async function doRenew(){
       if (d.steps) { showRenewSteps(d.steps); }
       return;
     }
-    // \u26a0\ufe0f Clear the key out of the DOM the moment it is no longer needed. It is
-    // still in memory somewhere, but leaving it in a textarea on a page that may
-    // sit open for hours is gratuitous.
-    document.getElementById('renewKey').value = '';
+    // ⚠️ Clear the key out of the DOM the moment it is no longer needed. It
+    // is still in memory somewhere, but leaving it on a page that may sit open
+    // for hours is gratuitous. The picker holds a handle to the file rather
+    // than its bytes, and clearing it also stops a second Renew re-sending a
+    // key the operator thinks they already used.
+    if (picker) { picker.value = ''; }
     document.getElementById('renewPw').value = '';
     document.getElementById('renewForm').hidden = true;
     document.getElementById('renewDone').hidden = false;

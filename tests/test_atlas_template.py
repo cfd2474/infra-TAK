@@ -869,3 +869,84 @@ def test_the_module_really_does_remove_them_all():
 
     assert "for inst in found:" in body
     assert "remove_instance(ctx, inst)" in body
+
+
+# --------------------------------------------------------------------------- #
+# The renewal takes the key file, not a paste (W236)
+# --------------------------------------------------------------------------- #
+
+
+def _page():
+    return (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+
+
+def test_the_renewal_offers_a_file_picker():
+    """⚠️ The operator has the root key as a *file* -- "Save ... recovery
+    file" downloaded it. Asking them to open it in an editor and paste the
+    PEM was friction at the one moment they are handling the most dangerous
+    secret in the system."""
+    page = _page()
+
+    assert 'id="renewKeyFile"' in page
+    assert 'type="file"' in page.split('id="renewKeyFile"')[0].rsplit("<input", 1)[-1] \
+        or 'type="file" id="renewKeyFile"' in page
+
+
+def test_the_renewal_accepts_the_same_kinds_of_file_as_the_recovery_check():
+    """⚠️ One page, one answer. A picker that accepted something different
+    from the modal two steps away would be a trap dressed as a convenience."""
+    page = _page()
+    accepts = re.findall(r'<input type="file"[^>]*accept="([^"]*)"', page)
+
+    assert len(accepts) == 2, accepts
+    assert accepts[0] == accepts[1], accepts
+
+
+def test_the_pasted_key_box_is_gone():
+    """⚠️ Replaced, not supplemented -- the operator asked for the upload
+    *instead*, and the recovery-check modal has been file-only without
+    complaint. A root key held in a password manager would have to be saved
+    to a file first; that is the trade, and it is recorded in
+    PROJECT_STATE."""
+    page = _page()
+
+    assert 'id="renewKey"' not in page, "the textarea is still there"
+
+
+def test_choosing_nothing_still_means_use_the_key_on_the_server():
+    """⚠️ **The normal path**, and the one W235 had just restored -- the
+    console can finally see a root key that is already there. A picker that
+    demanded a file would undo that. Asserted on the prose the operator
+    reads; the behaviour itself is driven by the node harness below."""
+    page = _page()
+
+    assert "Choose nothing if the root key is still on this server" in page
+
+
+def test_the_renewal_upload_behaves():
+    """⚠️ Driven, not matched.
+
+    The template will contain `type="file"` and `.text()` whether or not the
+    bytes ever reach the request body, and the behaviour that matters most
+    is a *negative*: no file chosen must still send an empty `root_key`.
+    A string search cannot see that at all, which is the same reason
+    `check_deploy_gate.js` and `check_channel_card.js` exist.
+    """
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip(
+            "no node on PATH, so the renewal modal is unexercised. The rest of "
+            "this module only checks the markup is present."
+        )
+
+    result = subprocess.run(
+        [node, str(ROOT / "scripts" / "check_renew_upload.js")],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "all renewal-upload checks passed" in output, output
