@@ -86,6 +86,16 @@ CHANNEL_BLURB = {
     'dev': 'The newest release, before it has been promoted. Expect to find '
            'the problems here.',
 }
+#: ⚠️ **The pin follows the `main` channel, not the newest release.** It
+#: governs *fresh installs*, and a fresh install must not land on something
+#: that has not been promoted: `main` is "tested releases", so pinning a
+#: dev-only tag here would quietly make every new box a dev box. Updates
+#: resolve the newest tag on the box's own channel themselves and are not
+#: affected by this value.
+#:
+#: So this moves when a release is **promoted**, not when it is published.
+#: v1.51.0 is on `dev` as of 2026-09-19 and this stays at the head of `main`
+#: until it is promoted.
 ATLAS_TAG = 'v1.49.0'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
@@ -187,6 +197,23 @@ STORE_IMAGE = None
 #: Where it is mounted. Inside the ATLAS directory, because the compose file's
 #: bind mounts are relative to it.
 STORE_DIRNAME = 'store'
+
+#: The file ATLAS publishes its complete device-CA trust set to, inside its
+#: `pki/` directory (ATLAS W234).
+#:
+#: ⚠️ **This name is a contract with the other repository**, and the
+#: contract exists because of something this console cannot do. Caddy has to
+#: verify device certificates against the root *plus every intermediate that
+#: has ever signed* -- a device issued by one that has since retired chains
+#: through it. That set is only knowable by listing `pki/retired/`, and `pki/`
+#: is `drwx------` owned by the application's uid: the glob that used to be
+#: here ran as the console, returned nothing, and said nothing. `_read_priv`
+#: reads a *named* file and there is no brokered `listdir`, so ATLAS answers
+#: the question instead and this reads the answer.
+#:
+#: If ATLAS ever renames it, this changes in the same release and ATLAS keeps
+#: writing the old name until the oldest supported release writes the new one.
+BUNDLE_CERT = 'device-ca-bundle.crt'
 
 #: ⚠️ **The operator cannot reserve everything.** 85% of what is free, so a
 #: box cannot be configured into having no room for its own logs, its package
@@ -3302,23 +3329,40 @@ def sync_device_ca_for_caddy(inst=None, ctx=None):
     # never leave the install directory: verification takes the public half,
     # and a key readable by a web server is a fleet's identity one file-read
     # away.
-    # ⚠️ **KNOWN GAP: `retired/` cannot be listed by the console.** The glob
-    # below runs as the console, and `pki/` is `drwx------` owned by the
-    # application's uid — so it returns nothing, silently, and a renewed CA
-    # would stage a trust pool without the retired intermediates. Devices
-    # whose certificates chain through one would stop being trusted at the
-    # edge, which is a fleet-wide outage with no error anywhere.
+    # ⚠️ **One named file, because the console cannot list a directory it
+    # cannot traverse.** This used to glob `pki/retired/*.crt`. That glob runs
+    # as the console; `pki/` is `drwx------` owned by the application's uid,
+    # so it returned nothing -- silently -- and after the first CA renewal the
+    # pool staged here would have been missing every retired intermediate.
+    # A device issued by one chains through it, so all of them would have
+    # stopped being trusted at the edge, with no error anywhere.
     #
-    # `_read_priv` reads a *named* file; there is no brokered `listdir`, so
-    # this cannot be closed from the module side. It is on the list of seams
-    # to ask upstream for, with `_chown_priv`. Harmless until the first CA
-    # renewal, and it must not ship past one.
-    for candidate in ([os.path.join(pki_dir, 'ca.crt'),
-                       os.path.join(pki_dir, 'issuing.crt')] +
-                      sorted(_glob(os.path.join(pki_dir, 'retired', '*.crt')))):
-        text = _read_maybe_priv(candidate, ctx)
-        if text and text not in bundle_parts:
-            bundle_parts.append(text)
+    # `_read_priv` reads a *named* path and there is no brokered `listdir`, so
+    # the module could not close this from its side. ATLAS closes it instead:
+    # it knows the set, and since W234 it publishes it as one file.
+    bundle = _read_maybe_priv(os.path.join(pki_dir, BUNDLE_CERT), ctx)
+    if bundle:
+        bundle_parts.append(bundle)
+    else:
+        # ⚠️ **The fallback is not decoration and is not safe either.** A
+        # deployment on a release older than W234 publishes no bundle, and
+        # this has to go on working for it -- but what it assembles is
+        # `ca.crt` + `issuing.crt` and *nothing retired*, for the reason
+        # above. That is correct until the deployment's first CA renewal and
+        # wrong, invisibly, ever after.
+        #
+        # So it says so. The alternative -- failing the deploy -- would
+        # strand every existing deployment on an upgrade, and the condition
+        # clears itself the moment ATLAS is updated.
+        print('[' + KEY + '] ' + pki_dir + ' has no ' + BUNDLE_CERT
+              + ': this ATLAS predates W234, so the trust pool is being '
+              + 'assembled here and CANNOT include retired intermediates. '
+              + 'Update ATLAS before renewing this CA.', flush=True)
+        for candidate in (os.path.join(pki_dir, 'ca.crt'),
+                          os.path.join(pki_dir, 'issuing.crt')):
+            text = _read_maybe_priv(candidate, ctx)
+            if text and text not in bundle_parts:
+                bundle_parts.append(text)
     if not bundle_parts:
         # ⚠️ Never silent. This function feeds a *fatal* check in `deploy`,
         # and it had three separate `return None` paths that said nothing —

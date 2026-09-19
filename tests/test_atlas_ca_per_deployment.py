@@ -21,6 +21,7 @@ been.
 
 import os
 import pathlib
+import io
 import re
 import sys
 
@@ -392,6 +393,141 @@ def test_the_bundle_includes_the_issuing_certificate(monkeypatch, tmp_path):
 
     assert 'ROOT-CERT' in written['body']
     assert 'ISSUING-CERT' in written['body'], written['body']
+
+
+def _staged(monkeypatch, tmp_path, files, said=None):
+    """Run the staging with `files` in the plain deployment's `pki/`.
+
+    Returns what was written to Caddy's trust pool, or None.
+    """
+    pki = tmp_path / 'atlas' / 'default' / 'pki'
+    pki.mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        (pki / name).write_text(body, encoding='utf-8')
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'caddy_base',
+                        lambda: str(tmp_path / 'caddy').replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, '_run_root', lambda argv, timeout=120: (0, ''))
+    if said is not None:
+        monkeypatch.setattr(atlas, 'print',
+                            lambda *a, **k: said.append(' '.join(map(str, a))),
+                            raising=False)
+    written = {}
+    atlas.sync_device_ca_for_caddy(
+        None, {'_write_priv': lambda p, body, **k: written.update({'body': body})})
+    return written.get('body')
+
+
+# --------------------------------------------------------------------------- #
+# ATLAS publishes the bundle; this reads it (W234)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_published_bundle_is_used_when_it_is_there(monkeypatch, tmp_path):
+    """⚠️ **The retired intermediates are in it and cannot be found any
+    other way.** The glob this replaced ran as the console against a
+    `drwx------` directory owned by the application's uid: it returned
+    nothing, silently, so a renewed CA staged a pool missing every retired
+    intermediate and the devices they issued stopped being trusted at the
+    edge."""
+    body = _staged(monkeypatch, tmp_path, {
+        'ca.crt': 'ROOT-CERT',
+        'issuing.crt': 'ISSUING-CERT',
+        atlas.BUNDLE_CERT: 'ROOT-CERT' + chr(10) + 'RETIRED-ONE' + chr(10) + 'ISSUING-CERT' + chr(10) + '',
+    })
+
+    assert 'RETIRED-ONE' in body, body
+
+
+def test_the_published_bundle_is_taken_whole_not_added_to(monkeypatch, tmp_path):
+    """⚠️ ATLAS decides what this deployment trusts, and it is the only
+    thing that can see the full set. Concatenating the loose files on top
+    would put a certificate ATLAS had deliberately dropped -- an intermediate
+    removed because it was compromised -- back into the pool."""
+    body = _staged(monkeypatch, tmp_path, {
+        'ca.crt': 'ROOT-CERT',
+        'issuing.crt': 'REVOKED-AND-REMOVED',
+        atlas.BUNDLE_CERT: 'ROOT-CERT' + chr(10) + 'CURRENT-ISSUING' + chr(10) + '',
+    })
+
+    assert 'REVOKED-AND-REMOVED' not in body, body
+    assert body.strip() == 'ROOT-CERT' + chr(10) + 'CURRENT-ISSUING'
+
+
+def test_an_atlas_without_a_bundle_still_works(monkeypatch, tmp_path):
+    """⚠️ **The fallback is not optional.** A deployment on a release
+    older than W234 publishes no bundle, and refusing to stage would strand
+    it on the upgrade that would have fixed it."""
+    body = _staged(monkeypatch, tmp_path, {
+        'ca.crt': 'ROOT-CERT', 'issuing.crt': 'ISSUING-CERT'})
+
+    assert 'ROOT-CERT' in body
+    assert 'ISSUING-CERT' in body
+
+
+def test_falling_back_says_what_it_cannot_include(monkeypatch, tmp_path):
+    """⚠️ **And it is not safe, so it must not be quiet.** What the
+    fallback assembles is correct until that deployment's first CA renewal
+    and wrong, invisibly, ever after: nothing errors, devices issued by a
+    retired intermediate simply stop being trusted."""
+    said = []
+    _staged(monkeypatch, tmp_path,
+            {'ca.crt': 'ROOT-CERT', 'issuing.crt': 'ISSUING-CERT'}, said=said)
+
+    joined = chr(10).join(said)
+
+    assert 'retired' in joined.lower(), joined
+    assert atlas.BUNDLE_CERT in joined, joined
+
+
+def test_a_published_bundle_is_not_announced_as_a_problem(monkeypatch, tmp_path):
+    """⚠️ A warning on the healthy path is a warning nobody reads."""
+    said = []
+    _staged(monkeypatch, tmp_path, {
+        'ca.crt': 'ROOT-CERT',
+        atlas.BUNDLE_CERT: 'ROOT-CERT' + chr(10) + 'ISSUING-CERT' + chr(10) + ''}, said=said)
+
+    assert not [line for line in said if 'retired' in line.lower()], said
+
+
+def test_the_console_no_longer_globs_a_directory_it_cannot_read():
+    """⚠️ The bug was the glob, and a glob that returns nothing looks
+    exactly like a deployment that has never rotated. Asserted on the source
+    so that reintroducing it fails here rather than at a tablet."""
+    import inspect
+
+    source = inspect.getsource(atlas.sync_device_ca_for_caddy)
+    code = chr(10).join(line for line in source.split(chr(10))
+                        if not line.lstrip().startswith('#'))
+
+    assert '_glob(' not in code, (
+        'the console cannot list pki/retired -- it is drwx------ and owned by '
+        'the application. Read the published bundle instead.')
+
+
+def test_the_bundle_name_matches_the_one_atlas_publishes():
+    """⚠️ **A contract across two repositories, checked where both are
+    checked out.** Skipped elsewhere -- a box has only this one -- but this is
+    the machine where either side gets changed, so it is the machine where
+    drift has to fail.
+    """
+    import os
+    import re
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ca_py = os.path.join(os.path.dirname(here), 'TAK-MDM',
+                         'app', 'security', 'ca.py')
+    if not os.path.isfile(ca_py):
+        pytest.skip('the ATLAS checkout is not beside this one')
+
+    with io.open(ca_py, encoding='utf-8') as handle:
+        found = re.search(r'^BUNDLE_CERT = "([^"]+)"', handle.read(), re.M)
+
+    assert found, 'ATLAS no longer defines BUNDLE_CERT'
+    assert found.group(1) == atlas.BUNDLE_CERT, (
+        'ATLAS publishes %r and this reads %r' % (found.group(1),
+                                                  atlas.BUNDLE_CERT))
 
 
 def test_deploy_restages_the_bundle_after_issuing(monkeypatch):
