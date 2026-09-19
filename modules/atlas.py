@@ -2630,6 +2630,21 @@ def _stale_deploy_key(dirpath):
 
 
 
+def _module_head(ctx, dirpath):
+    """The commit a checkout is on, or None.
+
+    ⚠️ Through `ctx['_module_git']`, the same seam `deploy` uses, rather
+    than a bare `subprocess.run` — a checkout under the console's home is
+    readable either way today, but the seam is what keeps that true.
+    """
+    try:
+        r = ctx['_module_git'](dirpath, 'rev-parse', 'HEAD', timeout=10)
+        head = (getattr(r, 'stdout', '') or '').strip()
+        return head or None
+    except Exception:
+        return None
+
+
 def _write_build_file(dirpath, plog=None):
     """Record the checked-out revision where the container can still read it.
 
@@ -3993,6 +4008,15 @@ def _run_update(ctx, inst=None):
         plog('━━━ Step 3/3: Recording ━━━')
         s = ctx['load_settings']()
         s[f'{_prefix}version'] = target
+        # ⚠️ **The commit too, not just the version.** This was written only
+        # at deploy, so after an update the record said 1.50.0 beside the
+        # commit of v1.49.0 — found on the box. Nothing reads it today, which
+        # is exactly why it could drift: a provenance record that quietly
+        # describes a different build is worth less than none, because it
+        # will be believed. `tvr` already refreshes its own here.
+        head = _module_head(ctx, dirpath)
+        if head:
+            s[f'{_prefix}commit_sha'] = head
         ctx['save_settings'](s)
         plog('✓ ' + _me['name'] + ' updated to v' + target)
         slot.update({'running': False, 'complete': True, 'error': False})

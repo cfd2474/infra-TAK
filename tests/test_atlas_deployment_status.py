@@ -644,3 +644,21 @@ def test_an_unfinished_deployment_does_not_drag_the_badge_back(monkeypatch,
 
     assert info['version'] == '1.48.0'
     assert info['update_available'] is False
+
+
+def test_an_update_records_the_commit_it_moved_to(monkeypatch, tmp_path):
+    """⚠️ **A provenance record that lies is worth less than none**, because it
+    will be believed. `commit_sha` was written only at deploy, so after an
+    update the settings said 1.50.0 beside the commit of v1.49.0 — found on
+    the box during a structural scan. Nothing reads it today; that is exactly
+    why it could drift unnoticed. The sibling `tvr` module already refreshes
+    its own at this point.
+    """
+    import inspect
+
+    source = inspect.getsource(atlas._run_update)
+    record = source.index('Step 3/3: Recording')
+
+    assert 'commit_sha' in source[record:], (
+        'the update records a version without the commit it came from')
+    assert '_module_head(' in source[record:]
