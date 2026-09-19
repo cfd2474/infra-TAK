@@ -2328,7 +2328,14 @@ def _write_root_key(path, pem, ctx=None):
             os.close(fd)
     else:
         try:
-            writer(path, body, mode=0o600)
+            # ⚠️ **`perm`, not `mode`.** The seam is
+            # `_write_priv(path, content, mode='w', perm=None)`: `mode` is the
+            # *open* mode and `perm` is the permission bits. W235 passed
+            # `mode=0o600`, which corrupted the open mode and left `perm`
+            # unset, so the broker wrote the root key at its default 0644 --
+            # world-readable, and this is the one file in the system where
+            # that matters most. Found on the box, on a real ceremony.
+            writer(path, body, perm=0o600)
         except Exception as exc:
             return 'could not stage the key: %s' % exc
     err = _chown_priv(path, APP_UID, APP_GID)
@@ -2340,27 +2347,64 @@ def _write_root_key(path, pem, ctx=None):
     return None
 
 
-def _shred(path):
-    """Remove the root key, overwriting it first. Returns True when it is gone.
+def _shred(path, ctx=None, inst=None):
+    """Remove the root key. True only when it is really gone.
+
+    ⚠️ **This used to end in `return not os.path.exists(path)`, and that is
+    `True` for a file the console cannot see (W237).** `pki/` is `drwx------`
+    owned by the container's uid, so the stat is False whatever is there, the
+    negation is True, and the operator was told *"Root key removed from the
+    server"* over a key still sitting on disk. Found on the box, on a real
+    ceremony. It is W185 through a different door: the console asserting the
+    root is gone when it is not, which is the single claim this subsystem
+    exists to get right.
+
+    So the answer comes from the deployment itself. `ca-status` reports
+    `root_key_on_server`, the container can see its own files, and that is
+    the only reading of "gone" worth returning.
 
     ⚠️ **Overwriting is not secure erasure** and is not claimed to be: on a
-    journaling or copy-on-write filesystem the original blocks may survive. It is
-    done because it costs nothing and raises the bar slightly. The honest position
-    is that the root key touched this machine, which is a moment of exposure the
-    ceremony cannot avoid — only shorten.
+    journaling or copy-on-write filesystem the original blocks survive. It is
+    done where it is free -- a root-era console owns the file -- and skipped
+    through the broker, where it would be an extra privileged write buying
+    nothing the removal does not already buy. The honest position is
+    unchanged: the root key touched this machine, and the ceremony can only
+    shorten that, never undo it.
     """
+    broker = _broker_script()
     try:
-        if os.path.exists(path):
-            size = os.path.getsize(path)
-            with open(path, 'r+b') as fh:
-                fh.write(b'\0' * size)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.unlink(path)
-        return not os.path.exists(path)
+        if broker is None:
+            # Root-era: the console owns it, so overwrite and unlink directly.
+            if os.path.exists(path):
+                size = os.path.getsize(path)
+                with open(path, 'r+b') as fh:
+                    fh.write(b'\0' * size)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.unlink(path)
+            return not os.path.exists(path)
+
+        # ⚠️ `rm -f`, so there is no existence check to get wrong: it
+        # succeeds on a file that was never there.
+        rc, out = _run_root(['python3', broker, 'exec', '--', 'rm', '-f', path],
+                            timeout=60)
+        if rc != 0:
+            print('[' + KEY + '] could not remove the root key: '
+                  + (out or '').strip()[:200], flush=True)
+            return False
     except Exception as exc:
         print('[' + KEY + '] could not remove the root key: ' + str(exc), flush=True)
         return False
+
+    # ⚠️ **Verified by asking, never by statting.** A removal that returns 0
+    # and a key that is gone are not the same claim, and this function's whole
+    # job is the second one.
+    status = _ca_status(ctx, inst=inst, use_cache=False)
+    if status is None:
+        print('[' + KEY + '] removed the root key but could not confirm it: '
+              + 'the deployment did not answer', flush=True)
+        return False
+    return not status.get('root_key_on_server')
 
 
 def _compose_exec(ctx, argv, timeout=60, stdin=None, inst=None):
@@ -4827,7 +4871,7 @@ def register(ctx):
             # on the server — that is precisely the state the whole exercise exists
             # to avoid, reached by trying to fix it.
             if supplied:
-                removed = _shred(key_path)
+                removed = _shred(key_path, ctx, inst)
                 steps.append('Root key removed from the server' if removed
                              else '⚠ COULD NOT REMOVE %s — delete it by hand NOW' % key_path)
 

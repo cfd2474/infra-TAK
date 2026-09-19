@@ -256,6 +256,59 @@ def test_nothing_stats_a_path_inside_the_pki_directory():
         'answer is always False. Ask the container instead: %s' % bad)
 
 
+#: Helpers that are handed a path *inside* a deployment's `pki/`. ⚠️ They
+#: take it as a plain parameter, so the guard above -- which looks for `pki`,
+#: `ca.key` and friends in the expression being stat'd -- has nothing to
+#: match on and sailed straight past them. `_shred` was the fifth instance
+#: of this bug and the first that the guard was supposed to have caught.
+#:
+#: Adding a name here is a claim that the function receives a pki path.
+PKI_PATH_HELPERS = ('_shred', '_write_root_key')
+
+
+@pytest.mark.parametrize('helper', PKI_PATH_HELPERS)
+def test_a_pki_helper_never_decides_anything_by_statting(helper):
+    """⚠️ **A stat inside `pki/` is always False for the console**, and each
+    of these is one `not` away from turning that into a confident lie.
+    `_shred` did exactly that: `return not os.path.exists(path)` reported
+    "Root key removed from the server" over a key still on disk.
+
+    ⚠️ The **root-era** branch may stat, and must: that console owns the
+    file, there is no broker, and the direct path is the correct one. So
+    this checks the brokered branch only -- everything after the
+    `if broker is None:` block.
+    """
+    code = STRIPPED
+    body = code[code.index('def %s(' % helper):]
+    body = body[:body.index(chr(10) + 'def ')]
+
+    marker = 'if broker is None:'
+    if marker in body:
+        # Everything the non-root console actually runs.
+        head, _, tail = body.partition(marker)
+        rest = tail[tail.index(chr(10) + '        return'):] \
+            if chr(10) + '        return' in tail else tail
+        body = head + rest
+
+    for probe in ('os.path.exists', 'os.path.isfile', 'os.path.getsize'):
+        assert probe not in body, (
+            '%s asks the filesystem about a path it cannot read; the answer '
+            'is always False and a `not` turns that into a lie. Ask the '
+            'container (`_ca_status`) or let `rm -f` be idempotent.'
+            % helper)
+
+
+def test_the_shred_confirms_with_the_container():
+    """The positive half: a guard that only forbids is satisfied by deleting
+    the check."""
+    code = STRIPPED
+    body = code[code.index('def _shred('):]
+    body = body[:body.index(chr(10) + 'def ')]
+
+    assert '_ca_status(' in body
+    assert 'root_key_on_server' in body
+
+
 def test_the_root_key_question_is_asked_of_the_container():
     """The positive half — a guard that only forbids can be satisfied by
     deleting the check altogether."""

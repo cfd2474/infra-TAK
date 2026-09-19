@@ -459,6 +459,19 @@ def test_the_renewal_asks_the_container_whether_a_root_key_is_there():
         'the console cannot stat inside pki/ -- the answer is always False')
 
 
+def test_the_renewal_hands_the_shred_its_deployment():
+    """⚠️ `_shred` confirms the key is gone by asking the deployment, so
+    a call that does not name one cannot confirm anything -- it degrades to
+    reporting a failure over a removal that worked, which trains an operator
+    to ignore the warning that matters."""
+    source = _view_code('ca_renew_view')
+    calls = re.findall(r'_shred\([^)]*\)', source)
+
+    assert calls, 'the supplied key is no longer removed at all'
+    for call in calls:
+        assert 'inst' in call, call
+
+
 def test_the_renewal_says_not_running_rather_than_no_key():
     """⚠️ Two different answers, and conflating them sends the operator
     hunting for a key that is present on a deployment that is merely
@@ -500,14 +513,21 @@ def test_a_supplied_root_key_is_written_through_the_broker(tmp_path,
     wrote = {}
     monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: None)
     ctx = {'_write_priv': lambda path, body, **k: wrote.update(
-        {'path': path, 'body': body, 'mode': k.get('mode')})}
+        {'path': path, 'body': body, 'kwargs': k})}
 
     err = atlas._write_root_key(str(tmp_path / 'pki' / 'ca.key'), 'KEYPEM', ctx)
 
     assert err is None
     assert wrote['path'].endswith('ca.key')
     assert wrote['body'] == 'KEYPEM' + chr(10)
-    assert wrote['mode'] == 0o600
+    # ⚠️ **`perm`, not `mode`, and this test used to assert the bug.** The
+    # seam is `_write_priv(path, content, mode='w', perm=None)`: `mode` is
+    # the *open* mode, `perm` the permission bits. Passing `mode=0o600` left
+    # `perm` unset, so the broker wrote the root key world-readable -- the
+    # one file where that matters most -- and this assertion agreed with it.
+    assert wrote['kwargs'].get('perm') == 0o600, wrote['kwargs']
+    assert not isinstance(wrote['kwargs'].get('mode'), int), (
+        'an int in `mode` is the permission bits going to the open mode')
 
 
 def test_the_staged_key_is_handed_to_the_container(tmp_path, monkeypatch):
@@ -799,3 +819,95 @@ def test_deploy_restages_the_bundle_after_issuing(monkeypatch):
 
     assert staged < issued < restaged, (
         're-staging must come after the intermediate is created')
+
+
+# --------------------------------------------------------------------------- #
+# The shred has to be able to tell (W237)
+# --------------------------------------------------------------------------- #
+
+
+def _shred_box(monkeypatch, on_server_after, rc=0):
+    """A brokered console whose deployment reports `on_server_after`."""
+    monkeypatch.setattr(atlas, '_broker_script', lambda: '/opt/infratak/broker/b.py')
+    ran = []
+    monkeypatch.setattr(atlas, '_run_root',
+                        lambda argv, timeout=120: ran.append(argv) or (rc, ''))
+    monkeypatch.setattr(
+        atlas, '_ca_status',
+        lambda c, inst=None, use_cache=True:
+        None if on_server_after is None
+        else {'root_key_on_server': on_server_after})
+    return ran
+
+
+def test_the_confirmation_never_reads_a_cached_answer(monkeypatch):
+    """⚠️ **The cache is populated *before* the removal.** The renewal's
+    own precheck reads `ca-status` on the way in, so at shred time the entry
+    still says the root key is present. Confirming from that would report a
+    removal that worked as a failure -- and an alarm that cries wolf is one
+    an operator learns to click past, on the single screen where they must
+    not."""
+    seen = []
+    monkeypatch.setattr(atlas, '_broker_script', lambda: '/b.py')
+    monkeypatch.setattr(atlas, '_run_root', lambda argv, timeout=120: (0, ''))
+    monkeypatch.setattr(
+        atlas, '_ca_status',
+        lambda c, inst=None, use_cache=True:
+        seen.append(use_cache) or {'root_key_on_server': False})
+
+    atlas._shred('/x/pki/ca.key', {}, None)
+
+    assert seen == [False], seen
+
+
+def test_a_key_that_is_still_there_is_not_reported_as_gone(monkeypatch):
+    """⚠️ **The lie, reproduced.** This returned `not os.path.exists(path)`,
+    and the console cannot stat inside `pki/` -- so it was `not False`, and
+    the operator was told "Root key removed from the server" over a key
+    sitting on disk. Measured on the box, on a real ceremony."""
+    _shred_box(monkeypatch, on_server_after=True)
+
+    assert atlas._shred('/home/takwerx/atlas/testone/pki/ca.key', {}, None) is False
+
+
+def test_a_key_that_is_really_gone_is_reported_gone(monkeypatch):
+    _shred_box(monkeypatch, on_server_after=False)
+
+    assert atlas._shred('/home/takwerx/atlas/testone/pki/ca.key', {}, None) is True
+
+
+def test_the_removal_goes_through_the_broker(monkeypatch):
+    """⚠️ `rm -f`, so there is no existence check to get wrong: it succeeds
+    on a file that was never there, which is the whole reason to use it."""
+    ran = _shred_box(monkeypatch, on_server_after=False)
+
+    atlas._shred('/home/takwerx/atlas/testone/pki/ca.key', {}, None)
+
+    assert any('rm' in argv and '-f' in argv for argv in ran), ran
+
+
+def test_a_removal_that_failed_is_not_reported_as_gone(monkeypatch):
+    _shred_box(monkeypatch, on_server_after=False, rc=1)
+
+    assert atlas._shred('/x/pki/ca.key', {}, None) is False
+
+
+def test_a_deployment_that_cannot_confirm_is_not_reported_as_gone(monkeypatch):
+    """⚠️ "The command returned 0" and "the key is gone" are different
+    claims, and this function's job is the second one. A container that
+    cannot answer has not confirmed anything."""
+    _shred_box(monkeypatch, on_server_after=None)
+
+    assert atlas._shred('/x/pki/ca.key', {}, None) is False
+
+
+def test_a_root_era_console_still_overwrites_and_unlinks(tmp_path, monkeypatch):
+    """No broker, so the console owns the file and the direct path is right.
+    ⚠️ The overwrite is free here; through the broker it would be an extra
+    privileged write buying nothing, and it was never the guarantee."""
+    monkeypatch.setattr(atlas, '_broker_script', lambda: None)
+    key = tmp_path / 'ca.key'
+    key.write_text('SECRET', encoding='utf-8')
+
+    assert atlas._shred(str(key)) is True
+    assert not key.exists()
