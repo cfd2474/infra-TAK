@@ -128,6 +128,48 @@ def test_rewriting_an_existing_file_still_tightens_the_mode(tmp_path, monkeypatc
     assert seen == [(str(target), 0o600)]
 
 
+def test_an_env_the_console_cannot_rewrite_is_replaced(tmp_path, monkeypatch):
+    """⚠️ **Every deployment built before this fix has a root-owned
+    `.env`, and the fix alone cannot rewrite one** -- the open raises
+    `PermissionError`. Without a repair the change would turn a silent
+    failure into a hard one: the next update of an existing deployment stops
+    dead and the operator has a stranded install.
+
+    The console owns the *directory*, and unlink needs write on the
+    directory rather than on the file, so it can clear the old one and make
+    a fresh one it owns. Measured on the box before it was written.
+    """
+    target = tmp_path / '.env'
+    target.write_text('OLD=1', encoding='utf-8')
+    real_open = atlas.os.open
+    refused = []
+
+    def once(path, flags, mode=0o777):
+        if str(path) == str(target) and not refused:
+            refused.append(1)
+            raise PermissionError(13, 'Permission denied')
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(atlas.os, 'open', once)
+
+    atlas._write_own(str(target), 'NEW=2', 0o600)
+
+    assert refused, 'the test did not exercise the refusal'
+    assert target.read_text(encoding='utf-8') == 'NEW=2'
+
+
+def test_a_write_that_fails_for_another_reason_is_not_swallowed(tmp_path,
+                                                                monkeypatch):
+    """⚠️ The repair is for one specific cause. A missing directory or a
+    full disk must still surface."""
+    monkeypatch.setattr(atlas.os, 'open',
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(28, 'No space left on device')))
+
+    with pytest.raises(OSError):
+        atlas._write_own(str(tmp_path / '.env'), 'x', 0o600)
+
+
 @pytest.mark.parametrize('reader', ['_arm_admin_gates', '_set_trusted_proxies',
                                     '_push_email_relay'])
 def test_a_reader_that_cannot_open_the_env_does_not_answer_false(reader):

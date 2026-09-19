@@ -2330,7 +2330,21 @@ def _write_own(path, body, perm=0o644):
     no window where `.env` -- which carries the database password and the
     proxy-auth secret -- is readable by anyone who happens to look.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, perm)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, perm)
+    except PermissionError:
+        # ⚠️ **Every deployment built before this fix has a root-owned
+        # `.env`, and the fix alone cannot rewrite one.** Without this, the
+        # change turns a silent failure into a hard one: the next update of
+        # an existing deployment stops with `PermissionError` and the
+        # operator has a stranded install and no obvious remedy.
+        #
+        # The console owns the *directory*, and unlink needs write on the
+        # directory rather than on the file -- measured on the box -- so it
+        # can clear the old one and create a fresh one it owns. No broker
+        # needed, and nothing else in the tree is touched.
+        os.unlink(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, perm)
     try:
         os.write(fd, body.encode('utf-8'))
     finally:
