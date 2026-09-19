@@ -24,6 +24,7 @@ resolve in a config file, it means one of them quietly stops renewing.
 """
 import json
 import os
+import stat
 from glob import glob as _glob
 # ⚠️ These are paths on the *managed box*, which is always Linux. Building
 # them with `os.path.join` uses the separator of whichever machine this code
@@ -146,6 +147,16 @@ API_CONTAINER = 'takmdm-api-1'
 #: Spelled out, because an escaped backslash inside a replace() chain is
 #: exactly the kind of literal that gets mis-edited later.
 BACKSLASH = chr(92)
+
+#: `O_NOFOLLOW`, or 0 where the platform has no such flag.
+#:
+#: ⚠️ **A box is always Linux; the test runner is not.** Windows has no
+#: `O_NOFOLLOW` and no `fchown`, and referring to them directly made the
+#: suite fail on the machine this is developed on rather than on any box.
+#: Degrading to 0 is correct *here* and nowhere else: it removes a
+#: protection, so it is named once, with this comment, instead of being an
+#: inline `getattr` a reader would skim past.
+O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 
 APP_UID = 1000
 APP_GID = 1000
@@ -1565,11 +1576,14 @@ def _push_email_relay(ctx, dirpath, plog):
     leaving it would make the console promise a relay that has been uninstalled.
     """
     env_path = os.path.join(dirpath, '.env')
-    try:
-        with open(env_path, 'r') as f:
-            body = f.read()
-    except OSError:
-        return False
+    # ⚠️ **Let it raise (W240).** This swallowed the PermissionError from
+    # a root-owned `.env` and returned the same False it returns for
+    # "nothing needed changing" -- so a deploy that had wired up neither the
+    # admin group nor the proxy-auth secret still printed a tick. Every
+    # caller reaches this *after* the deploy wrote the file, so an
+    # unreadable or missing `.env` here is a fault, not a state to live with.
+    with open(env_path, 'r') as f:
+        body = f.read()
 
     relay = (ctx['load_settings']() or {}).get('email_relay') or {}
     from_addr = (relay.get('from_addr') or '').strip()
@@ -1853,11 +1867,14 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     for its own gate (`caddy_proxy_auth_gate_v1`); this is that pattern, reused.
     """
     env_path = os.path.join(dirpath, '.env')
-    try:
-        with open(env_path, 'r') as f:
-            body = f.read()
-    except OSError:
-        return False
+    # ⚠️ **Let it raise (W240).** This swallowed the PermissionError from
+    # a root-owned `.env` and returned the same False it returns for
+    # "nothing needed changing" -- so a deploy that had wired up neither the
+    # admin group nor the proxy-auth secret still printed a tick. Every
+    # caller reaches this *after* the deploy wrote the file, so an
+    # unreadable or missing `.env` here is a fault, not a state to live with.
+    with open(env_path, 'r') as f:
+        body = f.read()
 
     changed = False
 
@@ -2016,11 +2033,14 @@ def _set_trusted_proxies(dirpath, plog, project='takmdm'):
       subnet we already detected, and neither is ours to overwrite.
     """
     env_path = os.path.join(dirpath, '.env')
-    try:
-        with open(env_path, 'r') as f:
-            body = f.read()
-    except OSError:
-        return False
+    # ⚠️ **Let it raise (W240).** This swallowed the PermissionError from
+    # a root-owned `.env` and returned the same False it returns for
+    # "nothing needed changing" -- so a deploy that had wired up neither the
+    # admin group nor the proxy-auth secret still printed a tick. Every
+    # caller reaches this *after* the deploy wrote the file, so an
+    # unreadable or missing `.env` here is a fault, not a state to live with.
+    with open(env_path, 'r') as f:
+        body = f.read()
 
     detected = _bridge_gateway(project)
 
@@ -2297,6 +2317,28 @@ def root_key_holders(ctx, projects=None):
     return {'holders': holders, 'unknown': unknown}
 
 
+def _write_own(path, body, perm=0o644):
+    """Write a file in the console's **own** directory. Raises on failure.
+
+    ⚠️ **Not `_write_priv` (W240).** That seam writes as root and does not
+    chown, so a file it creates under `<home>/atlas/<slug>/` comes out
+    `root:root` and the console cannot read its own deployment's `.env`
+    afterwards. Everything downstream then failed silently. `_write_priv`
+    is for paths the console does not own -- `/etc`, `/var/lib/caddy`.
+
+    ⚠️ The mode is set on the descriptor, not after the write, so there is
+    no window where `.env` -- which carries the database password and the
+    proxy-auth secret -- is readable by anyone who happens to look.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, perm)
+    try:
+        os.write(fd, body.encode('utf-8'))
+    finally:
+        os.close(fd)
+    # An existing file keeps its old mode through O_CREAT, so say it again.
+    os.chmod(path, perm)
+
+
 def _write_root_key(path, pem, ctx=None):
     """Put the root key on disk for the length of one command. Error, or None.
 
@@ -2320,12 +2362,29 @@ def _write_root_key(path, pem, ctx=None):
     body = pem if pem.endswith(chr(10)) else pem + chr(10)
     writer = (ctx or {}).get('_write_priv')
     if writer is None:
-        # Root-era console: it owns everything and can simply write.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # ⚠️ **`O_NOFOLLOW`, and the chown on the fd, not the path (W240).**
+        # A root-era console writes here as uid 0 into `pki/`, which the
+        # *container* owns. A compromised container that plants
+        # `pki/ca.key -> /etc/<target>` gets root to truncate and overwrite
+        # that target on the next "renew with a supplied key". `O_EXCL`
+        # alone does not close it: the symlink is the final component, and
+        # without `O_NOFOLLOW` the open resolves through it.
+        #
+        # Broker boxes were already covered -- `_do_write` opens console-owned
+        # prefixes `O_NOFOLLOW` and checks realpath containment. This is the
+        # same protection for the console that has no broker.
+        fd = os.open(path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
+                     0o600)
         try:
             os.write(fd, body.encode())
+            # On the descriptor, so nothing can be swapped underneath between
+            # the write and the handover.
+            if hasattr(os, 'fchown'):
+                os.fchown(fd, APP_UID, APP_GID)
         finally:
             os.close(fd)
+        return None
     else:
         try:
             # ⚠️ **`perm`, not `mode`.** The seam is
@@ -2338,6 +2397,8 @@ def _write_root_key(path, pem, ctx=None):
             writer(path, body, perm=0o600)
         except Exception as exc:
             return 'could not stage the key: %s' % exc
+    # Only the brokered branch reaches here: the root-era one chowned its own
+    # descriptor and returned.
     err = _chown_priv(path, APP_UID, APP_GID)
     if err:
         # ⚠️ Staged but unreadable by the process that needs it. Leaving it
@@ -3088,7 +3149,25 @@ def deploy(ctx, job, params):
             plog('    The console will still work through Caddy, but devices')
             plog('    cannot be enrolled without a hostname to put in the QR.')
 
-        ctx['_write_priv'](os.path.join(dirpath, '.env'), _ENV_TEMPLATE.format(
+        # ⚠️ **Written as the console, not through `_write_priv` (W240).**
+        # The install directory is the console's own, and `_write_priv` on a
+        # broker box is `_do_write`: `os.open` as uid 0, `fchmod`, **no
+        # chown**. That left `<home>/atlas/<slug>/.env` `root:root 0600` on
+        # every non-root install, and everything that reads it back --
+        # `_arm_admin_gates`, `_set_trusted_proxies`, `_push_email_relay` --
+        # took `except OSError: return False` while the deploy printed
+        # "✓ ATLAS deployed".
+        #
+        # ⚠️ The effect was not cosmetic: `TAKMDM_ADMIN_GROUP` stayed blank,
+        # `TAKMDM_PROXY_AUTH_SECRET` was never written, `TAKMDM_TRUSTED_PROXIES`
+        # kept its wide fallback and the relay was never wired. The refuse
+        # branch W229 added for exactly this was unreachable, because the
+        # `OSError` return came first.
+        #
+        # Guide §8: files under the module's own directory are the console's
+        # to read and write directly; `_write_priv` is for root-owned paths.
+        # Compose still reads this file as root, through the broker.
+        _write_own(os.path.join(dirpath, '.env'), _ENV_TEMPLATE.format(
             trusted_proxies=_bridge_gateway(_me['compose_project']),
             pg_password=pg_password,
             device_url=_me['device_url'],
@@ -3098,12 +3177,12 @@ def deploy(ctx, job, params):
             # the plain name — it is what the console renders — and the
             # escaping belongs only where compose parses it.
             agency_name=_env_quote(_me['agency_name']),
-        ), perm=0o600)
+        ), 0o600)
         # ⚠️ The allocated port, not `APP_PORT`. Two deployments both binding
         # 127.0.0.1:8760 would leave the second failing to start with a port
         # conflict that says nothing about which deployment claimed it — and
         # Caddy's upstream for the second one points at the first.
-        ctx['_write_priv'](
+        _write_own(
             os.path.join(dirpath, 'docker-compose.override.yml'),
             _COMPOSE_OVERRIDE.format(app_port=_app_port),
         )
@@ -3355,8 +3434,23 @@ def _read_maybe_priv(path, ctx=None):
     already been fixed.
     """
     try:
-        with open(path, 'r') as handle:
-            return handle.read().strip()
+        # ⚠️ **`O_NOFOLLOW` and `S_ISREG` (W240).** A root-era console reads
+        # here as uid 0, and the paths are inside `pki/`, which the container
+        # owns. A planted `pki/issuing.crt -> /etc/shadow` would otherwise be
+        # read by root and concatenated into the device-CA bundle, which is
+        # staged `0644` where Caddy -- and anything else on the box -- can
+        # read it. The `S_ISREG` check closes the same trick through a fifo,
+        # which would hang the deploy instead.
+        fd = os.open(path, os.O_RDONLY | O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, 'r') as handle:
+                fd = None
+                return handle.read().strip()
+        finally:
+            if fd is not None:
+                os.close(fd)
     except OSError:
         pass
     reader = (ctx or {}).get('_read_priv')
@@ -5164,11 +5258,23 @@ def register(ctx):
         import threading
         from flask import request as _rq
 
+        # ⚠️ **The password, as well as the typed slug (W240).** This
+        # destroys one agency's device CA and its database, which is the same
+        # class of act as the whole-module uninstall and the three CA routes
+        # -- and all four of those ask. `login_required` proves a session;
+        # it does not prove the person at the keyboard meant to destroy a
+        # fleet's identity. Every tablet enrolled against that CA needs a
+        # factory reset in person.
+        _data = _rq.get_json(silent=True) or {}
+        _pw_err = _check_admin_password(ctx, _data)
+        if _pw_err:
+            return jsonify({'success': False, 'error': _pw_err}), 403
+
         inst = _addressed(slug)
         if inst is None:
             return jsonify({'success': False,
                             'error': 'no deployment with that slug'}), 404
-        confirm = (_rq.get_json(silent=True) or {}).get('confirm')
+        confirm = _data.get('confirm')
         expected = inst.get('slug') or 'general'
         if (confirm or '').strip() != expected:
             return jsonify({
