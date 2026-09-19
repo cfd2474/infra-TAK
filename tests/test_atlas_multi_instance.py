@@ -67,14 +67,75 @@ def test_a_box_with_only_agency_installs_still_resolves_to_root(monkeypatch):
     assert 'atlas*' in seen[0]
 
 
+def test_the_probe_sees_a_nested_checkout_too(monkeypatch):
+    """⚠️ **The glob that stopped matching when deployments nested (W233).**
+    `atlas*/.git` finds `/root/atlas/.git` and `/root/atlas-corona/.git` -- the
+    two shapes that existed when it was written -- and misses
+    `/root/atlas/corona/.git` entirely. A box whose deployments had all been
+    redeployed into the new layout would read as empty and answer the home
+    directory, and the next deploy would build a second copy there."""
+    def only_nested(pattern):
+        return ['/root/atlas/corona/.git'] if '/*/' in pattern.replace(chr(92), '/')             else []
+    monkeypatch.setattr(atlas, '_glob', only_nested)
+
+    assert atlas.install_base() == '/root'
+
+
+def test_the_probe_still_answers_the_home_when_nothing_is_installed(monkeypatch):
+    """⚠️ Adding a second glob must not turn "no deployments" into `/root`."""
+    monkeypatch.setattr(atlas, '_glob', lambda pattern: [])
+
+    assert atlas.install_base() == os.path.expanduser('~')
+
+
 def test_atlas_dir_still_answers_for_the_plain_instance(monkeypatch):
     """⚠️ One argument, and the same answer as before this chunk. Every existing
     call site and test double passes exactly one; widening the signature broke
     33 of them at once, which was the right signal."""
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/root')
 
-    assert atlas.atlas_dir(None) == '/root/atlas'
-    assert atlas.atlas_dir() == '/root/atlas'
+    assert atlas.atlas_dir(None) == '/root/atlas/default'
+    assert atlas.atlas_dir() == '/root/atlas/default'
+
+
+def test_the_root_holds_every_deployment(monkeypatch):
+    """⚠️ One directory, which is the whole point of W233: the broker
+    allows `<home>/atlas/` and resolves the real path against it, so a
+    deployment that is not *inside* it is refused every write, chown and
+    delete."""
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/home/console')
+    root = atlas.atlas_root()
+
+    assert root == '/home/console/atlas'
+    for inst in (None, AGENCY):
+        assert atlas.instance_paths(None, inst)['dir'].startswith(root + '/')
+
+
+def test_the_plain_deployments_folder_name_is_a_reserved_slug():
+    """⚠️ **Nesting created a collision that did not exist before (W233).**
+    The plain deployment is a folder inside the root now, so its folder name
+    is in the same namespace as every agency slug. A deployment created with
+    that slug would land on exactly the plain deployment's directory -- same
+    store, same `pki`, same `.env` -- while its compose project, volume and
+    settings prefix all stayed distinct, so nothing else would notice.
+
+    ⚠️ Asserted against `PLAIN_DIRNAME` rather than the string, so that
+    renaming the folder without reserving the new name fails here.
+    """
+    assert atlas.PLAIN_DIRNAME in ai.RESERVED_SLUGS
+    assert ai.validate_slug(atlas.PLAIN_DIRNAME)[0] is None
+
+
+def test_no_allowed_slug_can_land_on_the_plain_deployment(monkeypatch):
+    """The collision itself, not just the list entry that prevents it."""
+    monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/root')
+    plain = atlas.instance_paths(None, None)['dir']
+
+    for candidate in ('corona', 'defaults', 'defaultx', 'a'):
+        slug, err = ai.validate_slug(candidate)
+        assert slug and not err, (candidate, err)
+        assert atlas.instance_paths(
+            None, ai.make(slug, ai.MODE_FIXED, 1, 8761))['dir'] != plain
 
 
 # --------------------------------------------------------------------------- #
@@ -88,25 +149,53 @@ def rooted(monkeypatch):
     return None
 
 
-def test_the_plain_instance_still_resolves_to_the_live_paths(rooted):
-    """⚠️ **The test that protects the running deployment.** These are read off
-    the live box. If this file ever changes them, an existing install is
-    stranded: a deploy would build a new store beside the real one and report
-    success."""
+def test_the_plain_instance_lives_in_the_root_under_a_reserved_name(rooted):
+    """⚠️ **It moved, and only the directory moved (W233).** `pg_volume` is
+    asserted alongside on purpose: the volume, the compose project and the
+    image names are what a *running* deployment is identified by, and changing
+    any of them would strand one. The directory is the only thing nesting is
+    allowed to touch."""
     p = atlas.instance_paths(None, None)
 
-    assert p['dir'] == '/root/atlas'
-    assert p['store'] == '/root/atlas/store'
-    assert p['artifacts'] == '/root/atlas/artifacts'
-    assert p['cache'] == '/root/atlas/cache'
+    assert p['dir'] == '/root/atlas/default'
+    assert p['store'] == '/root/atlas/default/store'
+    assert p['artifacts'] == '/root/atlas/default/artifacts'
+    assert p['cache'] == '/root/atlas/default/cache'
     assert p['pg_volume'] == atlas.STORE_PG_VOLUME == 'takmdm_pgdata'
+
+
+def test_a_deployment_already_in_the_old_place_keeps_it(rooted, monkeypatch):
+    """⚠️ **This is what now protects the running deployment**, and it is
+    not the same guarantee the old path assertion gave. A box deployed before
+    W233 has `/root/atlas/.git` and `/root/atlas-corona/.git` on disk; if the
+    console simply looked in the new place it would find nothing, offer to
+    build a second copy over the one still running, and report success.
+
+    So the old directory wins whenever it is really there -- decided by a
+    `.git`, because that is what says *a checkout*, not an empty directory
+    somebody made."""
+    old = {'/root/atlas/.git', '/root/atlas-agencya/.git'}
+    monkeypatch.setattr(atlas.os.path, 'isdir', lambda p: p in old)
+
+    assert atlas.instance_paths(None, None)['dir'] == '/root/atlas'
+    assert atlas.instance_paths(None, AGENCY)['dir'] == '/root/atlas-agencya'
+
+
+def test_an_empty_old_directory_does_not_count_as_a_deployment(rooted,
+                                                               monkeypatch):
+    """⚠️ The fallback is for a real checkout, not for a leftover. A bare
+    `/root/atlas-agencya` with nothing in it would otherwise pin every future
+    deploy to the layout this change exists to get out of."""
+    monkeypatch.setattr(atlas.os.path, 'isdir', lambda p: p == '/root/atlas-agencya')
+
+    assert atlas.instance_paths(None, AGENCY)['dir'] == '/root/atlas/agencya'
 
 
 def test_an_agency_resolves_beside_it_on_the_same_layout(rooted):
     p = atlas.instance_paths(None, AGENCY)
 
-    assert p['dir'] == '/root/atlas-agencya'
-    assert p['store'] == '/root/atlas-agencya/store'
+    assert p['dir'] == '/root/atlas/agencya'
+    assert p['store'] == '/root/atlas/agencya/store'
     assert p['pg_volume'] == 'takmdm-agencya_pgdata'
     assert p['compose_project'] == 'takmdm-agencya'
 
@@ -116,8 +205,8 @@ def test_agencies_follow_a_home_layout_too(monkeypatch):
     constant said so while the plain instance lives in a home directory."""
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: '/home/console')
 
-    assert atlas.instance_paths(None, AGENCY)['dir'] == '/home/console/atlas-agencya'
-    assert atlas.instance_paths(None, None)['dir'] == '/home/console/atlas'
+    assert atlas.instance_paths(None, AGENCY)['dir'] == '/home/console/atlas/agencya'
+    assert atlas.instance_paths(None, None)['dir'] == '/home/console/atlas/default'
 
 
 def test_no_instance_shares_a_path_with_another(rooted):
@@ -176,17 +265,20 @@ def test_creating_an_agency_store_makes_only_its_own_directories(box, tmp_path):
                              mode=ai.MODE_DYNAMIC, inst=AGENCY)
 
     assert err is None, err
-    assert (tmp_path / 'atlas-agencya' / 'store' / 'pgdata').is_dir()
-    assert (tmp_path / 'atlas-agencya' / 'artifacts').is_dir()
-    assert not (tmp_path / 'atlas').exists(), 'the plain deployment was touched'
+    assert (tmp_path / 'atlas' / 'agencya' / 'store' / 'pgdata').is_dir()
+    assert (tmp_path / 'atlas' / 'agencya' / 'artifacts').is_dir()
+    # ⚠️ The *plain deployment*, not the root: they share `<base>/atlas`
+    # now (W233), and the agency's own directory is inside it.
+    plain = tmp_path / 'atlas' / 'default'
+    assert not plain.exists(), 'the plain deployment was touched'
 
 
 def test_creating_the_plain_store_never_names_an_agency(box, tmp_path):
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=None)
 
-    assert (tmp_path / 'atlas' / 'store' / 'pgdata').is_dir()
+    assert (tmp_path / 'atlas' / 'default' / 'store' / 'pgdata').is_dir()
     assert 'agencya' not in box.text()
-    assert not (tmp_path / 'atlas-agencya').exists()
+    assert not (tmp_path / 'atlas' / 'agencya').exists()
 
 
 def test_the_database_directory_is_not_chowned_at_all(box, tmp_path):
@@ -250,8 +342,8 @@ def test_removing_an_agency_store_leaves_the_plain_one_alone(box, tmp_path):
     did, errs = atlas.remove_store({}, lambda *_: None, inst=AGENCY)
 
     assert errs == [], errs
-    assert (tmp_path / 'atlas' / 'store').is_dir(), 'the plain store was removed'
-    assert posix(tmp_path / 'atlas-agencya' / 'store') in chr(10).join(did)
+    assert (tmp_path / 'atlas' / 'default' / 'store').is_dir(), 'the plain store was removed'
+    assert posix(tmp_path / 'atlas' / 'agencya' / 'store') in chr(10).join(did)
 
 
 def test_removing_an_agency_removes_only_its_own_volume(box):
@@ -300,7 +392,7 @@ def test_the_volume_goes_before_the_directories(box, tmp_path, monkeypatch):
 def test_the_default_instance_is_still_the_plain_one(box, tmp_path):
     atlas.ensure_store({}, 4 * GIB, lambda *_: None)
 
-    assert (tmp_path / 'atlas' / 'store').is_dir()
+    assert (tmp_path / 'atlas' / 'default' / 'store').is_dir()
 
 
 def test_no_instance_path_escapes_the_redirected_base(monkeypatch, tmp_path):
@@ -525,7 +617,7 @@ def test_the_store_is_idempotent_over_a_postgres_owned_pgdata(box, tmp_path, mon
     that. `ensure_store` runs on all of them.
     """
     atlas.ensure_store({}, 4 * GIB, lambda *_: None, inst=AGENCY)
-    pgdata = tmp_path / 'atlas-agencya' / 'store' / 'pgdata'
+    pgdata = tmp_path / 'atlas' / 'agencya' / 'store' / 'pgdata'
 
     # Stand in for "root owns this now": any chmod/chown from here raises.
     def refuse(*a, **k):

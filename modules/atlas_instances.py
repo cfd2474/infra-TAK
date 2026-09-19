@@ -50,6 +50,11 @@ RESERVED_SLUGS = frozenset({
     'pg', 'commit', 'access', 'enabled', 'instances',
     # Confusing as `atlas.<slug>.<fqdn>`.
     'atlas', 'admin', 'api', 'www', 'device', 'devices',
+    # ⚠️ The plain deployment's own folder inside `<base>/atlas/`
+    # (W233). Deployments nest now, so a slug of 'default' would put an
+    # agency directly on top of it -- same directory, same store, same
+    # pki -- while every *name* stayed distinct and nothing complained.
+    'default',
 })
 
 #: Internal loopback port for the api container. The plain instance already uses
@@ -250,10 +255,18 @@ def derive(instance, fqdn=None):
     escalation primitive. The key is named `store` rather than `mount` because
     it is no longer a mount point, and a key that lies about that is how the
     next reader loses an afternoon.
+
+    ⚠️ **No directories (W233).** This used to return `dir`, `store`,
+    `artifacts` and `cache` built from a hardcoded `/root/<name>`, and
+    `instance_paths` overwrote all four on its first line -- so the layout was
+    written down twice and only one copy was ever read. When deployments
+    nested, the dead copy went stale silently and the only thing that noticed
+    was a test asserting on it. Naming is this function's job; *where things
+    sit* is `atlas.instance_paths`, which is the one that can see whether the
+    box keeps deployments under `/root` or a home directory.
     """
     slug = (instance or {}).get('slug') or None
     name = 'atlas' if slug is None else f'atlas-{slug}'
-    directory = f'/root/{name}'
     host = 'atlas' if slug is None else f'atlas.{slug}'
 
     return {
@@ -262,10 +275,6 @@ def derive(instance, fqdn=None):
         # The job slot and lock. ⚠️ `[a-z0-9_-]` only — the descriptor validator
         # rejects anything else, and a colon here would fail at import.
         'job_key': name,
-        'dir': directory,
-        'store': f'{directory}/store',
-        'artifacts': f'{directory}/artifacts',
-        'cache': f'{directory}/cache',
         # ⚠️ Compose takes the project name from `-p`, which outranks the
         # `name:` in the released compose file, so ATLAS itself needs no change.
         'compose_project': 'takmdm' if slug is None else f'takmdm-{slug}',

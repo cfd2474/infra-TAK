@@ -21,7 +21,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
-from modules import atlas_instances as ai  # noqa: E402
+from modules import atlas_instances as ai
+from atlas_layout import deployment_dir  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -248,8 +249,8 @@ def test_a_missing_file_is_reported_rather_than_swallowed(tmp_path):
 def test_the_route_reports_a_write_that_failed(tmp_path, monkeypatch):
     """And the caller turns it into an error rather than a step."""
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
-    d = tmp_path / 'atlas-corona'
-    d.mkdir()
+    d = tmp_path / 'atlas' / 'corona'
+    d.mkdir(parents=True)
     (d / '.env').write_text('TAKMDM_AGENCY_NAME=""\n', encoding='utf-8')
     monkeypatch.setattr(atlas, 'install_base',
                         lambda c=None: str(tmp_path).replace(chr(92), '/'))
@@ -280,7 +281,7 @@ def built(monkeypatch, tmp_path):
     monkeypatch.setattr(atlas, 'install_base',
                         lambda c=None: str(tmp_path).replace(chr(92), '/'))
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
-    d = tmp_path / 'atlas-corona'
+    d = tmp_path / 'atlas' / 'corona'
     d.mkdir(parents=True)
     (d / '.env').write_text('TAKMDM_AGENCY_NAME=\n', encoding='utf-8')
     saved = {'atlas_enabled': True, ai.INSTANCES_KEY: [inst]}
@@ -380,7 +381,7 @@ def test_renaming_one_deployment_leaves_the_others_alone(monkeypatch, tmp_path):
     redlands = ai.make('redlands', ai.MODE_DYNAMIC, 50, 8762,
                        agency_name='Redlands PD')
     for name in ('atlas-corona', 'atlas-redlands'):
-        d = tmp_path / name
+        d = deployment_dir(name)
         d.mkdir(parents=True)
         (d / '.env').write_text('TAKMDM_AGENCY_NAME=\n', encoding='utf-8')
     saved = {'atlas_enabled': True, ai.INSTANCES_KEY: [corona, redlands]}
@@ -503,7 +504,7 @@ def test_a_record_made_before_the_field_existed_still_reports_a_name(
     monkeypatch.setattr(atlas, 'compose_projects_present',
                         lambda c=None: {'takmdm-corona'})
     monkeypatch.setattr(atlas, 'capacity_facts', lambda c, size_gb=None: {})
-    (tmp_path / 'atlas-corona').mkdir(parents=True)
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
     # The record as an older console wrote it: no `agency_name` key at all.
     old = {'slug': 'corona', 'mode': ai.MODE_DYNAMIC, 'size_gb': 50,
            'port': 8761}
@@ -544,7 +545,7 @@ def test_every_key_the_template_writes_is_reported():
 
 
 def _checkout(tmp_path, declared):
-    d = tmp_path / 'atlas-corona'
+    d = tmp_path / 'atlas' / 'corona'
     d.mkdir(parents=True, exist_ok=True)
     body = ['services:', '  api:', '    environment:']
     body += ['      %s: ${%s-}' % (k, k) for k in declared]
@@ -603,7 +604,7 @@ def test_a_variable_that_is_only_interpolated_still_counts(tmp_path):
     `TAKMDM_DATABASE_URL` for the application. Reporting it as unread would put
     a warning an operator cannot act on into every deploy log, which is how a
     warning stops being read at all."""
-    d = tmp_path / 'atlas-corona'
+    d = tmp_path / 'atlas' / 'corona'
     d.mkdir(parents=True)
     (d / 'docker-compose.yml').write_text(
         'services:' + chr(10)

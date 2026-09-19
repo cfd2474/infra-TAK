@@ -296,7 +296,7 @@ def one_box(monkeypatch, tmp_path):
                         lambda c=None: {'takmdm-corona'})
     monkeypatch.setattr(atlas, 'capacity_facts',
                         lambda c, size_gb=None: {'budget_gb': 353.2})
-    d = tmp_path / 'atlas-corona'
+    d = tmp_path / 'atlas' / 'corona'
     d.mkdir(parents=True, exist_ok=True)
     (d / 'VERSION').write_text('1.47.3', encoding='utf-8')
 

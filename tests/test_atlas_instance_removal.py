@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
 from modules import atlas_instances as ai  # noqa: E402
+from atlas_layout import deployment_dir  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -234,7 +235,7 @@ def actions(monkeypatch):
 
 def _make_box(tmp_path, instances, extra=None):
     for inst in instances:
-        d = tmp_path / ai.derive(inst)['name']
+        d = deployment_dir(ai.derive(inst)['name'])
         d.mkdir(parents=True, exist_ok=True)
         (d / 'VERSION').write_text('1.48.0', encoding='utf-8')
     settings = {'atlas_enabled': True, 'atlas_domain': 'atlas.example.com'}
@@ -297,7 +298,7 @@ def test_it_deletes_that_deployment_s_install_directory(box, actions):
 
     atlas.remove_instance(ctx, inst)
 
-    assert not (box / 'atlas-corona').exists()
+    assert not (box / 'atlas' / 'corona').exists()
     assert (box / 'atlas').exists(), \
         "removing an agency deleted the plain deployment's directory"
 
@@ -406,7 +407,7 @@ def test_a_busy_store_stops_before_the_directory_is_deleted(box, actions,
     steps, errs = atlas.remove_instance(ctx, inst)
 
     assert errs and 'store could not be removed' in errs[0]
-    assert (box / 'atlas-corona').exists()
+    assert (box / 'atlas' / 'corona').exists()
 
 
 def test_a_failed_teardown_keeps_the_database_password(box, actions,
@@ -479,7 +480,35 @@ def test_uninstall_removes_every_deployment(box, actions):
     assert result['success'] is True
     assert sorted(actions['store'], key=str) == [None, 'corona', 'redlands']
     for name in ('atlas', 'atlas-corona', 'atlas-redlands'):
-        assert not (box / name).exists(), f'{name} survived the uninstall'
+        assert not deployment_dir(name).exists(),             f'{name} survived the uninstall'
+
+
+def test_uninstall_leaves_no_empty_root_behind(box, actions):
+    """⚠️ Nesting created `<base>/atlas` (W233), so nesting has to clean it
+    up. An operator who uninstalls expects the box as it was, and the previous
+    layout left nothing at all -- every deployment *was* a top-level
+    directory, so removing them removed everything."""
+    instances = [ai.make(None, ai.MODE_FIXED, 100, 8760),
+                 ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)]
+    ctx = _make_box(box, instances)
+
+    assert atlas.uninstall(ctx, None, {})['success'] is True
+
+    assert not (box / 'atlas').exists()
+
+
+def test_a_root_holding_something_else_is_left_alone(box, actions):
+    """⚠️ It ends in a delete, so it removes the root only when the root is
+    *empty*. A stranded deployment the console could not reach, or anything an
+    operator put there, stays -- and `rmdir` rather than a recursive remove is
+    what makes that true by construction rather than by a check that could be
+    wrong."""
+    ctx = _make_box(box, [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)])
+    (box / 'atlas' / 'somebody-elses').mkdir(parents=True)
+
+    assert atlas.uninstall(ctx, None, {})['success'] is True
+
+    assert (box / 'atlas' / 'somebody-elses').exists()
 
 
 def test_uninstall_removes_an_agency_only_box(box, actions):
@@ -492,7 +521,7 @@ def test_uninstall_removes_an_agency_only_box(box, actions):
     result = atlas.uninstall(ctx, None, {})
 
     assert result['success'] is True
-    assert not (box / 'atlas-corona').exists()
+    assert not deployment_dir('atlas-corona').exists()
 
 
 def test_uninstall_clears_every_deployment_s_settings(box, actions):
@@ -535,8 +564,8 @@ def test_uninstall_continues_past_one_deployment_that_will_not_go(box, actions,
     result = atlas.uninstall(ctx, None, {})
 
     assert result['success'] is False
-    assert (box / 'atlas-corona').exists()
-    assert not (box / 'atlas-redlands').exists(), \
+    assert (box / 'atlas' / 'corona').exists()
+    assert not (box / 'atlas' / 'redlands').exists(), \
         'one failure stopped the others from being removed'
 
 

@@ -189,8 +189,41 @@ def test_the_privileged_removal_refuses_a_path_outside_its_directory():
     when a guard is worth having."""
     import modules.atlas as atlas
 
-    assert atlas._rm_priv('/etc/passwd', '/home/takwerx/atlas-x') is not None
-    assert atlas._rm_priv('/home/takwerx/atlas-xy', '/home/takwerx/atlas-x')         is not None, 'a sibling sharing a prefix must not count as inside'
+    assert atlas._rm_priv('/etc/passwd', '/home/takwerx/atlas') is not None
+    assert atlas._rm_priv('/home/takwerx/atlas-corona',
+                          '/home/takwerx/atlas') is not None, (
+        'a sibling sharing a prefix must not count as inside')
+
+
+def test_every_deployment_directory_is_inside_the_one_allowlisted_root():
+    """⚠️ **The property the broker entry rests on (W233).**
+
+    `MODULE_DIR_NAMES` grants one directory per add-on: `<home>/atlas/`, and
+    the broker resolves the *real* path of every target against it. A
+    deployment placed beside that directory rather than inside it is refused
+    every write, chown and delete -- which is precisely what happened while
+    they were siblings, 61 times on a single deploy, silently, because the
+    broker is still PERMISSIVE and executed each one anyway.
+
+    So the containment is asserted here rather than left to the shape of a
+    `posixpath.join` somewhere. ⚠️ `startswith(root + '/')`, not
+    `startswith(root)`: `<home>/atlas-corona` passes the second and is exactly
+    the bug.
+    """
+    import modules.atlas as atlas
+    from modules import atlas_instances as ai
+
+    root = atlas.atlas_root(None)
+
+    for inst in (None,
+                 ai.make('corona', ai.MODE_DYNAMIC, 50, 8761),
+                 ai.make('a', ai.MODE_FIXED, 1, 8762)):
+        got = atlas.instance_paths(None, inst)
+        for field in ('dir', 'store', 'artifacts', 'cache'):
+            assert got[field].startswith(root + '/'), (
+                '%s is %r, which is outside the directory the broker allows '
+                '(%r). Every privileged operation on it will be denied.'
+                % (field, got[field], root))
 
 
 def test_nothing_writes_to_a_privileged_path_directly():

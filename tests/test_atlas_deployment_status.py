@@ -16,7 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
-from modules import atlas_instances as ai  # noqa: E402
+from modules import atlas_instances as ai
+from atlas_layout import deployment_dir  # noqa: E402
 
 
 class Probe:
@@ -49,7 +50,7 @@ def box(monkeypatch, tmp_path, instances, checkouts=(), projects=(),
     monkeypatch.setattr(atlas, 'compose_projects_present',
                         lambda ctx=None: set(projects))
     for name, version in checkouts:
-        d = tmp_path / name
+        d = deployment_dir(name)
         d.mkdir(parents=True, exist_ok=True)
         (d / 'VERSION').write_text(version, encoding='utf-8')
 
@@ -590,7 +591,7 @@ def test_an_unreadable_version_is_treated_as_the_oldest(monkeypatch, tmp_path):
     """⚠️ `VERSION` arrived in 1.0.0, so a deployment without one predates every
     release we can see — and is precisely the one that most needs telling.
     Sorting it as newest would leave the oldest boxes the quietest."""
-    (tmp_path / 'atlas-corona').mkdir(parents=True, exist_ok=True)
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True, exist_ok=True)
     ctx = box(monkeypatch, tmp_path,
               [ai.make(None, ai.MODE_FIXED, 100, 8760),
                ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],

@@ -300,7 +300,7 @@ def test_stranded_is_not_the_same_as_unfinished(converted, tmp_path):
     offered it, because the containers are already there."""
     assert atlas.instance_is_built(None, converted) is False
 
-    (tmp_path / 'atlas-corona').mkdir()
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
 
     assert atlas.instance_is_stranded(None, converted) is False
     assert atlas.instance_is_built(None, converted) is True

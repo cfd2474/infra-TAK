@@ -462,12 +462,33 @@ def instance_paths(ctx=None, inst=None):
     pure and testable while the filesystem question stays here.
     """
     d = dict(atlas_instances.derive(inst))
-    # ⚠️ Rebased onto whatever layout the *plain* instance resolves to, so a
-    # test double that patches `atlas_dir` moves every instance with it, and
-    # a box under `~` keeps its agencies there too.
-    plain_dir = atlas_dir(ctx)
-    base = plain_dir if not d['slug'] else posixpath.join(
-        posixpath.dirname(plain_dir), d['name'])
+    # ⚠️ **Nested under one directory, not scattered beside it (W233).**
+    # They used to sit side by side — `<base>/atlas`, `<base>/atlas-corona` —
+    # and the broker's model is *one add-on, one directory*: it allows
+    # `<home>/atlas/` and verifies by resolving the **real** path on disk
+    # against that directory. `atlas-corona` is a sibling, not a child, so
+    # every write, chown and delete in it was refused. 61 refusals, all of
+    # them fatal the day enforcement is switched on.
+    #
+    # A name fragment on the allowlist cannot fix that: the check needs a
+    # real directory to resolve against, and `atlas-` is not one. So the
+    # directories genuinely nest.
+    #
+    # ⚠️ **Only the directory moves.** Compose project, volume, image
+    # names, the Caddy path and the settings keys are what a *running*
+    # deployment is identified by; changing any of them would strand one.
+    base = posixpath.join(atlas_root(ctx), d['slug'] or PLAIN_DIRNAME)
+
+    # ⚠️ **Transitional: a deployment already in the old sibling directory
+    # keeps it.** Anything else would strand a box deployed before this
+    # change — the console would look in the new place, find nothing, and
+    # offer to build a second copy over the one still running. Such a
+    # deployment goes on producing denials until it is removed and
+    # redeployed, which is the state it is already in.
+    legacy = posixpath.join(posixpath.dirname(atlas_root(ctx)), d['name'])
+    if legacy != base and os.path.isdir(posixpath.join(legacy, '.git')):
+        base = legacy
+
     d['dir'] = base
     d['store'] = posixpath.join(base, STORE_DIRNAME)
     d['artifacts'] = posixpath.join(base, 'artifacts')
@@ -2327,6 +2348,14 @@ def install_base(ctx=None):
     """
     if _glob(posixpath.join('/root', KEY + '*', '.git')):
         return '/root'
+    # ⚠️ **Both layouts, because the probe outlives the move (W233).**
+    # Nested checkouts are `/root/atlas/<slug>/.git`, which `atlas*/.git`
+    # does not match -- it only sees the pre-nesting siblings. A box whose
+    # deployments had all been redeployed into the new layout would read as
+    # having no ATLAS at all and answer the home directory, and the next
+    # deploy would build a second copy there.
+    if _glob(posixpath.join('/root', KEY, '*', '.git')):
+        return '/root'
     return os.path.expanduser('~')
 
 
@@ -2356,6 +2385,23 @@ def stranded_deployments(ctx):
             if instance_is_stranded(ctx, inst, projects)]
 
 
+#: The one directory every deployment lives inside.
+#:
+#: ⚠️ The name matters: it is what the broker allowlists, and what its
+#: real-path containment check measures against.
+ATLAS_ROOT_DIRNAME = KEY
+
+#: The plain deployment's folder inside it. A slug can never be this —
+#: `validate_slug` refuses the reserved list, and a collision here would put
+#: an agency on top of the plain deployment.
+PLAIN_DIRNAME = 'default'
+
+
+def atlas_root(ctx=None):
+    """The directory holding every deployment on this box."""
+    return posixpath.join(install_base(ctx), ATLAS_ROOT_DIRNAME)
+
+
 def atlas_dir(ctx=None):
     """Where the **plain** ATLAS deployment is installed.
 
@@ -2364,8 +2410,14 @@ def atlas_dir(ctx=None):
     stroke — which was the right signal: agency paths belong in
     `instance_paths`, not here. This answers one question and keeps answering
     it the way it always has.
+
+    ⚠️ **It is no longer `<base>/atlas` (W233).** That path is now the
+    *root* holding every deployment; the plain one sits inside it like any
+    other. Asking `atlas_root` for the plain deployment's files would hand
+    back the directory that contains all of them — and `remove_store` would
+    then delete the lot.
     """
-    return posixpath.join(install_base(ctx), KEY)
+    return posixpath.join(atlas_root(ctx), PLAIN_DIRNAME)
 
 
 def _compose_argv(ctx, *action, inst=None):
@@ -4318,6 +4370,23 @@ def uninstall(ctx, job, params):
     # the device listener away from the deployments still running.
     ctx['_fw_remove'](DEVICE_PORT, 'tcp')
     steps.append(f'Firewall rule for {DEVICE_PORT}/tcp removed')
+
+    # ⚠️ **Nesting created this directory, so nesting cleans it up (W233).**
+    # Before deployments nested, every one of them *was* a top-level directory
+    # and removing them left nothing behind; now they share `<base>/atlas`,
+    # which would survive as an empty husk.
+    #
+    # ⚠️ `rmdir`, never a recursive remove. It refuses a directory that
+    # still holds something -- a stranded deployment the console could not
+    # reach, or anything an operator put there -- which makes "only when
+    # empty" true by construction instead of by a check that could be wrong.
+    # Failing is fine and is not reported: an uninstall is not incomplete
+    # because a directory somebody else is using stayed.
+    try:
+        os.rmdir(atlas_root(ctx))
+        steps.append('Empty ATLAS directory removed')
+    except OSError:
+        pass
 
     # ⚠️ Every generated value goes, agencies included. `startswith` is right
     # *here* — the point is to leave nothing — where in `remove_instance` it

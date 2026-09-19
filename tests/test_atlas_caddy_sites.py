@@ -194,7 +194,7 @@ def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     `ctx['_write_priv']`, so the fake writer *is* the observation and nothing
     has to be swallowed.
     """
-    src = tmp_path / 'atlas-agencya' / 'pki'
+    src = tmp_path / 'atlas' / 'agencya' / 'pki'
     src.mkdir(parents=True)
     (src / 'ca.crt').write_text(
         '-----BEGIN CERTIFICATE-----' + chr(10) + 'x' + chr(10)
@@ -221,6 +221,10 @@ def test_the_ca_copy_is_per_deployment(monkeypatch, tmp_path):
     assert dest.endswith('atlas-agencya/device-ca.crt'), dest
     assert written['path'] == dest
     assert 'BEGIN CERTIFICATE' in written['body']
+    # ⚠️ **Caddy's directory did not nest, and must not.** W233 moved the
+    # *install* directory; this one is `/var/lib/caddy/<name>`, keyed by
+    # the deployment name Caddy's config already refers to. Renaming it
+    # would point every generated vhost at a trust pool that is not there.
     assert ['mkdir', '-p', posix(tmp_path / 'caddy' / 'atlas-agencya')] in ran, ran
 
 
@@ -229,7 +233,7 @@ def test_the_ca_is_not_staged_when_its_directory_cannot_be_made(monkeypatch, tmp
     `_write_priv` creates the parent; it does not, and nothing else did once
     the old `os.makedirs` was removed. A staging that cannot happen must
     report None so `deploy` refuses -- not write into nowhere."""
-    src = tmp_path / 'atlas' / 'pki'
+    src = tmp_path / 'atlas' / 'default' / 'pki'
     src.mkdir(parents=True)
     (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----', encoding='utf-8')
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: posix(tmp_path))
@@ -246,7 +250,7 @@ def test_the_ca_is_not_written_without_a_privileged_writer(monkeypatch, tmp_path
     `_write_priv` in `ctx` there is nothing to do but say so — and `deploy`
     turns that None into a refusal, because a device channel that silently
     does not exist is worse than a deploy that stops."""
-    src = tmp_path / 'atlas' / 'pki'
+    src = tmp_path / 'atlas' / 'default' / 'pki'
     src.mkdir(parents=True)
     (src / 'ca.crt').write_text('-----BEGIN CERTIFICATE-----', encoding='utf-8')
     monkeypatch.setattr(atlas, 'install_base', lambda ctx=None: posix(tmp_path))

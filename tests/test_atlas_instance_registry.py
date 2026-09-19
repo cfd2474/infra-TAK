@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
 from modules import atlas_instances as ai  # noqa: E402
+from atlas_layout import deployment_dir  # noqa: E402
 
 GIB = ai.GIB
 
@@ -409,7 +410,7 @@ def _project_for(name):
 
 
 def _checkout(base, name, version, built=True):
-    d = base / name
+    d = deployment_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     (d / 'VERSION').write_text(version, encoding='utf-8')
     if built:
@@ -580,7 +581,7 @@ def test_a_checkout_alone_is_not_a_deployment(monkeypatch, tmp_path):
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
     monkeypatch.setattr(atlas, 'install_base',
                         lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    (tmp_path / 'atlas-corona').mkdir()
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
 
     assert atlas.instance_is_built(None, inst, projects=set()) is False
 
@@ -589,7 +590,7 @@ def test_containers_make_it_a_deployment(monkeypatch, tmp_path):
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
     monkeypatch.setattr(atlas, 'install_base',
                         lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    (tmp_path / 'atlas-corona').mkdir()
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
 
     assert atlas.instance_is_built(
         None, inst, projects={'takmdm-corona'}) is True
@@ -599,7 +600,7 @@ def test_another_deployment_s_containers_do_not_count(monkeypatch, tmp_path):
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
     monkeypatch.setattr(atlas, 'install_base',
                         lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    (tmp_path / 'atlas-corona').mkdir()
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
 
     assert atlas.instance_is_built(
         None, inst, projects={'takmdm', 'takmdm-other'}) is False
@@ -649,7 +650,7 @@ def test_docker_being_down_never_claims_a_deployment_is_built(monkeypatch, tmp_p
     inst = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
     monkeypatch.setattr(atlas, 'install_base',
                         lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
-    (tmp_path / 'atlas-corona').mkdir()
+    (tmp_path / 'atlas' / 'corona').mkdir(parents=True)
     monkeypatch.setattr(atlas, '_run_root',
                         lambda argv, **k: (1, 'takmdm-corona: no such thing'))
 

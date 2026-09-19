@@ -133,37 +133,29 @@ TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
 MODULE_DIR_NAMES = (
     'tak-video-restreamer', 'webodm', 'netbird', 'cesium-tiles',
     'TAK-Portal', 'CloudTAK', 'node-red', 'authentik', 'eud-remote-assist',
-    # ATLAS MDM's plain deployment.
+    # ⚠️ **ATLAS MDM, and one entry covers every deployment on the box.**
+    # It runs one deployment per agency, and they used to sit side by side as
+    # `atlas`, `atlas-corona`, `atlas-redlands` -- siblings, which this list
+    # cannot express: it expands to `<home>/<name>/`, so `<home>/atlas-corona`
+    # never matched `<home>/atlas/` and every write, chown and delete inside
+    # an agency was refused. 61 refusals on one deploy, all of them fatal the
+    # day enforcement is switched on.
+    #
+    # Widening the rule was tried first -- a bare `<home>/atlas-` prefix -- and
+    # it does not work either: `_within_realpath` resolves the real path
+    # against a containment *directory*, and a name fragment is not one. The
+    # module nests its deployments under `<home>/atlas/<slug>/` instead, which
+    # is what this list already means by "one add-on, one directory".
     'atlas',
 )
-
-# Modules that deploy several instances side by side, each in its own
-# directory named `<name>-<instance>`. ATLAS runs one per agency: `atlas` for
-# the plain deployment and `atlas-corona`, `atlas-redlands` beside it.
-#
-# ⚠️ **A plain entry in MODULE_DIR_NAMES does not cover these, and looked
-# like it did.** That list expands to `<home>/<name>/`, so
-# `/home/takwerx/atlas-corona/` never matches `/home/takwerx/atlas/`. Adding
-# `'atlas'` alone was tried first and the next deploy failed on exactly this.
-#
-# ⚠️ **Expanded into the same literal prefixes everything else uses**, with
-# no trailing slash, so `startswith` matches `atlas-corona/...`. No matching
-# rule changes; only the list of prefixes grows. The marginal grant is
-# directories in the console's own home whose name begins `atlas-` — a home
-# the console already owns outright, and where `_CONSOLE_OWNED_PREFIXES`
-# still requires realpath containment against a symlink escape.
-MULTI_INSTANCE_DIR_NAMES = ('atlas',)
-ROOT_MODULE_DIRS = (tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
-                    + tuple('/root/%s-' % n for n in MULTI_INSTANCE_DIR_NAMES))
+ROOT_MODULE_DIRS = tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
 # Allowlist module dirs under EVERY plausible console home (the resolved home AND
 # the /home/<user> convention), deduped — so a passwd/HOME mismatch can't strand
 # them. The /nonexistent sentinel is dropped (nothing lives there anyway).
 _HOME_ROOTS = tuple(dict.fromkeys(
     h for h in (_NONROOT_HOME, _CONV_HOME) if h and h not in ('/nonexistent', '/')))
-HOME_MODULE_DIRS = (
-    tuple(os.path.join(h, n) + '/' for h in _HOME_ROOTS for n in MODULE_DIR_NAMES)
-    + tuple(os.path.join(h, n) + '-'
-            for h in _HOME_ROOTS for n in MULTI_INSTANCE_DIR_NAMES))
+HOME_MODULE_DIRS = tuple(
+    os.path.join(h, n) + '/' for h in _HOME_ROOTS for n in MODULE_DIR_NAMES)
 
 # ENFORCE vs PERMISSIVE (v10.0.5 → cutover v10.0.8, PLAN-v10.0.8 §C).
 #   PERMISSIVE: a request that fails the rulebook is still EXECUTED, but logged

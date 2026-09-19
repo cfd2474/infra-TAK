@@ -30,7 +30,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import modules.atlas as atlas  # noqa: E402
-from modules import atlas_instances as ai  # noqa: E402
+from modules import atlas_instances as ai
+from atlas_layout import deployment_dir  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -46,28 +47,28 @@ def box(monkeypatch, tmp_path):
 
 
 def test_an_agency_s_pki_is_found_under_its_own_directory(box):
-    (box / 'atlas-corona' / 'pki').mkdir(parents=True)
+    (box / 'atlas' / 'corona' / 'pki').mkdir(parents=True)
 
     found = atlas._pki_dir(None, {'slug': 'corona'})
 
-    assert found and found.endswith('atlas-corona/pki'), found
+    assert found and found.endswith('atlas/corona/pki'), found
 
 
 def test_an_agency_s_pki_is_not_the_plain_deployment_s(box):
     """⚠️ The bug. `_pki_dir` probed `/root/atlas/pki` whatever it was asked
     about, so on an agency-only box it answered None and the console reported
     *"ATLAS is not installed here"* over a healthy certificate authority."""
-    (box / 'atlas' / 'pki').mkdir(parents=True)
+    (box / 'atlas' / 'default' / 'pki').mkdir(parents=True)
 
     assert atlas._pki_dir(None, {'slug': 'corona'}) is None
 
 
 def test_the_plain_deployment_finds_its_own(box):
-    (box / 'atlas' / 'pki').mkdir(parents=True)
+    (box / 'atlas' / 'default' / 'pki').mkdir(parents=True)
 
     found = atlas._pki_dir(None, None)
 
-    assert found and found.endswith('atlas/pki'), found
+    assert found and found.endswith('atlas/default/pki'), found
 
 
 def test_the_plain_deployment_still_finds_a_legacy_checkout(monkeypatch,
@@ -148,7 +149,7 @@ def _holder_box(monkeypatch, tmp_path, deployments, with_key=(), built=None):
     monkeypatch.setattr(atlas, 'compose_projects_present',
                         lambda c=None: projects)
     for name in names:
-        pki = tmp_path / name / 'pki'
+        pki = deployment_dir(name) / 'pki'
         pki.mkdir(parents=True, exist_ok=True)
         (pki / 'ca.crt').write_text('cert', encoding='utf-8')
         if name in with_key:
@@ -193,7 +194,7 @@ def test_the_key_file_decides_not_whether_an_intermediate_exists(monkeypatch,
     ctx = _holder_box(monkeypatch, tmp_path,
                       [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)],
                       with_key=['atlas-corona'])
-    (tmp_path / 'atlas-corona' / 'pki' / 'issuing.crt').write_text(
+    (tmp_path / 'atlas' / 'corona' / 'pki' / 'issuing.crt').write_text(
         'intermediate', encoding='utf-8')
 
     assert atlas.root_key_holders(ctx)['holders'] == ['atlas-corona']
@@ -217,7 +218,7 @@ def test_a_deployment_with_no_pki_directory_is_unknown_not_safe(monkeypatch,
     ctx = _holder_box(monkeypatch, tmp_path,
                       [ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)])
     import shutil
-    shutil.rmtree(tmp_path / 'atlas-corona' / 'pki')
+    shutil.rmtree(tmp_path / 'atlas' / 'corona' / 'pki')
 
     answer = atlas.root_key_holders(ctx)
 
@@ -375,7 +376,7 @@ def test_the_bundle_includes_the_issuing_certificate(monkeypatch, tmp_path):
     bundle.** Caddy's `trust_pool file` verifies a client certificate against
     what is in that file; once the root is taken offline devices are issued by
     the intermediate, and the root alone cannot verify them."""
-    pki = tmp_path / 'atlas' / 'pki'
+    pki = tmp_path / 'atlas' / 'default' / 'pki'
     pki.mkdir(parents=True)
     (pki / 'ca.crt').write_text('ROOT-CERT', encoding='utf-8')
     (pki / 'issuing.crt').write_text('ISSUING-CERT', encoding='utf-8')

@@ -33,6 +33,8 @@ def _load_module():
 
 atlas = _load_module()
 
+from atlas_layout import deployment_dir  # noqa: E402
+
 
 # --------------------------------------------------------------------------- #
 # A fake root shell that records what it was asked to do
@@ -87,8 +89,24 @@ def _escape(path: str) -> str:
 
 @pytest.fixture
 def box(monkeypatch, tmp_path):
-    """A pretend box: an install directory, and nothing actually mounted."""
-    base = tmp_path / "atlas"
+    """A pretend box: an install directory, and nothing actually mounted.
+
+    ⚠️ **It redirects `install_base`, not `atlas_dir` (W233).**
+    `instance_paths` used to be *rebased on* `atlas_dir`, deliberately, so
+    that a fixture patching that one function moved every deployment with it.
+    Nesting ended that: the root now holds the plain deployment rather than
+    being it, so `instance_paths` asks `install_base` and `atlas_dir` is
+    derived from the answer instead of deciding it.
+
+    That is a better seam -- one function decides the layout instead of the
+    plain deployment's path implying it -- but it is a **silent** break for
+    any fixture still patching the old pivot: the module goes on resolving
+    the real home, the directory does not exist, `remove_instance` skips it,
+    and a test asserting on a *failed* teardown passes against a no-op.
+    """
+    monkeypatch.setattr(atlas, "install_base",
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    base = deployment_dir("atlas")
     (base / "store").mkdir(parents=True)
     (base / "artifacts").mkdir()
     (base / "cache").mkdir()
@@ -99,8 +117,6 @@ def box(monkeypatch, tmp_path):
     # ⚠️ POSIX-shaped: the module builds box paths with `posixpath`, and a
     # Windows temp path would produce separators that exist nowhere on a box.
     monkeypatch.setattr(atlas, "STORE_IMAGE", str(image).replace(chr(92), '/'))
-    monkeypatch.setattr(atlas, "atlas_dir",
-                        lambda _ctx=None: str(base).replace(chr(92), '/'))
     # Nothing is a mount point unless a test says so.
     monkeypatch.setattr(os.path, "ismount", lambda _p: False)
     return base

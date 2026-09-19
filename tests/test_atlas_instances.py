@@ -278,20 +278,25 @@ def test_allocation_is_deterministic():
 
 
 def test_the_plain_instance_derives_exactly_what_is_deployed_today():
-    """⚠️ **The most important test in this file.** These are the real paths on
-    the live box, read off it: `/root/atlas`, `/var/lib/atlas/store.img`, compose
+    """⚠️ **The most important test in this file.** These are the names a
+    *running* deployment is identified by, read off the live box: compose
     project `takmdm`, volume `takmdm_pgdata`, `/var/lib/caddy/atlas`, settings
     keyed `atlas_*`, api on 127.0.0.1:8760. A refactor that moved any of them
-    would strand a running deployment."""
+    would strand a running deployment.
+
+    ⚠️ **Directories are not among them any more (W233).** They used to be,
+    and the entry was a hardcoded `/root/<name>` that `instance_paths`
+    overwrote on its first line -- so this test was pinning a value nothing
+    read, and it went stale the moment deployments nested. Where a deployment
+    sits is asserted in `test_atlas_multi_instance.py`, against the function
+    that actually decides."""
     d = inst.derive(PLAIN, fqdn="leckliter.net")
 
-    assert d["dir"] == "/root/atlas"
-    # ⚠️ No `image` any more: the loop store is gone (W230), and `store`
-    # is a plain directory inside the install directory.
-    assert "image" not in d
-    assert d["store"] == "/root/atlas/store"
-    assert d["artifacts"] == "/root/atlas/artifacts"
-    assert d["cache"] == "/root/atlas/cache"
+    for absent in ("dir", "store", "artifacts", "cache", "image"):
+        assert absent not in d, (
+            "%r is a *location*, and only `instance_paths` can answer that: "
+            "it is the one that knows whether this box keeps deployments "
+            "under /root or a home directory." % absent)
     assert d["compose_project"] == "takmdm"
     assert d["pg_volume"] == "takmdm_pgdata"
     assert d["caddy_ca_dir"] == "/var/lib/caddy/atlas"
@@ -304,9 +309,8 @@ def test_the_plain_instance_derives_exactly_what_is_deployed_today():
 def test_an_agency_instance_derives_a_parallel_set():
     d = inst.derive(AGENCY_A, fqdn="leckliter.net")
 
-    assert d["dir"] == "/root/atlas-agencya"
-    assert "image" not in d
-    assert d["store"] == "/root/atlas-agencya/store"
+    for absent in ("dir", "store", "artifacts", "cache", "image"):
+        assert absent not in d
     assert d["compose_project"] == "takmdm-agencya"
     assert d["pg_volume"] == "takmdm-agencya_pgdata"
     assert d["caddy_ca_dir"] == "/var/lib/caddy/atlas-agencya"
@@ -331,9 +335,11 @@ def test_no_two_instances_share_any_derived_name():
     and prefix has to differ, or two agencies would write to each other."""
     a = inst.derive(PLAIN, fqdn="x.net")
     b = inst.derive(AGENCY_A, fqdn="x.net")
-    shared = ("dir", "store", "artifacts", "cache",
-              "compose_project", "pg_volume", "caddy_ca_dir", "settings_prefix",
-              "authentik_slug", "job_key", "vhost", "port")
+    # ⚠️ Paths are not here any more (W233) -- `instance_paths` owns them,
+    # and `test_no_instance_shares_a_path_with_another` makes the same
+    # assertion against the function that decides.
+    shared = ("compose_project", "pg_volume", "caddy_ca_dir",
+              "settings_prefix", "authentik_slug", "job_key", "vhost", "port")
 
     for field in shared:
         assert a[field] != b[field], f"{field} is the same for both instances"
@@ -367,4 +373,5 @@ def test_a_fixed_and_a_dynamic_instance_coexist():
     modes = {i["mode"] for i in instances}
 
     assert modes == {inst.MODE_FIXED, inst.MODE_DYNAMIC}
-    assert inst.derive(PLAIN)["dir"] != inst.derive(AGENCY_A)["dir"]
+    assert (inst.derive(PLAIN)["compose_project"]
+            != inst.derive(AGENCY_A)["compose_project"])
