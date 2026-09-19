@@ -363,3 +363,51 @@ def test_the_ca_status_says_which_deployment_it_describes():
 
     assert "body['name'] = names['name']" in source
     assert "body['slug'] = names['slug']" in source
+
+
+# --------------------------------------------------------------------------- #
+# The trust bundle carries the intermediate (2026-09-19)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_bundle_includes_the_issuing_certificate(monkeypatch, tmp_path):
+    """⚠️ **Root plus every intermediate, which is the whole point of a
+    bundle.** Caddy's `trust_pool file` verifies a client certificate against
+    what is in that file; once the root is taken offline devices are issued by
+    the intermediate, and the root alone cannot verify them."""
+    pki = tmp_path / 'atlas' / 'pki'
+    pki.mkdir(parents=True)
+    (pki / 'ca.crt').write_text('ROOT-CERT', encoding='utf-8')
+    (pki / 'issuing.crt').write_text('ISSUING-CERT', encoding='utf-8')
+    monkeypatch.setattr(atlas, 'install_base',
+                        lambda ctx=None: str(tmp_path).replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, 'caddy_base',
+                        lambda: str(tmp_path / 'caddy').replace(chr(92), '/'))
+    monkeypatch.setattr(atlas, '_run_root', lambda argv, timeout=120: (0, ''))
+    written = {}
+
+    atlas.sync_device_ca_for_caddy(
+        None, {'_write_priv': lambda p, body, **k: written.update({'body': body})})
+
+    assert 'ROOT-CERT' in written['body']
+    assert 'ISSUING-CERT' in written['body'], written['body']
+
+
+def test_deploy_restages_the_bundle_after_issuing(monkeypatch):
+    """⚠️ **The ordering bug, found on the box.** Step 6 stages the trust pool;
+    the CA ceremony that creates the intermediate runs *after* it. A fresh
+    deployment therefore had a pool holding only the root — one certificate,
+    `CN = TAK-MDM Device CA`, with `issuing.crt` sitting unused beside it.
+
+    The failure would never appear in a deploy log: it arrives later, at a
+    tablet, as a TLS handshake that refuses.
+    """
+    import inspect
+
+    source = inspect.getsource(atlas.deploy)
+    staged = source.index('Device CA staged for Caddy')
+    issued = source.index('Issuing certificate created')
+    restaged = source.index('Trust bundle re-staged')
+
+    assert staged < issued < restaged, (
+        're-staging must come after the intermediate is created')

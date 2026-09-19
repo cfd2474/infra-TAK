@@ -1638,6 +1638,75 @@ def _global_admin_group(ctx):
         return ADMIN_GROUP
 
 
+def remove_agency_admin_group(ctx, inst, plog=None):
+    """Delete this deployment's admin group. Returns a note, or None.
+
+    ⚠️ **The counterpart `ensure_agency_admin_group` never had.** Removing a
+    deployment deregistered its application and provider and left
+    `atlas-<slug>-admins` behind — found on the box with `atlas-testing-admins`
+    still present long after that deployment was gone. An orphaned group
+    grants nothing, which is precisely why nobody notices it: it accumulates
+    one per teardown, and the next deployment that reuses the slug silently
+    inherits whatever members the old one had.
+
+    ⚠️ **Matched by exact name, and only for an agency.** The plain
+    deployment has no group of its own — it uses the global administrators —
+    so a slug-less instance returns immediately. Without that, a teardown of
+    the plain deployment could delete the group every agency relies on.
+
+    ⚠️ **Members are reported, not preserved.** The group is this
+    deployment's and goes with it; saying how many people were in it is what
+    lets an operator put them back somewhere if that was a mistake.
+    """
+    import urllib.request as _urlreq
+    from urllib.parse import quote as _q
+
+    names = atlas_instances.derive(inst)
+    if not names['slug']:
+        return None
+    group_name = names['admin_group']
+
+    try:
+        settings = ctx['load_settings']()
+        token = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not token:
+            return None
+        ak_url = ctx['_get_authentik_api_url'](settings)
+        headers = {'Authorization': 'Bearer %s' % token,
+                   'Content-Type': 'application/json'}
+
+        def api(path, method=None):
+            req = _urlreq.Request('%s/api/v3/%s' % (ak_url, path),
+                                  headers=headers, method=method)
+            body = _urlreq.urlopen(req, timeout=10).read().decode()
+            return json.loads(body or '{}')
+
+        found = api('core/groups/?name=%s' % _q(group_name))
+        for group in found.get('results', []):
+            # ⚠️ Exact match. Authentik's `?name=` is a filter, not an
+            # identity, and `atlas-test-admins` must never resolve a teardown
+            # of `atlas-testing-admins` — one is a prefix of the other, which
+            # is the shape that has bitten this module repeatedly.
+            if group.get('name') != group_name:
+                continue
+            members = len(group.get('users') or [])
+            api('core/groups/%s/' % group.get('pk'), method='DELETE')
+            note = 'Authentik group "%s" removed' % group_name
+            if members:
+                note += ' (it had %d member%s)' % (
+                    members, '' if members == 1 else 's')
+            if plog:
+                plog(note)
+            return note
+        return None
+    except Exception as exc:
+        if plog:
+            plog('⚠ Authentik group "%s" could not be removed: %s'
+                 % (group_name, exc))
+        return None
+
+
 def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
     """Create this deployment's admin group and let it into this deployment.
 
@@ -2953,6 +3022,24 @@ def deploy(ctx, job, params):
         if out and 'issuing CA' in out:
             plog('✓ Issuing certificate created — the root key is now only needed')
             plog('  to renew it, about twice a decade.')
+            # ⚠️ **Re-staged, because the intermediate did not exist when the
+            # bundle was written.** Step 6 stages the trust pool and this runs
+            # after it, so a fresh deployment ended up with a pool holding the
+            # root alone — measured on the box: one certificate,
+            # `CN = TAK-MDM Device CA`, while `pki/issuing.crt` sat beside it.
+            #
+            # That matters exactly as the staging function's own comment says:
+            # once the root is offline the devices are issued by the
+            # intermediate, and Caddy cannot verify them from the root alone.
+            # The failure arrives later, at a tablet, as a TLS handshake that
+            # refuses — nothing in the deploy log would ever have mentioned it.
+            restaged = sync_device_ca_for_caddy(_inst, ctx)
+            if restaged:
+                ctx['_caddy_reload']()
+                plog('✓ Trust bundle re-staged with the issuing certificate')
+            else:
+                plog('⚠ Could not re-stage the trust bundle. Devices issued by')
+                plog('  the intermediate will not be trusted until it is staged.')
             plog('⚠ The root key is still on this server. Open the ATLAS module')
             plog('  page and save your recovery file — it takes one click.')
         else:
@@ -4108,6 +4195,13 @@ def remove_instance(ctx, inst, plog=None):
         note(f"{label}: Authentik application '{names['app_slug']}' removed")
     except Exception:
         note(f'{label}: Authentik application not present (not configured)')
+
+    # ⚠️ **And its admin group.** Deregistering the application leaves the
+    # group behind; an orphan grants nothing, so nobody notices until a slug
+    # is reused and the new deployment inherits the old members.
+    group_note = remove_agency_admin_group(ctx, inst)
+    if group_note:
+        note(f'{label}: {group_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*

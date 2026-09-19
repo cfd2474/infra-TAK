@@ -338,3 +338,126 @@ def test_the_pin_is_the_release_that_accepts_a_list():
     literal group name and matches nobody — every administrator locked out. The
     pin is what keeps a fresh install on a release that understands it."""
     assert atlas.ATLAS_TAG == 'v1.49.0'
+
+
+# --------------------------------------------------------------------------- #
+# The group goes with the deployment (2026-09-19)
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ Found on the box, not here: `atlas-testing-admins` was still in Authentik
+# long after that deployment was torn down. `remove_instance` deregistered the
+# application and the provider and never touched the group.
+
+
+class FakeAk:
+    """Authentik's group API, as far as this needs it."""
+
+    def __init__(self, groups):
+        self.groups = list(groups)
+        self.deleted = []
+
+    def __call__(self, url, timeout=None):
+        import io as _io
+        import json as _json
+        from urllib.parse import unquote
+
+        method = getattr(url, 'method', None) or 'GET'
+        full = url.full_url
+        if method == 'DELETE':
+            pk = full.rstrip('/').rsplit('/', 1)[-1]
+            self.deleted.append(pk)
+            self.groups = [g for g in self.groups if g['pk'] != pk]
+            return _io.BytesIO(b'')
+        wanted = unquote(full.split('name=', 1)[1]) if 'name=' in full else None
+        # ⚠️ A *filter*, like the real API — it returns prefix matches too,
+        # which is the whole reason the caller checks the name exactly.
+        hits = [g for g in self.groups
+                if wanted is None or wanted in g['name']]
+        return _io.BytesIO(_json.dumps({'results': hits}).encode())
+
+
+def _ctx_with_ak(monkeypatch, fake):
+    import urllib.request as urlreq
+    monkeypatch.setattr(urlreq, 'urlopen', fake)
+    return {
+        'load_settings': lambda: {},
+        '_get_authentik_env_value': lambda s, k: 'tok' if 'TOKEN' in k else None,
+        '_get_authentik_api_url': lambda s: 'http://127.0.0.1:9090',
+    }
+
+
+def test_the_agency_group_is_deleted_with_its_deployment(monkeypatch):
+    fake = FakeAk([{'pk': 'g1', 'name': 'atlas-corona-admins', 'users': []}])
+    ctx = _ctx_with_ak(monkeypatch, fake)
+
+    note = atlas.remove_agency_admin_group(ctx, CORONA)
+
+    assert fake.deleted == ['g1'], fake.deleted
+    assert 'atlas-corona-admins' in note
+
+
+def test_a_group_with_members_is_removed_and_the_count_reported(monkeypatch):
+    """⚠️ The group goes with the deployment either way — but an operator who
+    did not mean to do that needs to know how many people were in it."""
+    fake = FakeAk([{'pk': 'g1', 'name': 'atlas-corona-admins',
+                    'users': [1, 2, 3]}])
+    ctx = _ctx_with_ak(monkeypatch, fake)
+
+    note = atlas.remove_agency_admin_group(ctx, CORONA)
+
+    assert fake.deleted == ['g1']
+    assert '3 members' in note, note
+
+
+def test_a_prefix_match_is_not_deleted(monkeypatch):
+    """⚠️ **The trap this module keeps walking into.** Authentik's `?name=` is
+    a filter, not an identity, and `atlas-test-admins` is a prefix of
+    `atlas-testing-admins`. Tearing one down must not take the other."""
+    fake = FakeAk([
+        {'pk': 'g1', 'name': 'atlas-testing-admins', 'users': []},
+        {'pk': 'g2', 'name': 'atlas-test-admins', 'users': []},
+    ])
+    ctx = _ctx_with_ak(monkeypatch, fake)
+
+    atlas.remove_agency_admin_group(
+        ctx, ai.make('test', ai.MODE_DYNAMIC, 50, 8761))
+
+    assert fake.deleted == ['g2'], fake.deleted
+    assert [g['name'] for g in fake.groups] == ['atlas-testing-admins']
+
+
+def test_the_plain_deployment_has_no_group_to_remove(monkeypatch):
+    """⚠️ It uses the global administrators. Deleting anything here would take
+    the group every agency relies on."""
+    fake = FakeAk([{'pk': 'g1', 'name': 'authentik Admins', 'users': []}])
+    ctx = _ctx_with_ak(monkeypatch, fake)
+
+    assert atlas.remove_agency_admin_group(ctx, None) is None
+    assert fake.deleted == []
+
+
+def test_an_unreachable_authentik_does_not_fail_the_teardown(monkeypatch):
+    """The deployment's files are already gone by this point; refusing to
+    finish over an identity server that is down would strand the record."""
+    def boom(url, timeout=None):
+        raise OSError('connection refused')
+
+    import urllib.request as urlreq
+    monkeypatch.setattr(urlreq, 'urlopen', boom)
+    ctx = {
+        'load_settings': lambda: {},
+        '_get_authentik_env_value': lambda s, k: 'tok',
+        '_get_authentik_api_url': lambda s: 'http://127.0.0.1:9090',
+    }
+
+    assert atlas.remove_agency_admin_group(ctx, CORONA) is None
+
+
+def test_removal_calls_it(monkeypatch):
+    """⚠️ The wiring, not just the helper. The helper existing and never being
+    called is exactly the state the box was found in."""
+    import inspect
+
+    source = inspect.getsource(atlas.remove_instance)
+
+    assert 'remove_agency_admin_group(' in source
