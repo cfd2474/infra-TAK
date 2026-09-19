@@ -158,6 +158,26 @@ BACKSLASH = chr(92)
 #: inline `getattr` a reader would skim past.
 O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 
+
+def _running_as_root():
+    """Is this console uid 0?
+
+    ⚠️ **The question is the euid, not whether `ctx` carries a seam
+    (W242).** `_write_root_key` used to branch on `_write_priv` being
+    absent, and the console exports `_write_priv` in `_MODULE_CTX`
+    *always* -- on root consoles too. So the hardened branch was
+    unreachable in production and a root console still went through the
+    seam's root path, which is a plain `open()` plus `chmod` followed by
+    `os.chown(path, ...)`: both follow a planted symlink, which is the
+    whole thing the hardening was for.
+
+    ⚠️ Windows has no `geteuid`, and the test runner is Windows. Absent
+    means "not root", which routes to the brokered path -- the safe answer
+    for a platform that is never a box.
+    """
+    geteuid = getattr(os, 'geteuid', None)
+    return geteuid is not None and geteuid() == 0
+
 APP_UID = 1000
 APP_GID = 1000
 
@@ -2353,7 +2373,7 @@ def _write_own(path, body, perm=0o644):
     os.chmod(path, perm)
 
 
-def _write_root_key(path, pem, ctx=None):
+def _write_root_key(path, pem, ctx=None, inst=None):
     """Put the root key on disk for the length of one command. Error, or None.
 
     ⚠️ Created 0600, never world-readable for an instant — the same
@@ -2374,8 +2394,7 @@ def _write_root_key(path, pem, ctx=None):
     brokered one, so the `EPERM` that made W230 remove it does not return.
     """
     body = pem if pem.endswith(chr(10)) else pem + chr(10)
-    writer = (ctx or {}).get('_write_priv')
-    if writer is None:
+    if _running_as_root():
         # ⚠️ **`O_NOFOLLOW`, and the chown on the fd, not the path (W240).**
         # A root-era console writes here as uid 0 into `pki/`, which the
         # *container* owns. A compromised container that plants
@@ -2394,30 +2413,36 @@ def _write_root_key(path, pem, ctx=None):
             os.write(fd, body.encode())
             # On the descriptor, so nothing can be swapped underneath between
             # the write and the handover.
-            if hasattr(os, 'fchown'):
-                os.fchown(fd, APP_UID, APP_GID)
+            os.fchown(fd, APP_UID, APP_GID)
         finally:
             os.close(fd)
         return None
-    else:
-        try:
-            # ⚠️ **`perm`, not `mode`.** The seam is
-            # `_write_priv(path, content, mode='w', perm=None)`: `mode` is the
-            # *open* mode and `perm` is the permission bits. W235 passed
-            # `mode=0o600`, which corrupted the open mode and left `perm`
-            # unset, so the broker wrote the root key at its default 0644 --
-            # world-readable, and this is the one file in the system where
-            # that matters most. Found on the box, on a real ceremony.
-            writer(path, body, perm=0o600)
-        except Exception as exc:
-            return 'could not stage the key: %s' % exc
-    # Only the brokered branch reaches here: the root-era one chowned its own
-    # descriptor and returned.
+
+    writer = (ctx or {}).get('_write_priv')
+    if writer is None:
+        return ('no privileged writer available to stage the root key; this '
+                'console is neither root nor has a broker.')
+    try:
+        # ⚠️ **`perm`, not `mode`.** The seam is
+        # `_write_priv(path, content, mode='w', perm=None)`: `mode` is the
+        # *open* mode and `perm` is the permission bits. W235 passed
+        # `mode=0o600`, which corrupted the open mode and left `perm` unset,
+        # so the broker wrote the root key at its default 0644 --
+        # world-readable, and this is the one file in the system where that
+        # matters most. Found on the box, on a real ceremony.
+        #
+        # ⚠️ The broker opens console-owned prefixes `O_NOFOLLOW` and checks
+        # realpath containment, so the symlink hardening the root branch does
+        # by hand is already done for us here.
+        writer(path, body, perm=0o600)
+    except Exception as exc:
+        return 'could not stage the key: %s' % exc
+
     err = _chown_priv(path, APP_UID, APP_GID)
     if err:
         # ⚠️ Staged but unreadable by the process that needs it. Leaving it
         # there would be the exposure with none of the benefit.
-        _shred(path)
+        _shred(path, ctx, inst)
         return 'could not hand the staged key to the container: %s' % err
     return None
 
@@ -4946,7 +4971,7 @@ def register(ctx):
             if 'PRIVATE KEY' not in key_pem:
                 return jsonify({'success': False, 'error': 'that is not a PEM private key'}), 400
             try:
-                staging_err = _write_root_key(key_path, key_pem, ctx)
+                staging_err = _write_root_key(key_path, key_pem, ctx, inst)
             except Exception as exc:
                 staging_err = 'could not stage the key: %s' % exc
             if staging_err:

@@ -386,6 +386,19 @@ MODULE = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
 PAGE = (ROOT / 'templates' / 'atlas.html').read_text(encoding='utf-8')
 
 
+def _body_of(name):
+    """A module-level function's executable source, comments stripped.
+
+    Same reasoning as `_view_code` below: a guard must match executable
+    code, never the prose explaining the guard.
+    """
+    code = re.sub(TRIPLE + r'[\s\S]*?' + TRIPLE, '', MODULE)
+    code = re.sub(r'#[^\n]*', '', code)
+    start = code.index('def %s(' % name)
+    rest = code[start:]
+    return rest[:rest.index(chr(10) + 'def ', 1)]
+
+
 def _view_code(name):
     """A view's source with comments and docstrings removed.
 
@@ -511,6 +524,7 @@ def test_a_supplied_root_key_is_written_through_the_broker(tmp_path,
     used raised PermissionError, so supplying the key by hand could not work
     on a non-root box either -- both routes through the renewal were dead."""
     wrote = {}
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: False)
     monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: None)
     ctx = {'_write_priv': lambda path, body, **k: wrote.update(
         {'path': path, 'body': body, 'kwargs': k})}
@@ -536,6 +550,7 @@ def test_the_staged_key_is_handed_to_the_container(tmp_path, monkeypatch):
     two were the same and the code rested on that; measured on the box, they
     are not."""
     chowned = []
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: False)
     monkeypatch.setattr(atlas, '_chown_priv',
                         lambda p, u, g: chowned.append((p, u, g)))
     ctx = {'_write_priv': lambda path, body, **k: None}
@@ -550,8 +565,10 @@ def test_a_key_that_cannot_be_handed_over_is_not_left_lying_there(monkeypatch):
     only process that needs it is the exposure with none of the benefit, and
     the caller's `finally` only shreds what it believes it staged."""
     shredded = []
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: False)
     monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: 'EPERM')
-    monkeypatch.setattr(atlas, '_shred', lambda p: shredded.append(p) or True)
+    monkeypatch.setattr(atlas, '_shred',
+                        lambda p, c=None, i=None: shredded.append(p) or True)
     ctx = {'_write_priv': lambda path, body, **k: None}
 
     err = atlas._write_root_key('/x/pki/ca.key', 'KEYPEM', ctx)
@@ -560,15 +577,117 @@ def test_a_key_that_cannot_be_handed_over_is_not_left_lying_there(monkeypatch):
     assert shredded == ['/x/pki/ca.key']
 
 
-def test_a_root_era_console_still_writes_it_directly(tmp_path, monkeypatch):
-    """No broker on a root-era box, and none needed: it owns the directory."""
-    monkeypatch.setattr(atlas, '_chown_priv', lambda p, u, g: None)
+def test_the_root_predicate_reads_the_euid(monkeypatch):
+    """⚠️ **Every other test here monkeypatches this**, so on its own it
+    had no coverage at all -- a mutation making it return a constant
+    survived the whole suite. It decides which of two very different
+    write paths the root key takes, so it is worth its own test."""
+    monkeypatch.setattr(atlas.os, 'geteuid', lambda: 0, raising=False)
+    assert atlas._running_as_root() is True
+
+    monkeypatch.setattr(atlas.os, 'geteuid', lambda: 997, raising=False)
+    assert atlas._running_as_root() is False
+
+
+def test_a_platform_with_no_euid_is_not_root(monkeypatch):
+    """⚠️ Windows has no `geteuid`, and the test runner is Windows.
+    "Absent" must mean *not* root: that routes to the brokered path,
+    which is the safe answer for a platform that is never a box."""
+    monkeypatch.delattr(atlas.os, 'geteuid', raising=False)
+
+    assert atlas._running_as_root() is False
+
+
+def test_a_root_console_refuses_to_overwrite_an_existing_key(tmp_path,
+                                                             monkeypatch):
+    """⚠️ `O_EXCL`. The caller only reaches here having established that
+    no root key is on the server, so a file already sitting at that path
+    is something else -- and truncating it as root is exactly the damage
+    the symlink hardening is about, one step removed."""
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: True)
+    monkeypatch.setattr(atlas.os, 'fchown', lambda *a: None, raising=False)
+    path = tmp_path / 'ca.key'
+    path.write_text('SOMETHING-ELSE', encoding='utf-8')
+
+    with pytest.raises(OSError):
+        atlas._write_root_key(str(path), 'KEYPEM', {})
+
+    assert path.read_text(encoding='utf-8') == 'SOMETHING-ELSE'
+
+
+def test_a_console_that_is_neither_root_nor_brokered_says_so(tmp_path,
+                                                             monkeypatch):
+    """⚠️ It must not fall through and write nothing while returning
+    success -- the caller then runs the ceremony against a key that is
+    not there, and the error surfaces inside the container where nobody
+    can place it."""
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: False)
+
+    err = atlas._write_root_key(str(tmp_path / 'ca.key'), 'KEYPEM', {})
+
+    assert err and 'no privileged writer' in err
+    assert not (tmp_path / 'ca.key').exists()
+
+def test_a_root_console_writes_it_directly_with_nofollow(tmp_path, monkeypatch):
+    """{W} **Keyed on the euid, not on the seam (W242).**
+
+    This branched on `_write_priv` being absent from `ctx`, and the console
+    exports `_write_priv` in `_MODULE_CTX` *always* -- on root consoles too.
+    So the hardened branch was unreachable in production: a root console
+    went through the seam's root path, a plain `open()` plus `chmod`
+    followed by `os.chown(path, ...)`, and both of those follow a planted
+    symlink. The test passed only because it called the function with
+    `ctx=None`, which production never does.
+
+    {W} And `fchown(fd, 1000, 1000)` is `EPERM` for anyone but root, so the
+    old test could only ever pass on Windows, where there is no `fchown` at
+    all. Both are supplied here.
+    """
+    monkeypatch.setattr(atlas, '_running_as_root', lambda: True)
+    fchowned = []
+    monkeypatch.setattr(atlas.os, 'fchown',
+                        lambda fd, u, g: fchowned.append((u, g)),
+                        raising=False)
+    opened = []
+    real_open = atlas.os.open
+    monkeypatch.setattr(atlas.os, 'open',
+                        lambda p, flags, mode=0o777:
+                        opened.append(flags) or real_open(p, flags, mode))
     path = tmp_path / 'ca.key'
 
-    err = atlas._write_root_key(str(path), 'KEYPEM', None)
+    # A ctx that carries the seam, exactly as the console hands it over.
+    err = atlas._write_root_key(str(path), 'KEYPEM',
+                                {'_write_priv': _must_not_be_called})
 
     assert err is None
     assert path.read_text(encoding='utf-8') == 'KEYPEM' + chr(10)
+    assert fchowned == [(atlas.APP_UID, atlas.APP_GID)], (
+        'the handover must be on the descriptor')
+    assert opened, 'nothing was opened'
+    # ⚠️ Only assertable where the flag exists. On Windows it is 0, so
+    # `f & 0` is 0 for every honest implementation and the check would
+    # fail on correct code. The *intent* is pinned platform-independently
+    # by `test_the_root_era_key_write_refuses_a_symlink`, which reads the
+    # source.
+    if atlas.O_NOFOLLOW:
+        assert all(f & atlas.O_NOFOLLOW for f in opened), opened
+
+
+def _must_not_be_called(*_a, **_k):
+    raise AssertionError(
+        'a root console must not route the root key through _write_priv: '
+        'that path is a plain open() and an os.chown(path, ...), and both '
+        'follow a symlink planted by the container that owns pki/')
+
+
+def test_the_branch_is_on_the_euid_not_on_the_seam():
+    """{W} The guard that keeps it reachable. `_write_priv` is always in
+    `ctx`, so branching on it puts the hardening behind a condition
+    production never meets."""
+    body = _body_of('_write_root_key')
+
+    assert '_running_as_root()' in body
+    assert body.index('_running_as_root()') < body.index('_write_priv')
 
 
 def test_the_renewed_trust_bundle_is_staged_for_its_own_deployment():
