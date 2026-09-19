@@ -292,3 +292,102 @@ def test_the_nofollow_flag_is_named_once_and_degrades_visibly():
     comment rather than an inline `getattr` a reader would skim past."""
     assert hasattr(atlas, 'O_NOFOLLOW')
     assert 'getattr(os, ' + chr(39) + 'O_NOFOLLOW' + chr(39) in SOURCE
+
+# ------------------------------------------------------------------------- #
+# The update path repairs what W240 would otherwise have stranded (W243)
+# ------------------------------------------------------------------------- #
+
+
+def test_an_unreadable_env_is_repaired_through_the_broker(tmp_path,
+                                                          monkeypatch):
+    """⚠️ **W240 turned a silent failure into a stranded deployment.**
+    Every deployment built before it has a root-owned `.env`, the three
+    readers now raise rather than swallow, and `_run_update` calls all
+    three -- so an update of exactly the population that has the bug
+    would stop dead, with a full re-deploy the only way out.
+
+    `deploy` repairs it as a side effect because `_write_own` rewrites
+    the file wholesale; an update never does, so the repair is explicit.
+    """
+    env = tmp_path / '.env'
+    env.write_text('TAKMDM_DB_PASSWORD=keepme' + chr(10), encoding='utf-8')
+    monkeypatch.setattr(atlas.os, 'access', lambda p, m: False)
+    ctx = {'_read_priv': lambda p: io.open(p, encoding='utf-8').read()}
+    said = []
+
+    repaired = atlas._repair_env_ownership(str(env), ctx, said.append)
+
+    assert repaired is True
+    # ⚠️ Byte-for-byte. It carries the database password, and
+    # regenerating it from the template would need every value deploy
+    # had -- getting one wrong silently is worse than the bug.
+    assert env.read_text(encoding='utf-8') == \
+        'TAKMDM_DB_PASSWORD=keepme' + chr(10)
+    assert said and '.env' in said[0]
+
+
+def test_a_readable_env_is_left_alone(tmp_path):
+    """⚠️ The repair unlinks and recreates. Running it on a healthy file
+    would be a pointless window in which the deployment has no `.env`.
+
+    ⚠️ The broker IS supplied here. Without it the test passes on the
+    no-reader early return and says nothing about `os.access` -- which is
+    how a mutant that repaired every file survived the first version.
+    """
+    env = tmp_path / '.env'
+    env.write_text('FINE=1', encoding='utf-8')
+    asked = []
+    ctx = {'_read_priv': lambda p: asked.append(p) or 'REWRITTEN'}
+
+    assert atlas._repair_env_ownership(str(env), ctx) is False
+
+    assert env.read_text(encoding='utf-8') == 'FINE=1'
+    assert asked == [], 'a readable file was read through the broker'
+
+
+@pytest.mark.parametrize('ctx_kind', ['no broker', 'broker answers nothing'])
+def test_an_env_that_cannot_be_recovered_is_left_for_the_reader(tmp_path,
+                                                                monkeypatch,
+                                                                ctx_kind):
+    """⚠️ Not repairable, and not ours to guess at. Letting the reader that
+    follows raise says plainly which file and why; **inventing a replacement
+    would put a deployment on a database password it has never used**, and
+    Postgres only honours POSTGRES_PASSWORD on an empty volume -- so that
+    deployment could never authenticate again.
+    """
+    env = tmp_path / '.env'
+    env.write_text('SECRET=1', encoding='utf-8')
+    monkeypatch.setattr(atlas.os, 'access', lambda p, m: False)
+    ctx = {} if ctx_kind == 'no broker' else {'_read_priv': lambda p: ''}
+
+    assert atlas._repair_env_ownership(str(env), ctx) is False
+
+    assert env.read_text(encoding='utf-8') == 'SECRET=1'
+
+
+def test_the_repaired_env_keeps_0600(tmp_path, monkeypatch):
+    """{W} It carries the database password and the proxy-auth secret. The
+    helper it calls defaults to 0644, so the mode has to be asked for -- and
+    asking is a separate act from the helper honouring it."""
+    env = tmp_path / '.env'
+    env.write_text('TAKMDM_DB_PASSWORD=x', encoding='utf-8')
+    monkeypatch.setattr(atlas.os, 'access', lambda p, m: False)
+    wrote = []
+    monkeypatch.setattr(atlas, '_write_own',
+                        lambda p, b, perm=0o644: wrote.append(perm))
+
+    atlas._repair_env_ownership(
+        str(env), {'_read_priv': lambda p: 'TAKMDM_DB_PASSWORD=x'})
+
+    assert wrote == [0o600], wrote
+
+
+def test_the_update_repairs_before_it_reads():
+    """A repair after the read is no repair: the read raises first."""
+    body = _body('_run_update')
+
+    assert '_repair_env_ownership(' in body
+    for reader in ('_set_trusted_proxies', '_arm_admin_gates',
+                   '_push_email_relay'):
+        assert body.index('_repair_env_ownership(') < body.index(reader), \
+            reader

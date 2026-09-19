@@ -2373,6 +2373,49 @@ def _write_own(path, body, perm=0o644):
     os.chmod(path, perm)
 
 
+def _repair_env_ownership(env_path, ctx, plog=None):
+    """Give a root-owned `.env` back to the console. True if it repaired one.
+
+    ⚠️ **Without this, W240 turned a silent failure into a stranded
+    deployment.** Every deployment built before that fix has a `root:root`
+    `.env`; the fix made the three readers raise instead of returning False,
+    and `_run_update` calls all three. So an update of an existing
+    deployment stopped dead with a `PermissionError` and the only way out
+    was a full re-deploy — on the exact population that has the bug.
+
+    `deploy` repairs it as a side effect, because `_write_own` rewrites the
+    file wholesale. An update never rewrites it -- `write_env_value` edits
+    single lines -- so the repair has to be explicit here.
+
+    ⚠️ **The content is preserved exactly, through the broker.** It carries
+    the database password: regenerating it from the template would need
+    every value deploy had, and getting one wrong silently is worse than the
+    bug. The broker can read what the console cannot, and the console owns
+    the *directory*, so it can unlink and recreate.
+    """
+    if os.access(env_path, os.R_OK):
+        return False
+
+    reader = (ctx or {}).get('_read_priv')
+    if reader is None:
+        return False
+    try:
+        body = reader(env_path)
+    except Exception:
+        return False
+    if not body:
+        # ⚠️ Not repairable, and not ours to guess at. Let the reader that
+        # follows raise, which says plainly which file and why.
+        return False
+
+    os.unlink(env_path)
+    _write_own(env_path, body, 0o600)
+    if plog:
+        plog('  ✓ .env handed back to the console (it was root-owned by an '
+             'earlier release)')
+    return True
+
+
 def _write_root_key(path, pem, ctx=None, inst=None):
     """Put the root key on disk for the length of one command. Error, or None.
 
@@ -4302,6 +4345,11 @@ def _run_update(ctx, inst=None):
             raise RuntimeError('git fetch failed: ' + (r.stderr or '')[-300:])
         ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
         _write_build_file(dirpath, plog)
+        # ⚠️ **Before anything reads it (W243).** A deployment built
+        # before W240 has a root-owned `.env`; the readers below now raise
+        # rather than swallow, so without this an update of exactly the
+        # population that has the bug would stop dead.
+        _repair_env_ownership(os.path.join(dirpath, '.env'), ctx, plog)
         plog('✓ Source now at ' + tag)
 
         # ⚠️ Before the rebuild, or the new image starts without the setting and
