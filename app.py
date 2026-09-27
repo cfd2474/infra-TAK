@@ -38120,7 +38120,8 @@ def cloudtak_plugin_log_api():
     })
 
 
-def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host=''):
+def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host='',
+                                store_endpoint='http://store:9000'):
     """Build CloudTAK .env content for local or remote target.
 
     postgres_pass: strong random password for the postgis DB. Defaults to
@@ -38158,7 +38159,7 @@ CLOUDTAK_Config_media_url={media_url}
 SigningSecret={signing_secret}
 
 ASSET_BUCKET=cloudtak
-AWS_S3_Endpoint=http://store:9000
+AWS_S3_Endpoint={store_endpoint}
 AWS_S3_AccessKeyId=cloudtakminioadmin
 AWS_S3_SecretAccessKey={minio_pass}
 MINIO_ROOT_USER=cloudtakminioadmin
@@ -38640,6 +38641,57 @@ def _compose_cmd(remote_cfg=None):
     if subprocess.run('docker-compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
         return 'docker-compose'
     return None
+
+
+def _cloudtak_store_endpoint(cloudtak_dir=None, existing_env_text=''):
+    """The S3 endpoint CloudTAK's store actually listens on: MinIO 9000 or Garage 3900.
+
+    WHY (2026-09-27). CloudTAK is replacing MinIO with Garage (upstream PR #1847, open at the
+    time of writing but read directly rather than guessed). Its compose moves the store to
+    `dxflrs/garage`, publishes 127.0.0.1:3900, and — importantly — feeds Garage its credentials
+    FROM .env: GARAGE_DEFAULT_ACCESS_KEY=${AWS_S3_AccessKeyId}. It also hard-fails compose when
+    GARAGE_RPC_SECRET is unset (`:?`).
+
+    Our generator hardcoded `http://store:9000`, and AWS_S3_Endpoint is a key we are
+    authoritative for, so `_cloudtak_env_preserve_unknown()` will NOT protect it. On a box that
+    has moved to Garage, one infra-TAK reconfig would therefore point CloudTAK back at port
+    9000 and the store would be unreachable — the assets are fine, the address is wrong.
+
+    So read the box instead of assuming. Two independent signals, either one sufficient: the
+    compose `store` service running a garage image, or a GARAGE_RPC_SECRET already in .env.
+    Defaults to 9000, so today's MinIO boxes are unaffected.
+    """
+    try:
+        if re.search(r'(?m)^\s*GARAGE_RPC_SECRET\s*=\s*\S', existing_env_text or ''):
+            return 'http://store:3900'
+        for _fname in ('docker-compose.yml', 'compose.yaml'):
+            _p = os.path.join(cloudtak_dir or '', _fname)
+            if not os.path.isfile(_p):
+                continue
+            with open(_p) as f:
+                _body = f.read()
+            # Walk the `store:` block by indentation rather than regexing a YAML block:
+            # keys INSIDE the service (environment:, ports:) also look like a sibling key,
+            # so a lookahead-terminated match can end before it reaches `image:`.
+            _lines = _body.splitlines()
+            _base = None
+            for _ln in _lines:
+                _st = _ln.strip()
+                if _base is None:
+                    if _st == 'store:':
+                        _base = len(_ln) - len(_ln.lstrip())
+                    continue
+                if _st and not _st.startswith('#') and (len(_ln) - len(_ln.lstrip())) <= _base:
+                    break                      # left the store block
+                _im = re.match(r'image:\s*(\S+)', _st)
+                if _im:
+                    if 'garage' in _im.group(1).lower():
+                        return 'http://store:3900'
+                    break
+            break
+    except Exception:
+        pass
+    return 'http://store:9000'
 
 
 def _cloudtak_env_preserve_unknown(generated, existing_text):
@@ -40308,7 +40360,9 @@ def run_cloudtak_redeploy(cfg=None):
         # the volume with). Strong passwords only land on Remove + Reinstall.
         if not postgres_pass:
             postgres_pass = 'docker'
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
+        env_content = _cloudtak_build_env_content(
+            settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
         # never delete a key CloudTAK grew that we know nothing about (e.g. a store cluster secret)
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
