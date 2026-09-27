@@ -38642,6 +38642,119 @@ def _compose_cmd(remote_cfg=None):
     return None
 
 
+def _cloudtak_env_preserve_unknown(generated, existing_text):
+    """Keep every KEY= line CloudTAK's .env already had that we do not write ourselves.
+
+    WHY (2026-09-27). Every reconfig regenerates .env wholesale from
+    `_cloudtak_build_env_content()` and preserves exactly three secrets by name:
+    SigningSecret, MINIO_ROOT_PASSWORD, POSTGRES_PASSWORD. Any OTHER key CloudTAK grows is
+    silently deleted on the next reconfig. That is the same defect class as the TAK Portal
+    settings.json overwrites, which recurred three times in one file — see the
+    "Third-party app config is operator-owned" rule. The fix direction there was earned:
+    write only the keys we are authoritative for and leave the rest alone.
+
+    It is about to bite for real. CloudTAK is replacing MinIO with Garage (upstream
+    PR #1847) because minio/minio is no longer pullable from ANY public registry —
+    measured 2026-09-27: Docker Hub denied, the quay.io tags removed, ghcr denied. Garage
+    keeps a GARAGE_RPC_SECRET that is the cluster's identity: regenerate .env without it
+    and the store loses its data path. We do not need to know that key's name in advance
+    to stop deleting it, so this is written now rather than after the field report.
+
+    Ours wins on conflict (we are authoritative for what we write); theirs survives when we
+    say nothing about it.
+    """
+    def _keys(text):
+        out = []
+        for line in (text or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            out.append(line.split('=', 1)[0].strip())
+        return out
+
+    ours = set(_keys(generated))
+    kept = []
+    seen = set()
+    for line in (existing_text or '').splitlines():
+        st = line.strip()
+        if not st or st.startswith('#') or '=' not in st:
+            continue
+        k = st.split('=', 1)[0].strip()
+        if k in ours or k in seen:
+            continue
+        seen.add(k)
+        kept.append(st)
+    if not kept:
+        return generated
+    block = ('\n# --- preserved from the previous .env by infra-TAK ---\n'
+             '# Keys CloudTAK (or the operator) set that infra-TAK does not manage. They are\n'
+             '# carried across reconfigs rather than regenerated, because some of them are\n'
+             '# identities that cannot be recreated (e.g. a store cluster secret).\n')
+    return generated.rstrip('\n') + '\n' + block + '\n'.join(kept) + '\n'
+
+
+def _cloudtak_store_image_status(cloudtak_dir, log=None):
+    """Say plainly whether CloudTAK's object-store image can still be pulled.
+
+    WHY (2026-09-27, GitHub #73). `minio/minio` is gone from every public registry we can
+    reach. Measured from test6 with anonymous docker credentials:
+        docker.io/minio/minio:<pin>   -> denied / authentication required
+        quay.io/minio/minio:<pin>     -> no such manifest (the tags were REMOVED; the
+                                         quay API now 401s for that repository entirely)
+        ghcr.io/minio/minio:latest    -> denied
+        bitnami/minio:latest          -> no such manifest
+    So `_patch_cloudtak_minio_registry()`, which repoints the pin at quay.io, can no longer
+    help: its target is gone too. An existing box keeps running only because the image is
+    already in its local cache.
+
+    That turns a NEW CloudTAK install into `pull access denied for minio/minio`, which reads
+    like the operator's Docker Hub login is broken and sends them looking in the wrong place.
+    The real answer is upstream: CloudTAK is replacing MinIO with Garage (PR #1847), and
+    `dxflrs/garage` IS pullable today. So say the true thing instead of letting a registry
+    error stand in for it. Detection only — this does not attempt to substitute an image,
+    because the store's credentials are created differently by Garage and guessing that is
+    how you corrupt someone's map assets.
+    """
+    def _say(m):
+        if log:
+            log(m)
+        else:
+            print(m, flush=True)
+    try:
+        compose = os.path.join(cloudtak_dir or '', 'docker-compose.yml')
+        if not os.path.isfile(compose):
+            compose = os.path.join(cloudtak_dir or '', 'compose.yaml')
+        if not os.path.isfile(compose):
+            return True, ''
+        with open(compose) as f:
+            body = f.read()
+        m = re.search(r'(?m)^\s*image:\s*(\S*minio/minio:\S+)', body)
+        if not m:
+            return True, ''          # not a MinIO-based CloudTAK (Garage or newer) — nothing to warn about
+        img = m.group(1).strip().strip('"\'')
+        if subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', img]),
+                          capture_output=True, timeout=30).returncode == 0:
+            return True, img         # already cached locally: this box can still start
+        r = subprocess.run(_sudo_wrap(['docker', 'manifest', 'inspect', img]),
+                           capture_output=True, text=True, timeout=90)
+        if r.returncode == 0:
+            return True, img
+        _say('')
+        _say('  ⚠ CloudTAK\'s object-store image cannot be pulled: %s' % img)
+        _say('    This is NOT a problem with this server or with your Docker login. MinIO')
+        _say('    withdrew its images from the public registries, so nobody can pull that tag')
+        _say('    any more — Docker Hub denies it and the quay.io mirror\'s tags were removed.')
+        _say('    CloudTAK is replacing MinIO with Garage upstream (PR #1847). Until that lands')
+        _say('    in a CloudTAK release, a NEW CloudTAK install cannot complete. A CloudTAK that')
+        _say('    is already running is unaffected: its store image is already on this box.')
+        _say('    Tracking: https://github.com/takwerx/infra-TAK/issues/73')
+        _say('')
+        return False, img
+    except Exception as e:
+        _say('  (could not check the object-store image: %s)' % str(e)[:120])
+        return True, ''
+
+
 def _patch_cloudtak_minio_registry(cloudtak_dir=None):
     """Repoint CloudTAK's minio image at quay.io. Returns True if a file changed.
 
@@ -39486,8 +39599,11 @@ def run_cloudtak_deploy(cfg=None):
         # after the last console restart (CORAZ) stayed broken until hand-fixed.
         try:
             # minio/minio is no longer anonymously pullable from Docker Hub and the pin is in
-            # CloudTAK's own compose — repoint it before anything tries to pull.
+            # CloudTAK's own compose — repoint it before anything tries to pull. As of
+            # 2026-09-27 the quay.io mirror lost the tag too, so the repoint alone is no
+            # longer enough: say so plainly rather than letting a registry error speak.
             _patch_cloudtak_minio_registry(cloudtak_dir)
+            _cloudtak_store_image_status(cloudtak_dir, log=plog)
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -40008,6 +40124,19 @@ def run_cloudtak_redeploy(cfg=None):
             except Exception:
                 pass
             env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
+            # Same rule as the local reconfig: keep any key we do not manage. Read the whole
+            # remote .env rather than grepping one name at a time — we cannot grep for a key
+            # whose name we do not know yet, which is the entire point.
+            try:
+                _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null', timeout=20)
+                if _ok_env and (_rem_env or '').strip():
+                    _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
+                    if _merged != env_content:
+                        plog("  Preserving %d unmanaged key(s) from the remote .env"
+                             % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
+                    env_content = _merged
+            except Exception:
+                pass
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
@@ -40060,16 +40189,21 @@ def run_cloudtak_redeploy(cfg=None):
         signing_secret = None
         minio_pass = None
         postgres_pass = None
+        existing_env_text = ''
         if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('SigningSecret='):
-                        signing_secret = line.split('=', 1)[1].strip()
-                    elif line.startswith('MINIO_ROOT_PASSWORD='):
-                        minio_pass = line.split('=', 1)[1].strip()
-                    elif line.startswith('POSTGRES_PASSWORD='):
-                        postgres_pass = line.split('=', 1)[1].strip()
+            try:
+                with open(env_path) as f:
+                    existing_env_text = f.read()
+            except Exception:
+                existing_env_text = ''
+            for line in existing_env_text.splitlines():
+                line = line.strip()
+                if line.startswith('SigningSecret='):
+                    signing_secret = line.split('=', 1)[1].strip()
+                elif line.startswith('MINIO_ROOT_PASSWORD='):
+                    minio_pass = line.split('=', 1)[1].strip()
+                elif line.startswith('POSTGRES_PASSWORD='):
+                    postgres_pass = line.split('=', 1)[1].strip()
         import secrets as _secrets
         if not signing_secret:
             signing_secret = _secrets.token_hex(32)
@@ -40082,6 +40216,8 @@ def run_cloudtak_redeploy(cfg=None):
         if not postgres_pass:
             postgres_pass = 'docker'
         env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
+        # never delete a key CloudTAK grew that we know nothing about (e.g. a store cluster secret)
+        env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
             f.write(env_content)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
