@@ -212,13 +212,48 @@ gd_pg_unit() {
   echo postgresql   # nothing discoverable; keep the historical name so errors read sensibly
 }
 
-# gd_db_running    -> 0 if the database is up (remote host, native service, OR db container)
+# gd_db_container_state -> "true"/"false" if a database CONTAINER by the configured name
+# exists on this box, or empty when there is none (or no docker at all). Empty means "this
+# is not a containerised database", which is a different answer from "it is stopped".
+gd_db_container_state() {
+  [ -n "$GD_DB_CONTAINER" ] || return 0
+  docker inspect -f '{{.State.Running}}' "$GD_DB_CONTAINER" 2>/dev/null
+}
+
+# gd_db_running    -> 0 if the database is up (db container, remote host, OR native service)
+#
+# ORDER MATTERS, and it used to be wrong. `gd_db_is_remote` was asked FIRST, and it decides
+# from the DB hostname in CoreConfig. On a containerised TAK that hostname is a
+# docker-network alias — measured on the ARM box 2026-09-27: host `tak-database`, which the
+# HOST cannot resolve at all. So it was classified REMOTE, the host-side TCP probe to
+# tak-database:5432 failed, and the container branch was never reached: a permanently
+# "down" database on a box whose DB container was running and whose TAK was serving on 8443.
+# 84 Database Alerts between Sep 04 and Sep 22 on that box, every one of them false. They
+# never reached anyone only because that box has no alert recipient configured — a customer
+# with alerting on gets it hourly. Same disease as the hardcoded `postgresql-15` above, on
+# the other deployment shape.
+#
+# So ask for EVIDENCE, cheapest and most specific first, instead of inferring the shape from
+# a hostname:
+#   1. a database container by the configured name exists -> its state is the answer
+#      (running = up, stopped = a REAL outage, not a fall-through)
+#   2. no such container, and the host is somebody else's -> probe that host
+#   3. otherwise -> the local service
+# A containerised TAK pointed at an external managed database has no local DB container, so
+# it still lands on the remote probe, which is correct for that shape.
 gd_db_running() {
+  local _state
+  _state="$(gd_db_container_state)"
+  # A RUNNING database container is the database, whatever CoreConfig's hostname looks like.
+  [ "$_state" = "true" ] && return 0
+  # Stopped is a real outage only on a box that actually runs TAK in containers. A box that
+  # moved from containerised to native leaves a stopped `takserver-db` behind, and treating
+  # that corpse as the live database would invent the very false alarm this is fixing.
+  # No such leftover exists on the fleet today (checked) — this is so it stays true later.
+  [ "$_state" = "false" ] && gd_is_container && return 1
   if gd_db_is_remote; then
     # There is no local service to ask. Probe the machine TAK actually uses.
     gd_tcp_up "$(gd_db_host)" 5432
-  elif gd_is_container; then
-    [ "$(docker inspect -f '{{.State.Running}}' "$GD_DB_CONTAINER" 2>/dev/null)" = "true" ]
   else
     systemctl is-active --quiet "$(gd_pg_unit)" 2>/dev/null
   fi
@@ -229,10 +264,16 @@ gd_db_running() {
 # bounce some unrelated local postgres while the real database sits untouched on another
 # host. Returns 1 so callers report "not restarted" instead of claiming a fix.
 gd_db_restart() {
-  if gd_db_is_remote; then
-    return 1
-  elif gd_is_container; then
+  local _st
+  # Same evidence order as gd_db_running(): a real DB container is restarted as a container,
+  # whatever CoreConfig's hostname looks like. Before this, a containerised box took the
+  # remote branch and returned 1 — so the watchdog could not restart a database it was also
+  # wrongly reporting as down.
+  _st="$(gd_db_container_state)"
+  if [ "$_st" = "true" ] || { [ "$_st" = "false" ] && gd_is_container; }; then
     docker restart "$GD_DB_CONTAINER" >/dev/null 2>&1
+  elif gd_db_is_remote; then
+    return 1
   else
     # Same reasoning as gd_pg_unit(): restarting a hardcoded `postgresql-15` on a migrated
     # RHEL box would try to start the OLD, superseded cluster while PG18 holds the port.
