@@ -38694,6 +38694,27 @@ def _cloudtak_store_endpoint(cloudtak_dir=None, existing_env_text=''):
     return 'http://store:9000'
 
 
+def _cloudtak_remote_store_endpoint(remote_cfg):
+    """`_cloudtak_store_endpoint()` for a CloudTAK that lives on another host.
+
+    Same two signals, asked over SSH: a garage image on the compose `store` service, or a
+    non-empty GARAGE_RPC_SECRET in .env. Defaults to MinIO's 9000 on any doubt, so a box we
+    cannot read is left exactly as it is today.
+    """
+    try:
+        ok, out = _ssh_probe(
+            remote_cfg,
+            "grep -qs '^GARAGE_RPC_SECRET=.\\+' ~/CloudTAK/.env && echo GARAGE; "
+            "awk '/^[[:space:]]*store:/{f=1;next} f&&/^[[:space:]]*[a-zA-Z_-]+:[[:space:]]*$/{exit} "
+            "f&&/image:/{print; exit}' ~/CloudTAK/docker-compose.yml 2>/dev/null",
+            timeout=20)
+        if ok and 'garage' in (out or '').lower():
+            return 'http://store:3900'
+    except Exception:
+        pass
+    return 'http://store:9000'
+
+
 def _cloudtak_env_preserve_unknown(generated, existing_text):
     """Keep every KEY= line CloudTAK's .env already had that we do not write ourselves.
 
@@ -39421,7 +39442,12 @@ def run_cloudtak_deploy(cfg=None):
                     pass
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
+            # The clone above already put CloudTAK's compose on the remote box, so a FRESH
+            # install of a Garage-based CloudTAK is detected here rather than written wrong.
+            env_content = _cloudtak_build_env_content(
+                settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+                remote_host=remote_host,
+                store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -39713,7 +39739,11 @@ def run_cloudtak_deploy(cfg=None):
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
 
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
+        # The clone above is already on disk, so a FRESH install of a Garage-based CloudTAK
+        # gets port 3900 instead of MinIO's 9000.
+        env_content = _cloudtak_build_env_content(
+            settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
         with open(env_path, 'w') as f:
             f.write(env_content)
         try:
@@ -40268,7 +40298,10 @@ def run_cloudtak_redeploy(cfg=None):
                     plog("  Preserving existing postgis password from remote .env")
             except Exception:
                 pass
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
+            env_content = _cloudtak_build_env_content(
+                settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+                remote_host=remote_host,
+                store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
             # Same rule as the local reconfig: keep any key we do not manage. Read the whole
             # remote .env rather than grepping one name at a time — we cannot grep for a key
             # whose name we do not know yet, which is the entire point.
