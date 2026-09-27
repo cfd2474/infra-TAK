@@ -408,6 +408,13 @@ async function refreshAnchorStatus(){
     const connected = d.up && d.handshake_secs != null && d.handshake_secs < 180;
     if((d.configured || connected) && !anchorReconfiguring){
       document.getElementById('anchor-card').style.display = 'block';
+      // A box that already HAS a relay must never be told the relay is "optional for this
+      // network" — that note is for someone who has none and whose network was not recommended
+      // one. Without this, a box with a live tunnel showed "Optional for this network ... not
+      // the recommended route here" directly above "Tunnel up", which reads like a bug.
+      // Caught by the operator asking whether to test on a box that is using a relay.
+      var _optNote = document.getElementById('anchor-optional-note');
+      if(_optNote){ _optNote.style.display = 'none'; }
       showRelayForm(false);
       const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
         + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||51820) : ''))
