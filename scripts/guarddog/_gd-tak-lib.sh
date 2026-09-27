@@ -183,6 +183,35 @@ gd_db_is_remote() {
   return 0
 }
 
+# gd_pg_unit       -> the systemd unit that IS this box's PostgreSQL, whatever major it is.
+#
+# Debian/Ubuntu ship a `postgresql` wrapper unit that covers every cluster, so it stays
+# correct across a major upgrade. RHEL/Rocky do NOT: there the unit is `postgresql-<major>`,
+# and the major CHANGES when the TAK 5.8 migration moves 15 -> 18.
+#
+# This used to be hardcoded as `postgresql || postgresql-15`. Measured on nuc 2026-09-26,
+# after its 5.8 migration: `postgresql` inactive, `postgresql-15` inactive, and
+# `postgresql-18` active and serving on 5432. So the check returned "down" forever — a
+# daily false alarm by email AND, far worse, a watchdog that could no longer distinguish a
+# real outage from its own standing lie. Resolve the unit instead of assuming its number.
+#
+# Order matters: prefer whatever is ACTIVE (that is the truth right now), and only fall back
+# to the newest installed unit when nothing is running — which is exactly the case the
+# caller is about to try to repair.
+gd_pg_unit() {
+  local u
+  systemctl is-active --quiet postgresql 2>/dev/null && { echo postgresql; return 0; }
+  for u in $(systemctl list-units --all --type=service --no-legend 'postgresql-*.service' 'postgresql@*.service' 2>/dev/null \
+             | awk '{print $1}' | sed 's/\.service$//' | sort -V -r); do
+    systemctl is-active --quiet "$u" 2>/dev/null && { echo "$u"; return 0; }
+  done
+  for u in $(systemctl list-unit-files --no-legend 'postgresql-*.service' 'postgresql@*.service' 2>/dev/null \
+             | awk '{print $1}' | sed 's/\.service$//' | sort -V -r); do
+    echo "$u"; return 0
+  done
+  echo postgresql   # nothing discoverable; keep the historical name so errors read sensibly
+}
+
 # gd_db_running    -> 0 if the database is up (remote host, native service, OR db container)
 gd_db_running() {
   if gd_db_is_remote; then
@@ -191,7 +220,7 @@ gd_db_running() {
   elif gd_is_container; then
     [ "$(docker inspect -f '{{.State.Running}}' "$GD_DB_CONTAINER" 2>/dev/null)" = "true" ]
   else
-    systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet postgresql-15 2>/dev/null
+    systemctl is-active --quiet "$(gd_pg_unit)" 2>/dev/null
   fi
 }
 
@@ -205,7 +234,9 @@ gd_db_restart() {
   elif gd_is_container; then
     docker restart "$GD_DB_CONTAINER" >/dev/null 2>&1
   else
-    systemctl restart postgresql 2>/dev/null || systemctl restart postgresql-15 2>/dev/null
+    # Same reasoning as gd_pg_unit(): restarting a hardcoded `postgresql-15` on a migrated
+    # RHEL box would try to start the OLD, superseded cluster while PG18 holds the port.
+    systemctl restart "$(gd_pg_unit)" 2>/dev/null
   fi
 }
 
