@@ -71035,6 +71035,96 @@ def _tak58_s1_run_upgrade_db(s1, say, timeout=6 * 3600):
     return int(m.group(1)) if m else None
 
 
+def _tak58_s1_carry_db_tls(s1, say):
+    """Carry infra-TAK's database TLS from the OLD cluster onto the freshly upgraded one.
+
+    WHY THIS EXISTS (measured on test8 / Server One 190.102.110.222, 2026-09-27).
+    `_enable_server_one_db_tls()` puts four managed lines marked `# infra-TAK-dbtls` into
+    Server One's postgresql.conf, keeps the cert/key INSIDE that cluster's data directory,
+    and adds a `hostssl` rule to pg_hba.conf. `pg_upgradecluster` builds the new cluster with
+    NONE of it: measured afterwards, the PG18 conf had zero ssl lines, zero hostssl lines, and
+    `sslmode=require` was refused outright. CoreConfig demands sslEnabled="true"
+    sslMode="verify-full", so TAK could not connect at all — 37 database errors, zero pool
+    connections, while the migration happily reported success off an open port.
+
+    This is not an edge case: `_server_one_tls_step()` runs in the deploy tail for BOTH the
+    Debian and RHEL Server One paths, and `_migrate_split_db_tls()` retrofits existing
+    splits, so every two-server customer has this TLS.
+
+    Everything is derived from PostgreSQL itself (`SHOW config_file` / `hba_file` /
+    `data_directory`) rather than assuming a Debian layout, so a RHEL Server One works too.
+    Returns True when TLS is on afterwards, False when it could not be restored.
+    """
+    say('')
+    say('  Restoring the database TLS configuration on the new cluster…')
+    # The heredoc runs on Server One. Note the newline guard before appending to pg_hba:
+    # PG15's file had no trailing newline, and a naive append fused two rules into
+    # "md5hostssl", which made PostgreSQL refuse to start (agent error, same day).
+    script = r'''
+set -u
+OLDCONF=$(grep -l '# infra-TAK-dbtls' /etc/postgresql/*/main/postgresql.conf \
+                                      /var/lib/pgsql/*/data/postgresql.conf 2>/dev/null | head -1)
+if [ -z "$OLDCONF" ]; then echo "TLSCARRY: no infra-TAK-dbtls block anywhere — nothing to carry"; exit 0; fi
+OLDCRT=$(grep -E "^ssl_cert_file.*# infra-TAK-dbtls" "$OLDCONF" | sed -E "s/.*=\s*'([^']+)'.*/\1/")
+OLDKEY=$(grep -E "^ssl_key_file.*# infra-TAK-dbtls"  "$OLDCONF" | sed -E "s/.*=\s*'([^']+)'.*/\1/")
+OLDHBA=$(dirname "$OLDCONF")/pg_hba.conf
+NEWCONF=$(sudo -u postgres psql -tAX -c 'SHOW config_file' 2>/dev/null | tail -1)
+NEWHBA=$(sudo -u postgres psql -tAX -c 'SHOW hba_file' 2>/dev/null | tail -1)
+NEWDATA=$(sudo -u postgres psql -tAX -c 'SHOW data_directory' 2>/dev/null | tail -1)
+[ -n "$NEWCONF" ] && [ -n "$NEWDATA" ] || { echo "TLSCARRY-FAIL: could not ask the new cluster where its config lives"; exit 1; }
+[ "$NEWCONF" = "$OLDCONF" ] && { echo "TLSCARRY: new cluster already carries the block"; exit 0; }
+[ -f "$OLDCRT" ] && [ -f "$OLDKEY" ] || { echo "TLSCARRY-FAIL: cert/key missing at $OLDCRT / $OLDKEY"; exit 1; }
+sudo install -o postgres -g postgres -m 644 "$OLDCRT" "$NEWDATA/$(basename "$OLDCRT")"
+sudo install -o postgres -g postgres -m 600 "$OLDKEY" "$NEWDATA/$(basename "$OLDKEY")"
+sudo test -s "$NEWDATA/$(basename "$OLDCRT")" && sudo test -s "$NEWDATA/$(basename "$OLDKEY")" \
+  || { echo "TLSCARRY-FAIL: could not copy the cert/key into $NEWDATA"; exit 1; }
+# Keep a copy of both files we are about to edit. A conf that PostgreSQL refuses would leave a
+# customer's database server DOWN, so this path rolls itself back rather than hoping.
+sudo cp -p "$NEWCONF" "$NEWCONF.infratak-pre-tlscarry"
+[ -n "$NEWHBA" ] && sudo cp -p "$NEWHBA" "$NEWHBA.infratak-pre-tlscarry"
+sudo sed -i '/# infra-TAK-dbtls$/d' "$NEWCONF"
+printf "ssl = on # infra-TAK-dbtls\nssl_cert_file = '%s/%s' # infra-TAK-dbtls\nssl_key_file = '%s/%s' # infra-TAK-dbtls\npassword_encryption = scram-sha-256 # infra-TAK-dbtls\n" \
+  "$NEWDATA" "$(basename "$OLDCRT")" "$NEWDATA" "$(basename "$OLDKEY")" | sudo tee -a "$NEWCONF" >/dev/null
+if ! sudo grep -qE '^hostssl' "$NEWHBA" 2>/dev/null; then
+  # guarantee a trailing newline before appending, then carry the rules over
+  sudo sed -i -e '$a\' "$NEWHBA"
+  sudo grep -E '^hostssl' "$OLDHBA" 2>/dev/null | sudo tee -a "$NEWHBA" >/dev/null
+fi
+PGMAJ=$(sudo -u postgres psql -tAX -c 'SHOW server_version' 2>/dev/null | tail -1 | cut -d. -f1)
+sudo pg_ctlcluster "$PGMAJ" main restart 2>/dev/null \
+  || sudo systemctl restart "postgresql-$PGMAJ" 2>/dev/null \
+  || sudo systemctl restart postgresql 2>/dev/null
+sleep 5
+SSLNOW=$(sudo -u postgres psql -tAX -c "select current_setting('ssl')" 2>/dev/null | tail -1)
+if [ -z "$SSLNOW" ]; then
+  # the cluster did not come back: put both files back and restart, then say so plainly
+  sudo cp -p "$NEWCONF.infratak-pre-tlscarry" "$NEWCONF" 2>/dev/null
+  [ -n "$NEWHBA" ] && sudo cp -p "$NEWHBA.infratak-pre-tlscarry" "$NEWHBA" 2>/dev/null
+  sudo pg_ctlcluster "$PGMAJ" main restart 2>/dev/null \
+    || sudo systemctl restart "postgresql-$PGMAJ" 2>/dev/null \
+    || sudo systemctl restart postgresql 2>/dev/null
+  sleep 5
+  BACK=$(sudo -u postgres psql -tAX -c 'select 1' 2>/dev/null | tail -1)
+  echo "TLSCARRY-FAIL: the new cluster would not start with the TLS configuration; rolled it back (cluster reachable again: ${BACK:-NO})"
+  exit 1
+fi
+echo "TLSCARRY-SSL=$SSLNOW"
+'''
+    ok, out = _ssh_probe(s1, script, timeout=300)
+    for line in (out or '').strip().splitlines():
+        if line.strip().startswith('TLSCARRY'):
+            say('    ' + line.strip()[:170])
+    if 'TLSCARRY-SSL=on' in (out or ''):
+        say('  ✓ Database TLS restored on the new cluster.')
+        return True
+    if 'nothing to carry' in (out or ''):
+        say('  This deployment does not use infra-TAK database TLS — nothing to carry.')
+        return True
+    say('  ✗ Could not restore the database TLS on the new cluster. TAK Server requires it '
+        '(CoreConfig uses sslMode="verify-full"), so it will NOT be able to connect.')
+    return False
+
+
 def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg,
                                           log=None, status=None):
     """TAK 5.8 + PostgreSQL 18 on a split-box pair. Core here, database on Server One.
@@ -71184,26 +71274,71 @@ def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, ta
                         f'The PostgreSQL 15 cluster survives on Server One and the dump is at '
                         f'{backup}. Do NOT put this server into service.')
 
+        # The upgraded cluster is bare: pg_upgradecluster does not carry our TLS block, and
+        # TAK's CoreConfig demands verify-full. Do this BEFORE starting TAK, or TAK comes up
+        # unable to reach its own database.
+        _tls_ok = _tak58_s1_carry_db_tls(s1_cfg, say)
+
         say('')
         say('Starting TAK Server on the migrated database…')
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True,
                        timeout=300)
+        # An open port is NOT proof of life. On 2026-09-27 this loop passed on 8089 while TAK
+        # held ZERO database connections and logged 37 straight connection failures, and the
+        # migration printed "TAK Server is serving again". The same blind spot is why the
+        # 2026-09-04 split-box cell passed: every acceptance check was database-side, so none
+        # of them noticed TAK could not reach the database. Require BOTH: the listener, and
+        # TAK actually connected — asked of the database, not of TAK.
+        # Stray psql sessions are excluded by application_name: a remote psql also has a
+        # non-null client_addr, so counting one would let the gate green itself. TAK's pool
+        # reports application_name='PostgreSQL JDBC Driver' (measured on test8 2026-09-27).
         up = False
+        connected = False
         for waited in range(0, 900, 15):
             time.sleep(15)
-            _lp = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True,
-                                 capture_output=True, text=True, timeout=10)
-            if ':8089' in (_lp.stdout or ''):
-                up = True
-                break
+            if not up:
+                _lp = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True,
+                                     capture_output=True, text=True, timeout=10)
+                up = ':8089' in (_lp.stdout or '')
+            if up:
+                _c = _tak58_s1_sql(
+                    s1_cfg,
+                    "select count(*) from pg_stat_activity where datname='cot' "
+                    "and client_addr is not null "
+                    "and coalesce(application_name,'') not like 'psql%' "
+                    "and coalesce(application_name,'') not like 'pg_dump%'", db='cot')
+                if _c and _c.strip().isdigit() and int(_c.strip()) > 0:
+                    connected = True
+                    break
             if waited and waited % 120 == 0:
-                say(f'  ⏳ {waited // 60} min …')
+                say(f'  ⏳ {waited // 60} min …'
+                    + ('' if not up else ' (listening; waiting for it to reach the database)'))
         if not up:
             return fail('TAK Server did not start listening on 8089 within 15 minutes.',
                         'The database migrated and was verified; this is the core. Check '
                         '`journalctl -u takserver` and /opt/tak/logs/.')
-        say(f'  ✓ TAK Server is serving again. {int(time.time() - t_down)} s of downtime, '
-            f'{int(time.time() - t_all)} s end to end.')
+        if not connected:
+            return fail(
+                'TAK Server is listening on 8089 but has NOT connected to the database on '
+                'Server One within 15 minutes. An open port is not a working server.',
+                ('The database itself migrated and was verified, so your data is intact and '
+                 'the PostgreSQL 15 cluster plus the dump at %s remain your rollback. The '
+                 'usual cause is the database TLS: TAK uses sslMode="verify-full" and the '
+                 'upgraded cluster must present the infra-TAK certificate. Check '
+                 '/opt/tak/logs/takserver-api.log for "does not support SSL".' % backup)
+                + ('' if _tls_ok else ' NOTE: restoring that TLS configuration already failed '
+                                      'above — that is almost certainly the cause.'))
+        _enc = _tak58_s1_sql(
+            s1_cfg,
+            "select count(*) filter (where s.ssl) from pg_stat_activity a "
+            "left join pg_stat_ssl s on s.pid=a.pid "
+            "where a.datname='cot' and a.client_addr is not null "
+            "and coalesce(a.application_name,'') not like 'psql%'", db='cot')
+        say(f'  ✓ TAK Server is serving again and connected to the database'
+            + (f' ({_enc.strip()} encrypted connection(s))' if _enc and _enc.strip().isdigit()
+               else '')
+            + f'. {int(time.time() - t_down)} s of downtime, '
+              f'{int(time.time() - t_all)} s end to end.')
         say('')
         say('Migration complete. On Server One the PostgreSQL 15 cluster is still on disk and '
             'is your rollback until you remove it.')
