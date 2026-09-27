@@ -987,7 +987,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.85-alpha"
+VERSION = "10.2.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1992,6 +1992,65 @@ def _tak_is_container():
 # works unchanged; only binary EXECUTION (makeCert/keytool/UserManager) needs
 # `docker exec`. Mirrors the proven installTAK docker sequence.
 TAK_CONTAINER = 'takserver'          # app container name (and image tag)
+
+# -- TAK docker bundle layout (v10.2.0 W8) ---------------------------------
+# The Dockerfile names CHANGED in 5.8, and "hardened" is now the only container
+# bundle TAK publishes (operator, 2026-09-02):
+#
+#   5.7 and earlier   docker/Dockerfile.takserver            docker/Dockerfile.takserver-db
+#   5.8 hardened      docker/Dockerfile.hardened-takserver   docker/Dockerfile.hardened-takserver-db
+#
+# Hardcoding either name breaks the other, so resolve from what the bundle
+# actually contains. Verified against takserver-docker-hardened-5.8-RELEASE-75.zip,
+# whose DB image is built on registry.access.redhat.com/ubi10/ubi:10.2 with PGDG
+# EL-10 (postgresql18 + postgis36_18), NOT the old postgres:15.1 base.
+_TAK_DOCKERFILES = (
+    ('docker/Dockerfile.hardened-takserver', 'docker/Dockerfile.hardened-takserver-db'),
+    ('docker/Dockerfile.takserver',          'docker/Dockerfile.takserver-db'),
+)
+
+
+def _tak_bundle_dockerfiles(ctx):
+    """(app_dockerfile, db_dockerfile) relative to `ctx`, newest naming first.
+
+    Returns (None, None) when `ctx` is not a TAK docker bundle - callers use that
+    to reject a directory rather than guessing at a filename.
+    """
+    for app_df, db_df in _TAK_DOCKERFILES:
+        if os.path.isfile(os.path.join(ctx, app_df)) and os.path.isfile(os.path.join(ctx, db_df)):
+            return app_df, db_df
+    return None, None
+
+
+def _tak_db_volume_mount(ctx):
+    """`--mount` spec for the TAK DB named volume, chosen by the bundle's image era.
+
+    Pre-hardened images (Dockerfile.takserver-db, FROM postgres:15.1) initdb into
+    /var/lib/postgresql/<PGVER>/data and declare no VOLUME of their own, so the named
+    volume is mounted at the PARENT and the cluster lands at <volume>/15/data.
+
+    The hardened images (Dockerfile.hardened-takserver-db) declare
+    `VOLUME /var/lib/postgresql/data` and initdb there at build time. Mounting the parent
+    leaves that declared path to an ANONYMOUS volume Docker creates per container, so the
+    live database is not in takserver_pgsql at all and the next `docker rm` + `run`
+    abandons it. Measured on dev-4 2026-09-03 — `docker inspect takserver-db`:
+
+        volume takserver_pgsql -> /var/lib/postgresql
+        volume da5cc271…       -> /var/lib/postgresql/data     <- the real cluster
+
+    with the "data-preserving" container upgrade reporting "database preserved" over
+    a database SchemaManager had just built from nothing. So the hardened image gets the
+    named volume at exactly the path it declares.
+    """
+    _app_df, db_df = _tak_bundle_dockerfiles(ctx)
+    dest = '/var/lib/postgresql/data' if (db_df and 'hardened' in db_df.lower()) else '/var/lib/postgresql'
+    return f'--mount source={TAK_DB_VOLUME},destination={dest}'
+
+
+def _tak_is_bundle_dir(path):
+    """True when `path` looks like an unpacked takserver-docker bundle (any era)."""
+    return _tak_bundle_dockerfiles(path)[0] is not None
+
 TAK_DB_CONTAINER = 'takserver-db'    # db container name
 TAK_DOCKER_NET = 'takserver'         # docker network
 TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
@@ -3895,7 +3954,7 @@ print(json.dumps(out))
 #     If takserver ever DOES appear in this list, someone added a repo — that is
 #     why _classify_os_updates() flags it loudly instead of ignoring it.
 #   * MediaMTX is /usr/local/bin/mediamtx + a systemd unit — also in no repo.
-#   * PGDG package names are major-versioned (postgresql-15 only ever receives
+#   * PGDG package names are major-versioned (postgresql-<major> only ever receives
 #     15.x), so apt cannot jump a Postgres major on its own. Minors are bug/CVE
 #     fixes that never change on-disk format — the only cost is the restart.
 #   * docker-ce is the exception: Docker ships every version through one `stable`
@@ -8088,7 +8147,15 @@ def takserver_page():
     _migrate_done = tak_migrate_status.get('complete', False)
     if _migrate_done and not tak_migrate_status.get('running'):
         tak_migrate_status.update({'complete': False})
+    # v10.2.0 W5: 5.8/PG18 readiness for the update section. Cached (see
+    # _tak_58_preflight_cached) so a page render never waits on `du`, and wrapped
+    # so a probe failure degrades to "no card" rather than a 500 on the whole page.
+    try:
+        _tak58 = _tak_58_preflight_cached() if tak.get('installed') else None
+    except Exception:
+        _tak58 = None
     return render_template('takserver.html',
+        tak58=_tak58,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
@@ -8194,6 +8261,17 @@ def takserver_two_server_preflight():
     })
 
 _PG_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
+
+# The value we tell an operator to put in Azure's `azure.extensions` server parameter.
+# It is deliberately the SAME string static/takserver.js has displayed since the Azure
+# instructions shipped: handing someone two different values for one field is how you
+# get a half-applied setting. The ENFORCED requirement is narrower (see the allow-list
+# gate in the provision route) — POSTGIS and PGCRYPTO because TAK's schema needs them
+# and 5.8 stopped creating them, FUZZYSTRMATCH and POSTGIS_TOPOLOGY because
+# SchemaManager.purge() DROPs them and Azure rejects a DROP naming an extension it does
+# not allow. ADDRESS_STANDARDIZER is not needed by anything on the upgrade path; it
+# stays in the recommended string only because boxes in the field already carry it.
+_AZURE_EXTENSIONS_RECOMMENDED = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
 
 
 @app.route('/api/takserver/external-db/provision', methods=['POST'])
@@ -8377,26 +8455,119 @@ def takserver_external_db_provision():
         plog(f'  Azure PostgreSQL detected — granting azure_pg_admin to {app_user}...')
         ok, out = run_sql(f'GRANT azure_pg_admin TO {app_user};', 'grant azure_pg_admin', use_db='postgres')
         plog(f'  {"✓" if ok else "✗"} azure_pg_admin grant: {out if not ok else "OK"}')
-        # Pre-create required extensions as admin — Azure blocks CREATE EXTENSION for non-superusers
-        # even with IF NOT EXISTS, so SchemaManager (running as app_user) would fail without this.
-        azure_exts = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
-        plog(f'  Azure: pre-creating required extensions as {admin_user}...')
-        ext_failures = []
-        for ext in azure_exts:
-            ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}', use_db=db_name)
+
+    # Step 3c: the extensions TAK's schema needs, created by the ADMIN in the target
+    # database — for EVERY managed provider, not just Azure.
+    #
+    # This used to run only on the Azure branch, and on TAK 5.7 that was CORRECT for
+    # AWS: 5.7's own migrations created the extensions, so granting rds_superuser was
+    # enough and RDS installs and updates worked with nothing else —
+    #
+    #   5.7  V7__create_base_schema.sql:14   CREATE EXTENSION IF NOT EXISTS postgis;
+    #   5.7  V9__create_resource_hash.sql:9  CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    #
+    # **TAK 5.8 removed those lines.** No migration in 5.8's SchemaManager creates any
+    # extension; the vendor moved it to db-utils/setup.sql, which is run by
+    # takserver-setup-db.sh — and that script only ever runs on a LOCAL install. On an
+    # external database the console runs SchemaManager directly, so on 5.8 nothing
+    # creates PostGIS and the first migration that needs it dies. Measured on a fresh
+    # RDS PostgreSQL 18 instance, 2026-09-04:
+    #
+    #   Migration of schema "public" to version "7 - create base schema" failed!
+    #   ERROR: function addgeometrycolumn(...) does not exist
+    #   -> SchemaManager exited 2, cot had only `plpgsql`, schema_version stayed 0
+    #
+    # and the deploy still reported DEPLOYMENT COMPLETE, leaving TAK 5.8 running
+    # against a database with no schema. This is an UPSTREAM 5.8 regression against
+    # every managed-database deployment, and it hits upgrades as well as fresh
+    # installs — Azure escapes it only because of the pre-create below.
+    #
+    # The list mirrors TAK's own setup.sql rather than guessing: postgis and pgcrypto,
+    # and NOT fuzzystrmatch / postgis_topology / address_standardizer — setup.sql
+    # explicitly DROPs the first two as "unneeded extensions put in place by setup
+    # scripts for schema versions 7-12". The old Azure list created all five and hard
+    # -failed provisioning if the tenant had not whitelisted them, i.e. it demanded
+    # operators whitelist extensions TAK deletes.
+    if is_rds or is_azure:
+        _req_ext = 'postgis'
+        _opt_ext = ['pgcrypto']
+        _provider = 'Azure' if is_azure else 'AWS RDS'
+        plog(f'  {_provider}: creating the extensions TAK needs, as {admin_user}...')
+        ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {_req_ext};',
+                          f'create ext {_req_ext}', use_db=db_name)
+        plog(f'  {"✓" if ok else "✗"} {_req_ext}: {out if not ok else "OK"}')
+        if not ok:
+            if is_azure:
+                msg = (
+                    'PostGIS could not be created in the database and TAK\'s schema cannot be '
+                    'built without it. On Azure this normally means the extension is not '
+                    'whitelisted: Azure Portal → your PostgreSQL Flexible Server → Server '
+                    'parameters → search "azure.extensions" → set it to '
+                    + _AZURE_EXTENSIONS_RECOMMENDED + ' → '
+                    'Save, then re-run Provision Database. Reported: %s'
+                    % (out or 'unknown error'))
+            else:
+                msg = (
+                    'PostGIS could not be created in the database and TAK\'s schema cannot be '
+                    'built without it. Confirm the instance offers PostGIS for this engine '
+                    'version and that the admin user may create extensions. Reported: %s'
+                    % (out or 'unknown error'))
+            plog(f'  ✗ {msg}')
+            return jsonify({'success': False, 'error': msg, 'log': log,
+                            'extensions_not_whitelisted': True}), 400
+        _opt_missing = []
+        for ext in _opt_ext:
+            ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}',
+                              use_db=db_name)
             plog(f'  {"✓" if ok else "△"} {ext}: {out if not ok else "OK"}')
             if not ok:
-                ext_failures.append(ext)
-        if ext_failures:
-            missing = ', '.join(e.upper() for e in ext_failures)
-            msg = (
-                f'Azure extensions not whitelisted: {missing}. '
-                f'Go to Azure Portal → your PostgreSQL Flexible Server → Server parameters → '
-                f'search "azure.extensions" → add: FUZZYSTRMATCH, POSTGIS, POSTGIS_TOPOLOGY, '
-                f'ADDRESS_STANDARDIZER, PGCRYPTO → Save. Then re-run Provision Database.'
-            )
-            plog(f'  ✗ Extension pre-creation failed — {msg}')
-            return jsonify({'success': False, 'error': msg, 'log': log, 'extensions_not_whitelisted': True}), 400
+                _opt_missing.append(ext)
+        if _opt_missing:
+            plog('  △ Not available on this instance: %s. PostGIS is present, so the base '
+                 'schema will build; note these in case a later TAK feature needs them.'
+                 % ', '.join(_opt_missing))
+
+        # Azure only: the allow-list must also cover the extensions TAK DROPs.
+        #
+        # SchemaManager's `upgrade` opens with UpgradeCommand -> SchemaManager.purge(),
+        # which issues DROP EXTENSION IF EXISTS fuzzystrmatch / postgis_topology CASCADE
+        # on both 5.7 and 5.8. Azure refuses a DROP naming a non-allow-listed extension
+        # even when it does not exist, so SchemaManager exits 2 and no schema is ever
+        # built. Creating postgis and pgcrypto is therefore NOT sufficient on Azure, and
+        # provisioning that returns success here while the deploy is guaranteed to fail
+        # ten minutes later is a worse outcome than refusing now. Measured az-test-rds
+        # 2026-09-19. AWS RDS is unaffected — a DROP IF EXISTS of an absent extension
+        # simply succeeds there.
+        if is_azure:
+            _az_need = ['POSTGIS', 'PGCRYPTO', 'FUZZYSTRMATCH', 'POSTGIS_TOPOLOGY']
+            ok_al, out_al = run_sql('show azure.extensions;', 'read azure.extensions',
+                                    use_db=db_name)
+            if ok_al:
+                _allowed = set(x.strip().upper()
+                               for x in (out_al or '').replace('\n', ',').split(',') if x.strip())
+                _az_missing = [e for e in _az_need if e not in _allowed]
+                if _az_missing:
+                    _all = _AZURE_EXTENSIONS_RECOMMENDED
+                    msg = (
+                        'Azure: %s %s not allow-listed. TAK\'s SchemaManager runs '
+                        'DROP EXTENSION IF EXISTS fuzzystrmatch / postgis_topology before it '
+                        'builds the schema, and Azure rejects a DROP naming an extension that '
+                        'is not allow-listed even when it is not installed — so the deploy '
+                        'would fail with no schema. Azure Portal → %s → Settings → Server '
+                        'parameters → azure.extensions → set value to: %s → Save, then re-run '
+                        'Provision Database.'
+                        % (', '.join(_az_missing),
+                           'is' if len(_az_missing) == 1 else 'are',
+                           db_host.split('.')[0], _all))
+                    plog('  \u2717 ' + msg)
+                    return jsonify({'success': False, 'error': msg, 'log': log,
+                                    'extensions_not_whitelisted': True,
+                                    'missing_extensions': _az_missing}), 400
+                plog('  \u2713 azure.extensions covers all 4 required: ' + ','.join(_az_need))
+            else:
+                plog('  \u25b3 Could not read azure.extensions (%s) \u2014 confirm POSTGIS, '
+                     'PGCRYPTO, FUZZYSTRMATCH and POSTGIS_TOPOLOGY are allow-listed in the '
+                     'Azure Portal.' % (out_al or 'no output'))
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -8521,36 +8692,67 @@ def takserver_external_db_test_connection():
         if not db_pass:
             add_check('Azure extensions whitelisted', None, 'Skipped — run Provision Database first, then re-test')
         else:
-            azure_required = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+            # What Azure must ALLOW — which is not the same as what we create.
+            #
+            # We create postgis and pgcrypto (TAK 5.8 stopped creating them itself).
+            # But TAK's SchemaManager, on both 5.7 and 5.8, opens `upgrade` with
+            # UpgradeCommand -> SchemaManager.purge(), which unconditionally issues:
+            #
+            #   DROP EXTENSION IF EXISTS fuzzystrmatch CASCADE;
+            #   DROP EXTENSION IF EXISTS postgis_topology CASCADE;
+            #
+            # On AWS RDS that is a no-op when the extension isn't there. **Azure rejects
+            # a DROP of a non-allow-listed extension by NAME, even with IF EXISTS** —
+            # "extension \"fuzzystrmatch\" is not allow-listed for users". SchemaManager
+            # dies at exit 2 and the database never gets a schema. Measured on
+            # az-test-rds, 2026-09-19, on a fresh 5.7 install.
+            #
+            # So the allow-list is four, not the two we create. address_standardizer is
+            # NOT included: only SetupPostresOnRDS/SetupPostresGeneric reference it and
+            # neither is on the `upgrade` path we run.
+            _AZ_EXT_REASON = {
+                'POSTGIS': 'TAK schema (we create it)',
+                'PGCRYPTO': 'TAK schema (we create it)',
+                'FUZZYSTRMATCH': "SchemaManager.purge() DROPs it — Azure blocks the DROP if it isn't allow-listed",
+                'POSTGIS_TOPOLOGY': "SchemaManager.purge() DROPs it — same",
+            }
+            azure_required = list(_AZ_EXT_REASON)
             try:
-                names_sql = "SELECT name FROM pg_available_extensions WHERE name IN ({});".format(
-                    ','.join(f"'{e}'" for e in azure_required)
-                )
+                # Ask for the ALLOW-LIST, not pg_available_extensions. The latter lists
+                # what the engine could install and answers "yes" for extensions Azure
+                # still refuses, so it passed this check green while the deploy failed.
                 env = dict(os.environ, PGPASSWORD=db_pass)
-                # Use postgres system db — cot may not exist yet before first deploy
                 r = subprocess.run(
                     ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', 'postgres',
-                     '-c', names_sql, '--no-password', '-t', '-A'],
+                     '-c', 'show azure.extensions;', '--no-password', '-t', '-A'],
                     capture_output=True, text=True, timeout=15, env=env
                 )
                 if r.returncode == 0:
-                    available = set(line.strip() for line in r.stdout.splitlines() if line.strip())
-                    missing = [e for e in azure_required if e not in available]
+                    allowed = set(x.strip().upper() for x in (r.stdout or '').replace('\n', ',').split(',') if x.strip())
+                    missing = [e for e in azure_required if e not in allowed]
                     if missing:
-                        missing_upper = ','.join(e.upper() for e in missing)
-                        all_upper = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
+                        # Suggest the exact string the UI has shown since this feature
+                        # shipped (static/takserver.js) — an operator must never be handed
+                        # two different values for the same field. ADDRESS_STANDARDIZER is
+                        # not required by anything on the upgrade path, but it is already
+                        # set on boxes in the field and is harmless as a superset.
+                        all_upper = _AZURE_EXTENSIONS_RECOMMENDED
                         detail = (
-                            f'Missing: {missing_upper}. '
-                            f'In Azure Portal → {db_host.split(".")[0]} → Settings → Server parameters → '
-                            f'azure.extensions → set value to: {all_upper} → Save.'
+                            'Missing: %s (%s). In Azure Portal → %s → Settings → Server parameters → '
+                            'azure.extensions → set value to: %s → Save.'
+                            % (','.join(missing),
+                               '; '.join(f'{m}: {_AZ_EXT_REASON[m]}' for m in missing),
+                               db_host.split('.')[0], all_upper)
                         )
-                        add_check('Azure extensions whitelisted', False, detail)
+                        add_check('Azure extensions allow-listed', False, detail)
                     else:
-                        add_check('Azure extensions whitelisted', True, 'All 5 required extensions available')
+                        add_check('Azure extensions allow-listed', True,
+                                  'All 4 required extensions allow-listed: ' + ','.join(azure_required))
                 else:
-                    add_check('Azure extensions whitelisted', None, f'Could not query extensions — verify manually in Azure Portal')
+                    add_check('Azure extensions allow-listed', None,
+                              'Could not read azure.extensions — verify manually in Azure Portal')
             except Exception as e:
-                add_check('Azure extensions whitelisted', None, f'Extension check skipped: {str(e)[:150]}')
+                add_check('Azure extensions allow-listed', None, f'Extension check skipped: {str(e)[:150]}')
 
     all_ok = all(c['ok'] for c in checks if c.get('ok') is not None)
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
@@ -8890,13 +9092,41 @@ _SPLIT_DB_KEEPALIVE_LINES = ('tcp_keepalives_idle = 60\\n'
 
 
 # Reusable SSH snippets: discover the PG data dir + service name on a RHEL Server One
-# (PGDG postgresql-15 vs base). Module-level since v10.1.51 so the split-server DEPLOY path
+# (PGDG postgresql-<major> vs base). Module-level since v10.1.51 so the split-server DEPLOY path
 # and the keepalive RETROFIT below discover the same paths and cannot drift.
 # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands to
 # nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
+# ── PostgreSQL major version — fleet constants (v10.2.0 W1) ────────────────
+# TAK Server 5.8 requires PostgreSQL 18 (deb Depends: postgresql-18,
+# postgresql-18-postgis-3). 5.7 requires 15 and does NOT tolerate 18, so a box is
+# on exactly one of them and the move is a single guided migration, never a
+# standalone "upgrade Postgres" step.
+#
+# TWO constants on purpose — they are NOT interchangeable:
+#   TAK_PG_MAJOR   what we INSTALL. One fleet constant, no per-box tiering and no
+#                  max(cur, target): every box converges on the same major.
+#   TAK_PG_MAJORS  what we RECOGNISE, newest first. Health checks, service
+#                  discovery and systemd After= lines MUST accept BOTH. A box that
+#                  has not migrated yet is on 15, and a box mid-migration has both
+#                  clusters on disk. Probing only the new major would false-red
+#                  every un-migrated box in the fleet the moment this ships — the
+#                  same failure shape as the RHEL `postgresql-15` false-red that
+#                  the probes below already exist to fix.
+TAK_PG_MAJOR = 18
+TAK_PG_MAJORS = (18, 15)
+# ('postgresql-18', 'postgresql-15') — for systemctl is-active / discovery
+_PG_SVC_UNITS = tuple('postgresql-%d' % m for m in TAK_PG_MAJORS)
+# Debian's unsuffixed meta-service plus every major we recognise. Listing a unit
+# that does not exist in After= is harmless to systemd.
+_PG_SVC_AFTER = ' '.join(['postgresql.service'] + ['postgresql-%d.service' % m for m in TAK_PG_MAJORS])
+
+
 _PG_REMOTE_PGDATA_SH = ("PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); "
                         "[ -z \"$PGDATA\" ] && sudo test -d /var/lib/pgsql/data && PGDATA=/var/lib/pgsql/data; true")
-_PG_REMOTE_PGSVC_SH = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
+_PG_REMOTE_PGSVC_SH = (
+    'PGSVC=postgresql; for _m in ' + ' '.join(str(m) for m in TAK_PG_MAJORS) + '; do '
+    'systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-$_m" && { PGSVC=postgresql-$_m; break; }; '
+    'done; true')
 
 
 def _pg_keepalive_sh(conf_expr):
@@ -8917,7 +9147,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
     (pp.14-16) and the proven single-server RHEL install. The takserver-database .noarch.rpm
     is the DB installer (sets up the cot DB + martiuser, same role as the .deb); we install it,
-    then verify + SELF-HEAL (postgresql-15-setup initdb + start if the rpm didn't) and configure
+    then verify + SELF-HEAL (postgresql-<major>-setup initdb + start if the rpm didn't) and configure
     remote access at the RHEL data dir. Heavily instrumented so the first live run shows exactly
     what the rpm did. All ops run over SSH on Server One (sudo there). Returns (ok, log, db_password)."""
     log = ['Server One detected as RHEL/Rocky family — using dnf / firewalld / systemctl / /var/lib/pgsql path.']
@@ -8932,7 +9162,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     el_ver = el_ver if el_ver in ('8', '9') else '9'
     _, _ar = _ssh_probe(s1, 'uname -m', timeout=10)
     el_arch = 'aarch64' if ('aarch64' in (_ar or '') or 'arm64' in (_ar or '')) else 'x86_64'
-    # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-15 vs base).
+    # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-<major> vs base).
     # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands
     # to nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
     PGDATA = _PG_REMOTE_PGDATA_SH
@@ -8977,10 +9207,33 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
             log.append('takserver-database rpm install output:')
             log.append((iout or '')[:1000])
     else:
+        # No takserver-database package was supplied, so there is nothing to resolve
+        # dependencies FROM and we have to name the packages ourselves.
+        #
+        # This is the ONLY place that does. Everywhere else — the native deploy and the
+        # branch above — installs a TAK package and lets dnf/apt resolve, which is
+        # strictly better: TAK's own packages declare exactly what they need, verified
+        # 2026-09-02 by reading them:
+        #
+        #   takserver / takserver-database 5.8  ->  postgresql18-server postgresql18-contrib
+        #                                           postgis36_18 postgis36_18-utils
+        #   takserver / takserver-database 5.7  ->  postgresql15-server postgresql15-contrib
+        #                                           postgis33_15 postgis33_15-utils
+        #
+        # So the vendor already answers "which PostgreSQL", per artifact, and any list we
+        # hardcode is wrong for every other TAK version and goes stale at 5.9. Naming them
+        # here is a fallback, not a policy — note it also has to include the -utils
+        # subpackage the real dependency set carries, which the first version of this list
+        # omitted. PostGIS is version-coupled per PG major (postgis33_15 vs postgis36_18),
+        # so it cannot be derived from TAK_PG_MAJOR alone.
+        _pgis = {18: 'postgis36_18', 15: 'postgis33_15'}.get(TAK_PG_MAJOR)
+        _pkgs = 'postgresql%(m)d-server postgresql%(m)d-contrib' % {'m': TAK_PG_MAJOR}
+        _full = (_pkgs + ' ' + _pgis + ' ' + _pgis + '-utils') if _pgis else _pkgs
         _, iout = _ssh_probe(s1, (
-            'sudo dnf -y install postgresql15-server postgresql15-contrib postgis34_15 2>&1 || '
-            'sudo dnf -y install postgresql15-server postgresql15-contrib 2>&1; echo RC=$?'), timeout=600)
-        log.append('vanilla PG15 install: ' + (iout or '')[:300])
+            'sudo dnf -y install ' + _full + ' 2>&1 || '
+            'sudo dnf -y install ' + _pkgs + ' 2>&1; echo RC=$?'), timeout=600)
+        log.append('PostgreSQL %d install (no database package supplied): %s'
+                   % (TAK_PG_MAJOR, (iout or '')[:300]))
 
     # Step 3: ensure the cluster is INITIALIZED + STARTED (self-heal — the rpm may or may not have).
     init_cmd = (
@@ -9034,6 +9287,48 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     _, fout = _ssh_probe(s1, fw_cmd, timeout=40)
     log.append('firewalld: ' + ('db port scoped to core, ssh allowed.' if 'FW_DONE' in (fout or '') else (fout or '')[:200]))
 
+    # Step 5b: make sure the cot DB and martiuser actually EXIST.
+    #
+    # The takserver-database rpm only provisions them as part of its initdb; on a host
+    # that ALREADY has a PostgreSQL cluster the install prints "Data directory is not
+    # empty!", skips that work, and leaves no role and no database — while every step
+    # after it carries on. Measured on dev5 2026-09-04 (a box with a pre-existing PG18
+    # cluster): the deploy reported success with `db_password_captured: true`, and the
+    # server had `postgres template0 template1` and exactly one role. A redeploy, or any
+    # box that has ever run PostgreSQL, lands here.
+    #
+    # TAK ships the fix: db-utils/takserver-setup-db.sh, which their own comments call a
+    # manual post-install step. Run it when, and only when, the role or database is absent.
+    _need_sql = ("sudo -u postgres psql -tAXc \"select count(*) from pg_roles where "
+                 "rolname='martiuser'\" 2>/dev/null; "
+                 "sudo -u postgres psql -tAXc \"select count(*) from pg_database where "
+                 "datname='cot'\" 2>/dev/null")
+    _, _need_out = _ssh_probe(s1, _need_sql, timeout=30)
+    _need = [t for t in (_need_out or '').split() if t.isdigit()]
+    if len(_need) < 2 or _need[0] == '0' or _need[1] == '0':
+        log.append('cot database or martiuser missing after the rpm install (this host already '
+                   'had a PostgreSQL cluster, so the rpm skipped its own setup) — running TAK\'s '
+                   'takserver-setup-db.sh.')
+        # `-f`, not `-x`: TAK ships db-utils scripts mode 0544, so they are executable by
+        # root and NOT by the SSH user doing the test — the guard reported
+        # NO_SETUP_DB_SCRIPT for a script that was sitting right there (dev5, 2026-09-04).
+        # Same upstream packaging habit as the container bundle's missing execute bits.
+        # Run it through `sudo bash` so the mode does not matter, and with stdin closed so
+        # a prompt cannot hang the deploy.
+        _, _setup_out = _ssh_probe(s1, (
+            'if [ -f /opt/tak/db-utils/takserver-setup-db.sh ]; then '
+            'cd /opt/tak/db-utils && sudo bash ./takserver-setup-db.sh </dev/null 2>&1 | tail -14; '
+            'else echo NO_SETUP_DB_SCRIPT; fi'), timeout=600)
+        log.append('takserver-setup-db.sh: ' + (_setup_out or '')[:400])
+        _, _need_out = _ssh_probe(s1, _need_sql, timeout=30)
+        _need = [t for t in (_need_out or '').split() if t.isdigit()]
+        if len(_need) < 2 or _need[0] == '0' or _need[1] == '0':
+            log.append('✗ Server One still has no martiuser role and/or no cot database. The core '
+                       'cannot use this database, so stopping here rather than handing back a '
+                       'server that will fail at first login.')
+            return False, log, ''
+        log.append('✓ cot database and martiuser now present on Server One.')
+
     # Step 6: capture + verify the DB password (platform-neutral helpers — already work on RHEL).
     db_password, _ = _fetch_db_password_from_server_one(s1)
     if db_password:
@@ -9067,6 +9362,26 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
                        '(8446 login will 500). Output: ' + (scout or '')[:400])
     # Step 8 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
     tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+
+    # Final gate. Everything above logs warnings and carries on, and this function used to
+    # `return True` regardless — so a Server One with no martiuser, no tables and a password
+    # that failed validation was handed back as a success, and the operator only found out
+    # when the core 500'd at login. Ask the database instead: the role, the database, and
+    # actual tables in it.
+    _, _final = _ssh_probe(s1, (
+        "sudo -u postgres psql -tAXc \"select count(*) from pg_roles where rolname='martiuser'\" "
+        "2>/dev/null; "
+        "sudo -u postgres psql -tAX -d cot -c \"select count(*) from information_schema.tables "
+        "where table_schema='public'\" 2>/dev/null"), timeout=40)
+    _vals = [t for t in (_final or '').split() if t.isdigit()]
+    _roles = int(_vals[0]) if len(_vals) > 0 else 0
+    _tables = int(_vals[1]) if len(_vals) > 1 else 0
+    log.append(f'Server One verification: martiuser={"present" if _roles else "MISSING"}, '
+               f'cot public tables={_tables}.')
+    if not _roles or _tables < 1:
+        log.append('✗ Server One is not usable as a TAK database: the core would fail at first '
+                   'login with "relation ... does not exist". Fix this before deploying Server Two.')
+        return False, log, db_password, tls_pem
     return True, log, db_password, tls_pem
 
 
@@ -9193,7 +9508,8 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
                 'sudo apt-get install -y lsb-release && '
                 + _PGDG_REMOTE_SETUP_SH +
                 'sudo apt-get update -qq && '
-                'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-15 postgresql-15-postgis-3'
+                'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y '
+                'postgresql-%d postgresql-%d-postgis-3' % (TAK_PG_MAJOR, TAK_PG_MAJOR)
             )
             ok, out = _ssh_probe(s1, pg_install, timeout=300)
             log.append(out or '')
@@ -9268,6 +9584,24 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
     # Step 5 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
     tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+
+    # Same final gate as the RHEL path: every step above logs warnings and carries on, so
+    # without this a Server One with no martiuser and no tables is handed back as a
+    # success and the operator finds out when the core 500s at login. Ask the database.
+    _, _final = _ssh_probe(s1, (
+        "cd /tmp && sudo -u postgres psql -tAXc \"select count(*) from pg_roles where "
+        "rolname='martiuser'\" 2>/dev/null; "
+        "cd /tmp && sudo -u postgres psql -tAX -d cot -c \"select count(*) from "
+        "information_schema.tables where table_schema='public'\" 2>/dev/null"), timeout=40)
+    _vals = [t for t in (_final or '').split() if t.isdigit()]
+    _roles = int(_vals[0]) if len(_vals) > 0 else 0
+    _tables = int(_vals[1]) if len(_vals) > 1 else 0
+    log.append(f'Server One verification: martiuser={"present" if _roles else "MISSING"}, '
+               f'cot public tables={_tables}.')
+    if not _roles or _tables < 1:
+        log.append('✗ Server One is not usable as a TAK database: the core would fail at first '
+                   'login with "relation ... does not exist". Fix this before deploying Server Two.')
+        return False, log, db_password, tls_pem
     return True, log, db_password, tls_pem
 
 
@@ -10053,8 +10387,8 @@ def _migrate_split_db_keepalives():
             # SIGHUP only. Try every reload spelling; a unit that does not exist is a no-op.
             'sudo pg_ctlcluster 15 main reload 2>/dev/null; '
             'sudo systemctl reload postgresql 2>/dev/null; '
-            'sudo systemctl reload postgresql-15 2>/dev/null; '
-            'sudo systemctl reload postgresql-16 2>/dev/null; '
+            + ''.join('sudo systemctl reload postgresql-%d 2>/dev/null; ' % _m
+                      for _m in sorted(set(TAK_PG_MAJORS) | {16})) +
             'echo "PGCONF=$PGCONF"; '
             'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"'
         )
@@ -10499,7 +10833,15 @@ def takserver_two_server_deploy_server_two():
             return jsonify({'success': False, 'error': 'Core package install (dnf) failed on Server Two — check the deploy log for the dnf error.', 'log': log}), 400
     else:
         try:
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
+            # --allow-downgrades: installing an OLDER core than the box currently has is a
+            # downgrade, and apt refuses with "Packages were downgraded and -y was used
+            # without --allow-downgrades". The single-server deploy already carries this
+            # flag for exactly that reason; the two-server core install never got it, so
+            # standing a 5.7 pair up on a box that had touched 5.8 failed outright
+            # (dev-4, 2026-09-04) — which is precisely how anyone tests an upgrade.
+            r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                 ['apt-get', 'install', '-y', '--allow-downgrades',
+                                  f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
             log.append(r.stdout or '')
             log.append(r.stderr or '')
             if r.returncode != 0:
@@ -20422,8 +20764,9 @@ def _monitor_health_check(monitor_id):
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
             # native: Debian/Ubuntu uses the `postgresql` meta-service; RHEL/EL uses
-            # `postgresql-15.service` (PGDG). Either being active means PG is up.
-            for _pgsvc in ('postgresql', 'postgresql-15'):
+            # `postgresql-<major>.service` (PGDG). Either being active means PG is up.
+            # Probes EVERY major in TAK_PG_MAJORS: an un-migrated box is still on 15.
+            for _pgsvc in ('postgresql',) + _PG_SVC_UNITS:
                 r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _pgsvc]), capture_output=True, text=True, timeout=3)
                 if r.returncode == 0 and r.stdout.strip() == 'active':
                     return True
@@ -21264,7 +21607,7 @@ def guarddog_update():
             _settings = load_settings()
             _tak_cfg = _get_tak_deployment_config(_settings)
             _is_two = _tak_cfg.get('mode') == 'two_server'
-            _after = 'network-online.target' if _is_two else 'postgresql.service postgresql-15.service'
+            _after = 'network-online.target' if _is_two else _PG_SVC_AFTER
             _write_priv(av_svc_path, f'[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter={_after}\n\n[Service]\nType=oneshot\nExecStart={av_script}\n')
             _write_priv(av_tmr_path, '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n')
         # CoT DB size timer — install for two-server if missing
@@ -21274,7 +21617,7 @@ def guarddog_update():
             _settings2 = load_settings()
             _tak_cfg2 = _get_tak_deployment_config(_settings2)
             _is_two2 = _tak_cfg2.get('mode') == 'two_server'
-            _after2 = 'network-online.target' if _is_two2 else 'postgresql.service postgresql-15.service'
+            _after2 = 'network-online.target' if _is_two2 else _PG_SVC_AFTER
             _write_priv(cotdb_svc_path, f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
             _write_priv(cotdb_tmr_path, '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # DB repack timer (weekly Sunday 4am) — install if script exists but timer doesn't
@@ -21285,7 +21628,7 @@ def guarddog_update():
             _settings3 = load_settings()
             _tak_cfg3 = _get_tak_deployment_config(_settings3)
             _is_two3 = _tak_cfg3.get('mode') == 'two_server'
-            _after3 = 'network-online.target' if _is_two3 else 'postgresql.service postgresql-15.service'
+            _after3 = 'network-online.target' if _is_two3 else _PG_SVC_AFTER
             _write_priv(rp_svc_path, f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
             _write_priv(rp_tmr_path, '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
         # Retention guard timer (every 15min) — install if script exists but timer doesn't
@@ -21296,7 +21639,7 @@ def guarddog_update():
             _settings4 = load_settings()
             _tak_cfg4 = _get_tak_deployment_config(_settings4)
             _is_two4 = _tak_cfg4.get('mode') == 'two_server'
-            _after4 = 'network-online.target' if _is_two4 else 'postgresql.service postgresql-15.service'
+            _after4 = 'network-online.target' if _is_two4 else _PG_SVC_AFTER
             _write_priv(rg_svc_path, f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
             _write_priv(rg_tmr_path, '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # Build-cache reclaim timer (daily 4:30am) — install if script exists but timer doesn't.
@@ -22483,13 +22826,13 @@ def run_guarddog_deploy(alert_email):
             units.extend([
                 ('takdbguard.service', '[Unit]\nDescription=TAK PostgreSQL Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-db-watch.sh\n'),
                 ('takdbguard.timer', '[Unit]\nDescription=Run TAK DB monitor every 5 minutes\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=5min\nUnit=takdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
+                ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
                 ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
+                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
+                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
                 ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
+                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
                 ('takretentionguard.timer', '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         # Optional timers for other services (only if we installed the script)
@@ -22580,7 +22923,7 @@ def run_guarddog_deploy(alert_email):
             # 8089 against 20-30s on the Debian boxes, and its messaging JVM crashed on
             # the way up. Debian's .deb unit runs ExecStartPre as root already, so `+`
             # is a no-op there. This has been broken on RHEL since 10.1.44.
-            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target ' + _PG_SVC_AFTER + '\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
             # v10.1.63 W3: pin TAK to its own JDK 17 in the same breath. Also re-applied on
             # every console startup — see _pin_takserver_jvm().
@@ -27420,6 +27763,83 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+def _container_readable(path, log=None):
+    """Make a bundle file readable by the TAK container's non-root user.
+
+    The HARDENED 5.8 images run as `tak:0` (uid 1001, gid 0), not root. Files we
+    write through the /opt/tak mount land 0600 owned by the console user (uid 1000),
+    so the container simply cannot read them. Measured on dev-4 2026-09-03: the
+    container's read of cert-metadata.sh returned DENIED, which made makeRootCa.sh
+    source nothing - no $DIR, no $CAPASS - and fail with a misleading
+    `Can't open "../config.cfg"` plus `Keystore password must be at least 6
+    characters`. The real cause is two directories away from the error message.
+
+    Older non-hardened images ran as root, where 0600 was readable, which is why
+    this never surfaced before 5.8.
+
+    Group 0 + group-read is the tightest thing that works: the container's gid IS 0,
+    so it needs no world bit. cert-metadata.sh carries CAPASS, so we do not make it
+    world-readable.
+    """
+    try:
+        # NB: `chgrp` is NOT in the broker allowlist and fails SILENTLY through
+        # _sudo_wrap - which is exactly how the first version of this fix appeared to
+        # work while leaving gid unchanged. `chown :0` is the same operation via a
+        # binary the broker does permit.
+        subprocess.run(_sudo_wrap(['chown', ':0', path]), capture_output=True, timeout=20)
+        subprocess.run(_sudo_wrap(['chmod', '640', path]), capture_output=True, timeout=20)
+        return True
+    except Exception as e:
+        if log:
+            log(f"  could not make {path} container-readable: {str(e)[:120]}")
+        return False
+
+
+def _container_own_tree(root, log=None):
+    """Give the hardened container's `tak:0` user access to the mounted bundle.
+
+    The hardened 5.8 images run as tak:0 / postgres:0, NOT root, so a tree written by
+    the console user (uid 1000, gid 1000) is unreadable and unwritable inside the
+    container. Measured on dev-4 2026-09-03, as uid 1001:
+
+        ./makeRootCa.sh: line 6: cert-metadata.sh: Permission denied
+        genrsa: Can't open "ca-do-not-share.key" for writing, Permission denied
+        touch: cannot touch 'crl_index.txt': Permission denied
+
+    Group 0 + g+rwX matches TAK's own hardened model (their DB image does
+    `chown -R postgres:0` and puts the service user in group 0), and the container's
+    gid IS 0, so no world bits are needed.
+
+    Done from INSIDE a root container rather than on the host, because the host route
+    does not work and fails QUIETLY: `chgrp` is not in the broker allowlist at all, and
+    `chown` is path-checked, so on the bundle tree it returns success while changing
+    nothing. Both were tried first and both looked like they had worked - the unpack
+    chown set gid 0 on the bundle root while `tak/certs` (recreated later in the
+    deploy) stayed gid 1000, and cert generation kept failing with an error message
+    two directories away from the cause.
+    """
+    tak_real = os.path.realpath(root)
+    try:
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'run', '--rm', '--user', '0',
+            '-v', f'{tak_real}:/mnt/takown',
+            '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+            'chown -R :0 /mnt/takown && chmod -R g+rwX /mnt/takown']),
+            capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            if log:
+                log(f"  granted the container's tak:0 user access to {tak_real} (group 0, g+rwX)")
+            return True
+        if log:
+            log(f"  WARNING: could not set container ownership on {tak_real}: "
+                f"{(r.stderr or r.stdout or '').strip()[:200]}")
+        return False
+    except Exception as e:
+        if log:
+            log(f"  WARNING: container ownership setup failed on {tak_real}: {str(e)[:150]}")
+        return False
+
+
 def _patch_openssl_string_mask(log_fn=None):
     """Patch system openssl.cnf to use PrintableString instead of UTF8String.
 
@@ -30220,6 +30640,15 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}"); return False
     subprocess.run(_sudo_wrap(['cp', _tmp_p12, p12]), capture_output=True)
+    # The hardened 5.8 images run as tak:0, NOT root, so a root-owned 0600 p12 is
+    # unreadable by the keytool in Step B:
+    #   keytool error: java.io.FileNotFoundException: takserver-le.p12 (Permission denied)
+    # and the deploy silently falls back to the self-signed cert on 8446 - the port
+    # ATAK ENROLLS against. Measured on a fresh hardened container deploy, dev-4
+    # 2026-09-03: 8446 served CN=INT-CA-01 instead of the ACME cert.
+    # _container_own_tree() cannot cover this file: it runs during the deploy, and this
+    # cert is installed afterwards. The ownership is set from the container's real ids
+    # just below, which supersedes the group-0 model this lane originally used.
     try:
         os.remove(_tmp_p12)
     except Exception:
@@ -30244,6 +30673,10 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         log_fn(f"  ⚠ JKS conversion failed (existing keystore left intact): "
                f"{(r.stderr or r.stdout).strip()[:200]}"); return False
     subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', jks, p12]))
+    # 0640, not whatever keytool left. The JKS holds the server's TLS private key and
+    # used to land 0644 — world-readable on the host, on a box that may hold CJI. The
+    # p12 is already moded above; this is the same treatment for the keystore itself.
+    subprocess.run(_sudo_wrap(['chmod', '640', jks, p12]), capture_output=True)
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
     # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
     # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
@@ -30308,6 +30741,7 @@ chmod 0640 "$P12" 2>/dev/null || true
 # failed import exits here with the working keystore still in place and TAK untouched.
 docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks.new && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks.new -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt && mv -f takserver-le.jks.new takserver-le.jks"
 chown "$TAK_UID:$TAK_GID" "$JKS" 2>/dev/null || true
+chmod 0640 "$JKS" 2>/dev/null || true
 docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
@@ -30410,14 +30844,18 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # install(1) reads the /tmp source (broker source-permissive) and writes the
     # allowlisted /opt/tak dest as tak:tak in one step (replaces mv + chown).
+    # Mode 0640, not 0644: this keystore holds the server's TLS PRIVATE KEY, and TAK
+    # runs as `tak`, so nothing needs world read. (The container path had the same
+    # 0644 and is now 0640 too.)
     subprocess.run(_sudo_wrap([
-        'install', '-o', 'tak', '-g', 'tak', '-m', '644',
+        'install', '-o', 'tak', '-g', 'tak', '-m', '640',
         '/tmp/takserver-le.jks', '/opt/tak/certs/files/takserver-le.jks']),
         capture_output=True, text=True)
-    try:
-        os.remove('/tmp/takserver-le.jks')  # console-owned /tmp scratch; direct
-    except OSError:
-        pass
+    for _scratch in ('/tmp/takserver-le.jks', '/tmp/takserver-le.p12'):
+        try:
+            os.remove(_scratch)  # console-owned /tmp scratch; direct
+        except OSError:
+            pass
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
@@ -37682,7 +38120,8 @@ def cloudtak_plugin_log_api():
     })
 
 
-def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host=''):
+def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host='',
+                                store_endpoint='http://store:9000'):
     """Build CloudTAK .env content for local or remote target.
 
     postgres_pass: strong random password for the postgis DB. Defaults to
@@ -37720,7 +38159,7 @@ CLOUDTAK_Config_media_url={media_url}
 SigningSecret={signing_secret}
 
 ASSET_BUCKET=cloudtak
-AWS_S3_Endpoint=http://store:9000
+AWS_S3_Endpoint={store_endpoint}
 AWS_S3_AccessKeyId=cloudtakminioadmin
 AWS_S3_SecretAccessKey={minio_pass}
 MINIO_ROOT_USER=cloudtakminioadmin
@@ -38202,6 +38641,282 @@ def _compose_cmd(remote_cfg=None):
     if subprocess.run('docker-compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
         return 'docker-compose'
     return None
+
+
+def _cloudtak_store_endpoint(cloudtak_dir=None, existing_env_text=''):
+    """The S3 endpoint CloudTAK's store actually listens on: MinIO 9000 or Garage 3900.
+
+    WHY (2026-09-27). CloudTAK is replacing MinIO with Garage (upstream PR #1847, open at the
+    time of writing but read directly rather than guessed). Its compose moves the store to
+    `dxflrs/garage`, publishes 127.0.0.1:3900, and — importantly — feeds Garage its credentials
+    FROM .env: GARAGE_DEFAULT_ACCESS_KEY=${AWS_S3_AccessKeyId}. It also hard-fails compose when
+    GARAGE_RPC_SECRET is unset (`:?`).
+
+    Our generator hardcoded `http://store:9000`, and AWS_S3_Endpoint is a key we are
+    authoritative for, so `_cloudtak_env_preserve_unknown()` will NOT protect it. On a box that
+    has moved to Garage, one infra-TAK reconfig would therefore point CloudTAK back at port
+    9000 and the store would be unreachable — the assets are fine, the address is wrong.
+
+    So read the box instead of assuming. Two independent signals, either one sufficient: the
+    compose `store` service running a garage image, or a GARAGE_RPC_SECRET already in .env.
+    Defaults to 9000, so today's MinIO boxes are unaffected.
+    """
+    try:
+        if re.search(r'(?m)^\s*GARAGE_RPC_SECRET\s*=\s*\S', existing_env_text or ''):
+            return 'http://store:3900'
+        for _fname in ('docker-compose.yml', 'compose.yaml'):
+            _p = os.path.join(cloudtak_dir or '', _fname)
+            if not os.path.isfile(_p):
+                continue
+            with open(_p) as f:
+                _body = f.read()
+            # Walk the `store:` block by indentation rather than regexing a YAML block:
+            # keys INSIDE the service (environment:, ports:) also look like a sibling key,
+            # so a lookahead-terminated match can end before it reaches `image:`.
+            _lines = _body.splitlines()
+            _base = None
+            for _ln in _lines:
+                _st = _ln.strip()
+                if _base is None:
+                    if _st == 'store:':
+                        _base = len(_ln) - len(_ln.lstrip())
+                    continue
+                if _st and not _st.startswith('#') and (len(_ln) - len(_ln.lstrip())) <= _base:
+                    break                      # left the store block
+                _im = re.match(r'image:\s*(\S+)', _st)
+                if _im:
+                    if 'garage' in _im.group(1).lower():
+                        return 'http://store:3900'
+                    break
+            break
+    except Exception:
+        pass
+    return 'http://store:9000'
+
+
+def _cloudtak_remote_store_endpoint(remote_cfg):
+    """`_cloudtak_store_endpoint()` for a CloudTAK that lives on another host.
+
+    Same two signals, asked over SSH: a garage image on the compose `store` service, or a
+    non-empty GARAGE_RPC_SECRET in .env. Defaults to MinIO's 9000 on any doubt, so a box we
+    cannot read is left exactly as it is today.
+    """
+    try:
+        ok, out = _ssh_probe(
+            remote_cfg,
+            "grep -qs '^GARAGE_RPC_SECRET=.\\+' ~/CloudTAK/.env && echo GARAGE; "
+            "awk '/^[[:space:]]*store:/{f=1;next} f&&/^[[:space:]]*[a-zA-Z_-]+:[[:space:]]*$/{exit} "
+            "f&&/image:/{print; exit}' ~/CloudTAK/docker-compose.yml 2>/dev/null",
+            timeout=20)
+        if ok and 'garage' in (out or '').lower():
+            return 'http://store:3900'
+    except Exception:
+        pass
+    return 'http://store:9000'
+
+
+def _cloudtak_env_preserve_unknown(generated, existing_text):
+    """Keep every KEY= line CloudTAK's .env already had that we do not write ourselves.
+
+    WHY (2026-09-27). Every reconfig regenerates .env wholesale from
+    `_cloudtak_build_env_content()` and preserves exactly three secrets by name:
+    SigningSecret, MINIO_ROOT_PASSWORD, POSTGRES_PASSWORD. Any OTHER key CloudTAK grows is
+    silently deleted on the next reconfig. That is the same defect class as the TAK Portal
+    settings.json overwrites, which recurred three times in one file — see the
+    "Third-party app config is operator-owned" rule. The fix direction there was earned:
+    write only the keys we are authoritative for and leave the rest alone.
+
+    It is about to bite for real. CloudTAK is replacing MinIO with Garage (upstream
+    PR #1847) because minio/minio is no longer pullable from ANY public registry —
+    measured 2026-09-27: Docker Hub denied, the quay.io tags removed, ghcr denied. Garage
+    keeps a GARAGE_RPC_SECRET that is the cluster's identity: regenerate .env without it
+    and the store loses its data path. We do not need to know that key's name in advance
+    to stop deleting it, so this is written now rather than after the field report.
+
+    Ours wins on conflict (we are authoritative for what we write); theirs survives when we
+    say nothing about it.
+    """
+    def _keys(text):
+        out = []
+        for line in (text or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            out.append(line.split('=', 1)[0].strip())
+        return out
+
+    ours = set(_keys(generated))
+    kept = []
+    seen = set()
+    for line in (existing_text or '').splitlines():
+        st = line.strip()
+        if not st or st.startswith('#') or '=' not in st:
+            continue
+        k = st.split('=', 1)[0].strip()
+        if k in ours or k in seen:
+            continue
+        seen.add(k)
+        kept.append(st)
+    if not kept:
+        return generated
+    block = ('\n# --- preserved from the previous .env by infra-TAK ---\n'
+             '# Keys CloudTAK (or the operator) set that infra-TAK does not manage. They are\n'
+             '# carried across reconfigs rather than regenerated, because some of them are\n'
+             '# identities that cannot be recreated (e.g. a store cluster secret).\n')
+    return generated.rstrip('\n') + '\n' + block + '\n'.join(kept) + '\n'
+
+
+def _cloudtak_store_image_status(cloudtak_dir, log=None):
+    """Say plainly whether CloudTAK's object-store image can still be pulled.
+
+    WHY (2026-09-27, GitHub #73). `minio/minio` is gone from every public registry we can
+    reach. Measured from test6 with anonymous docker credentials:
+        docker.io/minio/minio:<pin>   -> denied / authentication required
+        quay.io/minio/minio:<pin>     -> no such manifest (the tags were REMOVED; the
+                                         quay API now 401s for that repository entirely)
+        ghcr.io/minio/minio:latest    -> denied
+        bitnami/minio:latest          -> no such manifest
+    So `_patch_cloudtak_minio_registry()`, which repoints the pin at quay.io, can no longer
+    help: its target is gone too. An existing box keeps running only because the image is
+    already in its local cache.
+
+    That turns a NEW CloudTAK install into `pull access denied for minio/minio`, which reads
+    like the operator's Docker Hub login is broken and sends them looking in the wrong place.
+    The real answer is upstream: CloudTAK is replacing MinIO with Garage (PR #1847), and
+    `dxflrs/garage` IS pullable today. So say the true thing instead of letting a registry
+    error stand in for it. Detection only — this does not attempt to substitute an image,
+    because the store's credentials are created differently by Garage and guessing that is
+    how you corrupt someone's map assets.
+    """
+    def _say(m):
+        if log:
+            log(m)
+        else:
+            print(m, flush=True)
+    try:
+        compose = os.path.join(cloudtak_dir or '', 'docker-compose.yml')
+        if not os.path.isfile(compose):
+            compose = os.path.join(cloudtak_dir or '', 'compose.yaml')
+        if not os.path.isfile(compose):
+            return True, ''
+        with open(compose) as f:
+            body = f.read()
+        m = re.search(r'(?m)^\s*image:\s*(\S*minio/minio:\S+)', body)
+        if not m:
+            return True, ''          # not a MinIO-based CloudTAK (Garage or newer) — nothing to warn about
+        img = m.group(1).strip().strip('"\'')
+        if subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', img]),
+                          capture_output=True, timeout=30).returncode == 0:
+            return True, img         # already cached locally: this box can still start
+        r = subprocess.run(_sudo_wrap(['docker', 'manifest', 'inspect', img]),
+                           capture_output=True, text=True, timeout=90)
+        if r.returncode == 0:
+            return True, img
+        _say('')
+        _say('  ⚠ CloudTAK\'s object-store image cannot be pulled: %s' % img)
+        _say('    This is NOT a problem with this server or with your Docker login. MinIO')
+        _say('    withdrew its images from the public registries, so nobody can pull that tag')
+        _say('    any more — Docker Hub denies it and the quay.io mirror\'s tags were removed.')
+        _say('    CloudTAK is replacing MinIO with Garage upstream (PR #1847). Until that lands')
+        _say('    in a CloudTAK release, a NEW CloudTAK install cannot complete. A CloudTAK that')
+        _say('    is already running is unaffected: its store image is already on this box.')
+        _say('    Tracking: https://github.com/takwerx/infra-TAK/issues/73')
+        _say('')
+        return False, img
+    except Exception as e:
+        _say('  (could not check the object-store image: %s)' % str(e)[:120])
+        return True, ''
+
+
+def _cloudtak_adopt_local_store_image(cloudtak_dir, log=None):
+    """If the pinned store image cannot be fetched, use a store image the operator built.
+
+    WHY (2026-09-27, GitHub #73). MinIO withdrew its images from every public registry, so a
+    new CloudTAK install cannot pull its `store` service. habr05 did the obvious thing —
+    built MinIO from source themselves — and STILL could not get past the deploy, because
+    nothing they could edit survives: a reinstall does `rm -rf ~/CloudTAK && git clone`, and
+    infra-TAK regenerates docker-compose.override.yml from scratch every deploy. Their image
+    was sitting right there on the box, unusable.
+
+    So adopt it instead of making them fight us. Deliberately narrow: this runs ONLY when the
+    pinned image is neither pullable NOR already cached — that is, only on an install that is
+    otherwise going to fail — and it refuses to guess when the box offers more than one
+    candidate. On every healthy box it is inert.
+
+    Returns the adopted image ref, or None.
+    """
+    def _say(m):
+        if log:
+            log(m)
+        else:
+            print(m, flush=True)
+    try:
+        compose = os.path.join(cloudtak_dir or '', 'docker-compose.yml')
+        if not os.path.isfile(compose):
+            compose = os.path.join(cloudtak_dir or '', 'compose.yaml')
+        if not os.path.isfile(compose):
+            return None
+        with open(compose) as f:
+            body = f.read()
+        m = re.search(r'(?m)^(\s*image:\s*)(\S*minio/minio:\S+)\s*$', body)
+        if not m:
+            return None
+        pinned = m.group(2).strip().strip('"\'')
+        # cached or pullable -> leave everything alone
+        if subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', pinned]),
+                          capture_output=True, timeout=30).returncode == 0:
+            return None
+        if subprocess.run(_sudo_wrap(['docker', 'manifest', 'inspect', pinned]),
+                          capture_output=True, timeout=90).returncode == 0:
+            return None
+        r = subprocess.run(_sudo_wrap(
+            ['docker', 'images', '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']),
+            capture_output=True, text=True, timeout=60)
+        # Group by image ID, not by ref. A box that has ever run CloudTAK carries the SAME
+        # MinIO image under two tags (minio/minio:X and quay.io/minio/minio:X) — counting
+        # those as two rival candidates made this refuse to act on exactly the boxes it
+        # exists to rescue (measured on test6). Two refs for one ID are one candidate.
+        by_id = {}
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            iid, ref = parts[0].strip(), parts[1].strip()
+            if not ref or ref.endswith(':<none>') or ref.startswith('<none>'):
+                continue
+            if 'minio' not in ref.lower() or ref == pinned:
+                continue
+            by_id.setdefault(iid, []).append(ref)
+        if not by_id:
+            _say('    If you build a MinIO image yourself, tag it with "minio" in the name')
+            _say('    (e.g. `docker build -t myminio:local .`) and run the install again —')
+            _say('    infra-TAK will pick up a locally built store image automatically.')
+            return None
+        def _official(refs):
+            return any(x.split(':', 1)[0] in ('minio/minio', 'quay.io/minio/minio',
+                                              'docker.io/minio/minio') for x in refs)
+        if len(by_id) > 1:
+            # Prefer a real MinIO over something merely named like one; only refuse when
+            # even that does not disambiguate.
+            off = [i for i, refs in by_id.items() if _official(refs)]
+            if len(off) == 1:
+                by_id = {off[0]: by_id[off[0]]}
+            else:
+                _say('    Several different MinIO-like images are present, so infra-TAK will')
+                _say('    not guess which one is the store: %s'
+                     % ', '.join(sorted(v[0] for v in by_id.values())[:6]))
+                _say('    Remove the ones you do not want, or retag the right one, and re-run.')
+                return None
+        cands = sorted(next(iter(by_id.values())))
+        adopted = cands[0]
+        with open(compose, 'w') as f:
+            f.write(body[:m.start(2)] + adopted + body[m.end(2):])
+        _say('    ✓ Using the store image you built on this box: %s' % adopted)
+        _say('      (the pinned %s cannot be fetched from any registry any more)' % pinned)
+        return adopted
+    except Exception as e:
+        _say('    (could not adopt a local store image: %s)' % str(e)[:120])
+        return None
 
 
 def _patch_cloudtak_minio_registry(cloudtak_dir=None):
@@ -38727,7 +39442,12 @@ def run_cloudtak_deploy(cfg=None):
                     pass
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
+            # The clone above already put CloudTAK's compose on the remote box, so a FRESH
+            # install of a Garage-based CloudTAK is detected here rather than written wrong.
+            env_content = _cloudtak_build_env_content(
+                settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+                remote_host=remote_host,
+                store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -39019,7 +39739,11 @@ def run_cloudtak_deploy(cfg=None):
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
 
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
+        # The clone above is already on disk, so a FRESH install of a Garage-based CloudTAK
+        # gets port 3900 instead of MinIO's 9000.
+        env_content = _cloudtak_build_env_content(
+            settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
         with open(env_path, 'w') as f:
             f.write(env_content)
         try:
@@ -39048,8 +39772,13 @@ def run_cloudtak_deploy(cfg=None):
         # after the last console restart (CORAZ) stayed broken until hand-fixed.
         try:
             # minio/minio is no longer anonymously pullable from Docker Hub and the pin is in
-            # CloudTAK's own compose — repoint it before anything tries to pull.
+            # CloudTAK's own compose — repoint it before anything tries to pull. As of
+            # 2026-09-27 the quay.io mirror lost the tag too, so the repoint alone is no
+            # longer enough: say so plainly rather than letting a registry error speak.
             _patch_cloudtak_minio_registry(cloudtak_dir)
+            if not _cloudtak_store_image_status(cloudtak_dir, log=plog)[0]:
+                # the pin is unfetchable: use an image the operator built, if there is one
+                _cloudtak_adopt_local_store_image(cloudtak_dir, log=plog)
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -39569,7 +40298,23 @@ def run_cloudtak_redeploy(cfg=None):
                     plog("  Preserving existing postgis password from remote .env")
             except Exception:
                 pass
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
+            env_content = _cloudtak_build_env_content(
+                settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+                remote_host=remote_host,
+                store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
+            # Same rule as the local reconfig: keep any key we do not manage. Read the whole
+            # remote .env rather than grepping one name at a time — we cannot grep for a key
+            # whose name we do not know yet, which is the entire point.
+            try:
+                _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null', timeout=20)
+                if _ok_env and (_rem_env or '').strip():
+                    _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
+                    if _merged != env_content:
+                        plog("  Preserving %d unmanaged key(s) from the remote .env"
+                             % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
+                    env_content = _merged
+            except Exception:
+                pass
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
@@ -39622,16 +40367,21 @@ def run_cloudtak_redeploy(cfg=None):
         signing_secret = None
         minio_pass = None
         postgres_pass = None
+        existing_env_text = ''
         if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('SigningSecret='):
-                        signing_secret = line.split('=', 1)[1].strip()
-                    elif line.startswith('MINIO_ROOT_PASSWORD='):
-                        minio_pass = line.split('=', 1)[1].strip()
-                    elif line.startswith('POSTGRES_PASSWORD='):
-                        postgres_pass = line.split('=', 1)[1].strip()
+            try:
+                with open(env_path) as f:
+                    existing_env_text = f.read()
+            except Exception:
+                existing_env_text = ''
+            for line in existing_env_text.splitlines():
+                line = line.strip()
+                if line.startswith('SigningSecret='):
+                    signing_secret = line.split('=', 1)[1].strip()
+                elif line.startswith('MINIO_ROOT_PASSWORD='):
+                    minio_pass = line.split('=', 1)[1].strip()
+                elif line.startswith('POSTGRES_PASSWORD='):
+                    postgres_pass = line.split('=', 1)[1].strip()
         import secrets as _secrets
         if not signing_secret:
             signing_secret = _secrets.token_hex(32)
@@ -39643,7 +40393,11 @@ def run_cloudtak_redeploy(cfg=None):
         # the volume with). Strong passwords only land on Remove + Reinstall.
         if not postgres_pass:
             postgres_pass = 'docker'
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
+        env_content = _cloudtak_build_env_content(
+            settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
+        # never delete a key CloudTAK grew that we know nothing about (e.g. a store cluster secret)
+        env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
             f.write(env_content)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
@@ -66084,9 +66838,9 @@ def takserver_services():
             })
         else:
             # Native host PostgreSQL: Debian/Ubuntu use the unsuffixed `postgresql`
-            # meta-service; RHEL/EL (PGDG) use `postgresql-15`. EITHER being active
+            # meta-service; RHEL/EL (PGDG) use `postgresql-<major>`. EITHER being active
             # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
-            # native box ("PostgreSQL stopped") even though postgresql-15 is serving
+            # native box ("PostgreSQL stopped") even though postgresql-<major> is serving
             # cot fine — same EL/Debian split already handled at the deploy probe.
             # v10.1.64 W1: before trusting a local probe, ask TAK where its database
             # actually is. A box split by hand (CoreConfig pointing elsewhere) is NOT in
@@ -66105,7 +66859,7 @@ def takserver_services():
                     'cpu': '', 'mem_mb': '', 'mem_pct': '', 'status': _pgst
                 })
             else:
-                pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql', 'postgresql-15']), capture_output=True, text=True, timeout=5)
+                pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql'] + list(_PG_SVC_UNITS)), capture_output=True, text=True, timeout=5)
                 pg_active = 'active' in (pg.stdout or '').split()
                 services.append({
                     'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
@@ -66168,13 +66922,63 @@ def takserver_uninstall():
         except Exception:
             pass
         steps.append('Container TAK removed (containers, volume, network, ~/tak-docker)')
-    # Stop service
-    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
-    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
-    steps.append('Stopped TAK Server')
-    # Kill any remaining processes
+    # Stop service.
+    #
+    # A slow shutdown must NOT abort the uninstall. `systemctl stop takserver` on a
+    # busy 5.8 box regularly exceeds 90 s (measured on a Rocky 9 box with ~1M rows,
+    # 2026-09-03), and subprocess.run raises TimeoutExpired. That exception was
+    # unhandled, so the route 500'd and every step below it - package purge,
+    # /opt/tak removal, database cleanup - never ran. The operator got "Internal
+    # Server Error" and a half-removed server: package still installed, unit in
+    # `failed`, /opt/tak still on disk. The next deploy then lands on that mess.
+    #
+    # Graceful stop is a courtesy here; the SIGKILL below is what actually
+    # guarantees the processes are gone. So allow longer, and on timeout say so and
+    # carry on to the kill rather than abandoning the uninstall.
+    _stopped_cleanly = True
+    for _unit_cmd in (['systemctl', 'stop', 'takserver'], ['systemctl', 'disable', 'takserver']):
+        try:
+            subprocess.run(_sudo_wrap(_unit_cmd), capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            _stopped_cleanly = False
+        except Exception:
+            _stopped_cleanly = False
+    steps.append('Stopped TAK Server' if _stopped_cleanly else
+                 'TAK Server did not stop within 5 minutes — killed instead (uninstall continued)')
+    # Kill any remaining processes.
+    #
+    # This used to be a bare unwrapped `pkill -9 -f takserver`, which on a born-non-root
+    # box runs as `takwerx` and therefore cannot signal anything owned by `tak` — the
+    # step reported "Killed remaining processes" while every one of them survived.
+    # What survives matters: TAK's own postrm runs `userdel tak`, and userdel exits 8
+    # ("user tak is currently used by process N") if ANY tak-owned process is left, so
+    # the package purge fails and the package is stranded half-installed. Measured on
+    # az-ubuntu-1, 2026-09-19 — survivors were a lingering `systemd --user` manager,
+    # four abandoned login session scopes, and orphaned takserver-plugins.sh /
+    # takserver-retention.sh wrappers with their JVMs.
+    #
+    # `pkill` is not on the broker's allow-list (and should not be — it is a
+    # signal-anything primitive). `loginctl` is, and terminate-user is the correct
+    # systemd answer anyway: it takes down the user's manager and every session scope,
+    # which is exactly where those orphans live. disable-linger stops it coming back.
+    _run_priv_chain([['loginctl', 'terminate-user', 'tak'],
+                     ['loginctl', 'disable-linger', 'tak']], 'seq', timeout=60)
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
-    steps.append('Killed remaining processes')
+    time.sleep(3)
+    _tak_left = subprocess.run("ps -u tak -o pid= 2>/dev/null | wc -l",
+                               shell=True, capture_output=True, text=True).stdout.strip()
+    try:
+        _tak_left = int(_tak_left)
+    except (TypeError, ValueError):
+        _tak_left = 0
+    if _tak_left:
+        # Say so. The purge below is about to fail because of exactly this, and a step
+        # list that claims a kill that did not happen sends the operator to the wrong place.
+        steps.append('⚠ %d process(es) still owned by the tak user after terminate-user — '
+                     'the package purge may fail (userdel refuses while they are running)'
+                     % _tak_left)
+    else:
+        steps.append('Killed remaining processes')
     # Purge package — must complete BEFORE removing /opt/tak, otherwise the
     # package can remain in 'ii' state with files gone, and the next
     # `apt-get install` becomes a no-op ("already newest version") that leaves
@@ -66206,22 +67010,34 @@ def takserver_uninstall():
             shell=True, capture_output=True, text=True
         ).stdout.strip()
         if pkg_status:
-            # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
-            # stderr so silent failures don't pretend success.
-            purge_ok = False
-            for cmd in (
-                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
-                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
-                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
-            ):
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-                after = subprocess.run(
+            # Try purge, escalating. These MUST go through _sudo_wrap: the console
+            # runs as `takwerx` on a born-non-root box, so the original unwrapped
+            # `apt-get purge` / `dpkg --purge` shell strings failed with permission
+            # denied every single time and Remove ended on "still registered with
+            # dpkg — manual cleanup required". Reproduced twice on az-ubuntu-1,
+            # 2026-09-19; the leftover half-installed package then has to be cleared
+            # by hand before the box can be redeployed.
+            #
+            # Shape matters too: the broker runs argv, not a shell, and both `env`
+            # and every shell are on its deny list — so DEBIAN_FRONTEND goes in the
+            # process environment, never as an `env`/inline prefix. The first step
+            # uses the apt<->dnf shim rather than a bare apt-get, per CLAUDE.md.
+            def _pkg_gone():
+                st = subprocess.run(
                     "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-                    shell=True, capture_output=True, text=True
-                ).stdout.strip()
-                if not after or 'not-installed' in after:
-                    purge_ok = True
-                    break
+                    shell=True, capture_output=True, text=True).stdout.strip()
+                return (not st) or ('not-installed' in st)
+
+            _pkg_remove('takserver', purge=True, timeout=180)
+            purge_ok = _pkg_gone()
+            if not purge_ok:
+                for argv in (['dpkg', '--purge', 'takserver'],
+                             ['dpkg', '--purge', '--force-all', 'takserver']):
+                    _run_priv_chain([argv], 'seq', timeout=180,
+                                    env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+                    if _pkg_gone():
+                        purge_ok = True
+                        break
             if purge_ok:
                 steps.append('Purged TAK Server package')
             else:
@@ -66348,11 +67164,21 @@ def upload_takserver_package():
         # with the wrong package by accident.
         _arch = _host_arch()
         _native_ext = '.rpm' if _distro_family() == 'rhel' else '.deb'
+        # A `takserver-database` package is the ONE artifact that legitimately belongs to
+        # the other family: in a two-server deployment it is installed on Server One,
+        # over SSH, and _setup_server_one() explicitly probes that host's OS and
+        # dispatches to the RHEL path when it differs from the console's ("the DB box
+        # (Server One) can be a DIFFERENT OS family than the console"). The deploy also
+        # already accepts either extension from uploads. Only this gate disagreed, so an
+        # Ubuntu core could never stage the .rpm its own Rocky Server One needs, and the
+        # mixed-family split-box the code supports was unreachable through the UI.
+        # arm64 stays container-only either way — that is not about families.
+        _is_db_pkg = 'database' in fn.lower()
         if fn.endswith('.deb'):
             if _arch == 'arm64':
                 os.remove(fp)
                 return jsonify({'error': f'.deb uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
-            if _distro_family() == 'rhel':
+            if _distro_family() == 'rhel' and not _is_db_pkg:
                 os.remove(fp)
                 return jsonify({'error': f'.deb uploaded but system is {os_type} (RHEL family). Need a takserver .rpm.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'deb', 'size_mb': sz})
@@ -66360,18 +67186,22 @@ def upload_takserver_package():
             if _arch == 'arm64':
                 os.remove(fp)
                 return jsonify({'error': f'.rpm uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
-            if _distro_family() != 'rhel':
+            if _distro_family() != 'rhel' and not _is_db_pkg:
                 os.remove(fp)
                 return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
         elif fn.endswith('.zip') and 'docker' in fn.lower():
-            # official takserver-docker-*.zip — the CONTAINER path. amd64 must use its
-            # native package (.deb/.rpm); arm64 is container-only here, so it takes the
-            # zip. (The TAK deb/rpm are arch-neutral — _all/.noarch — but arm64 deploys
-            # via the container path: it's the supported, field-validated arm path.)
-            if _arch != 'arm64':
-                os.remove(fp)
-                return jsonify({'error': f'Docker .zip uploaded but this is an amd64 {os_type} system — upload the native takserver {_native_ext}. (The docker .zip is the arm64 path.)'}), 400
+            # official takserver-docker-*.zip - the CONTAINER path.
+            #
+            # v10.2.0: amd64 may now upload this. The container path was always
+            # described as "arm64, or operator-selected on amd64" (see the block
+            # comment by TAK_CONTAINER) and the deploy route has always honoured an
+            # explicit install_method='container' on any arch - but this validation
+            # rejected the only artifact that path needs, so on amd64 it was
+            # unreachable through the UI. The two now agree.
+            #
+            # arm64 remains container-ONLY, enforced above: .deb and .rpm are still
+            # rejected there. This widens amd64; it does not loosen arm64.
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'docker', 'size_mb': sz})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             results['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz}
@@ -66733,18 +67563,1648 @@ def takserver_security_config_post():
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
+# ── TAK 5.8 pre-flight (v10.2.0 W2) ─────────────────────────────────────────
+# READ-ONLY. Mirrors the gates `upgrade-db.sh` enforces internally, but BEFORE
+# anything is touched, so the operator gets a useful refusal instead of a
+# mid-flight abort that leaves TAK wedged between the package install and the DB
+# migration (UPSTREAM-TAK-5.8-RELEASE-NOTES.md §1.1, §3.2a).
+#
+# Three of these mirror the vendor script; two are ours because the vendor's own
+# equivalents are absent or broken:
+#   * it takes NO backup — rollback rests entirely on the 15 cluster surviving,
+#     which is only true if disk holds both. Hence the 1.5x disk gate matters
+#     more to us than to it.
+#   * its Debian cluster check (lines 71-76) tests $? after a backtick assignment
+#     so it reflects the assignment, not pg_lsclusters, and only echoes — never
+#     exits. It is not the safety check it appears to be. We do our own.
+#
+# cot_router.id is inspected LIVE and never inferred from the TAK version:
+# measured 2026-09-01, test6 and test12 both run 5.7-RELEASE8 yet hold `integer`
+# and `bigint` respectively. Whether a box pays for SchemaManager's full-table PK
+# rewrite is a property of that box's history, not of its version string.
+_TAK58_MIN_DISK_RATIO = 1.5          # upgrade-db.sh exits 1 below this
+
+
+_tak58_pf_cache = {'at': 0, 'data': None}
+
+
+def _tak_58_preflight_cached(max_age=60):
+    """Cached pre-flight for page RENDERS.
+
+    The real check shells out to `du -sb` on the PostgreSQL data directory, which on
+    a multi-GB database is slow enough to stall a page load. The TAK Server page
+    renders this on every visit, so it reads through a short cache; the migration
+    itself always calls _tak_58_preflight() directly and never a cached verdict.
+    """
+    now = time.time()
+    if _tak58_pf_cache['data'] is not None and (now - _tak58_pf_cache['at']) < max_age:
+        return _tak58_pf_cache['data']
+    try:
+        d = _tak_58_preflight()
+    except Exception:
+        return _tak58_pf_cache['data']
+    _tak58_pf_cache.update({'at': now, 'data': d})
+    return d
+
+
+def _pg_client_bin(name, min_major, plog=None):
+    """Path to a `name` client (pg_dump/pg_restore/psql) of at least `min_major`.
+
+    PostgreSQL client tools REFUSE to talk to a newer server:
+
+        pg_dump: error: aborting because of server version mismatch
+        pg_dump: detail: server version: 18.6; pg_dump version: 15.19
+
+    On a managed-database box that is not a corner case, it is the normal state.
+    TAK's own .deb/.rpm depends on postgresql-15, so `pg_dump` on PATH is 15 — and
+    the moment the customer upgrades their RDS/Azure instance to 18 (which our own
+    pre-flight REQUIRES before 5.8), the local client can no longer dump it. The
+    5.8 pre-migration backup then fails, and because that backup is a hard gate the
+    update is permanently blocked with nothing on the box to explain why.
+    Measured on az-ubuntu-1 against az-test-rds 18.6, 2026-09-19. It applies
+    identically to AWS RDS.
+
+    So: prefer an explicitly versioned binary >= min_major, and install the client
+    package if none is present. Returns a path, or None if nothing suitable could
+    be obtained (callers must handle that — never silently fall back to a client
+    that cannot read the server).
+    """
+    if plog is None:
+        plog = lambda m: None
+    try:
+        min_major = int(min_major)
+    except (TypeError, ValueError):
+        return shutil.which(name)
+
+    def _probe():
+        # Highest first: a newer client can always read an older server.
+        for major in range(min_major + 6, min_major - 1, -1):
+            for layout in _TAK58_PG_BIN_LAYOUTS:
+                cand = os.path.join(layout.format(major=major), name)
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    return cand
+        return None
+
+    found = _probe()
+    if found:
+        return found
+
+    # Nothing local is new enough. The PGDG repo is already configured by the TAK
+    # deploy (Step 2), so the versioned client package is available on both families.
+    pkg = ('postgresql%d' % min_major) if _distro_family() == 'rhel' \
+        else ('postgresql-client-%d' % min_major)
+    plog('  no pg client >= %d on this host — installing %s...' % (min_major, pkg))
+    try:
+        ok, out = _pkg_install(pkg, timeout=600)
+    except Exception as e:
+        ok, out = False, str(e)
+    if not ok:
+        plog('  could not install %s: %s' % (pkg, (out or '')[:200]))
+        return None
+    found = _probe()
+    if found:
+        plog('  using %s' % found)
+    return found
+
+
+def _tak58_managed_pg_major(edb):
+    """(major, detail) for a MANAGED database, read over TCP. (None, why) if unknown.
+
+    The 5.8 pre-flight used the local `_sql()` helper for this, which runs
+    `runuser -u postgres -- psql` against the LOCAL cluster. On an external_db box
+    that is the wrong server entirely: measured on dev5 2026-09-03 it reported
+    PostgreSQL 18 (the box's own cluster) for an RDS instance running 15.19, which
+    would have set already_migrated=True on a database that had not been touched.
+
+    Same shape as the external-DB Test Connection check: psql over TCP with
+    PGPASSWORD, host validated first. `postgres` rather than `cot`, because the
+    application database may not exist before provisioning.
+    """
+    host = (edb.get('host') or '').strip()
+    if not host:
+        return None, 'no database host configured'
+    if not _safe_migration_db_host(host):
+        return None, 'configured host is not a plain IP or DNS name'
+    try:
+        port = int(edb.get('port') or 5432)
+    except (TypeError, ValueError):
+        return None, 'invalid port'
+    user = (edb.get('user') or 'martiuser').strip()
+    pw = edb.get('password') or ''
+    if not pw:
+        return None, 'no stored password — run Provision Database first'
+    try:
+        r = subprocess.run(
+            ['psql', '-h', host, '-p', str(port), '-U', user, '-d', 'postgres',
+             '-c', 'SHOW server_version_num;', '--no-password', '-t', '-A'],
+            capture_output=True, text=True, timeout=20,
+            env=dict(os.environ, PGPASSWORD=pw))
+    except FileNotFoundError:
+        return None, 'no psql client on this host to query the managed database with'
+    except Exception as e:
+        return None, str(e)[:160]
+    out = (r.stdout or '').strip()
+    if r.returncode != 0 or not out.isdigit():
+        return None, ((r.stderr or r.stdout or 'psql failed').strip()[:160])
+    return int(out) // 10000, ''
+
+
+def _tak58_external_schema_version(edb):
+    """schema_version reached on a MANAGED database.
+
+    Returns an int (0 = reachable but no schema at all), or None when the database
+    could not be questioned. Those two are NOT the same answer and must not collapse
+    into one: measured on Azure 2026-09-19, a deploy that had silently built its
+    schema in a LOCAL cluster left the managed `cot` with no `schema_version` table,
+    the single query below failed to PARSE, this returned None, and the caller read
+    that as "ran clean but unreadable" and shipped a WARNING on top of a deploy that
+    had not touched the managed database at all. A missing table is not an unreadable
+    database — it is a definitive zero, and the caller must be able to fail on it.
+
+    So: probe for the relation first, and only then read the version out of it.
+    """
+    host = (edb.get('host') or '').strip()
+    if not host or not _safe_migration_db_host(host):
+        return None
+    pw = edb.get('password') or ''
+    if not pw:
+        return None
+
+    def _q(sql):
+        try:
+            return subprocess.run(
+                ['psql', '-h', host, '-p', str(int(edb.get('port') or 5432)),
+                 '-U', (edb.get('user') or 'martiuser'), '-d', (edb.get('name') or 'cot'),
+                 '-c', sql, '--no-password', '-t', '-A'],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=pw))
+        except Exception:
+            return None
+
+    r = _q("select to_regclass('public.schema_version') is not null")
+    if r is None or r.returncode != 0:
+        return None                      # could not reach / authenticate — unknown
+    if (r.stdout or '').strip() != 't':
+        return 0                         # reachable, and the schema is definitively absent
+    r = _q('select coalesce(max(version::int), 0) from schema_version where success')
+    if r is None or r.returncode != 0:
+        return None
+    out = (r.stdout or '').strip()
+    return int(out) if out.isdigit() else None
+
+
+def _tak_58_preflight():
+    """Read-only readiness for the 5.8 + PG18 migration.
+
+    Returns {'ready': bool, 'blockers': [str], 'warnings': [str], 'facts': {...}}.
+    Never mutates anything. Safe to call on every page render.
+    """
+    facts, blockers, warnings = {}, [], []
+
+    def _sh(argv, timeout=20):
+        try:
+            return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    def _sql(q, db='cot', timeout=20):
+        try:
+            r = _pg_exec(['psql', '-tAX', '-d', db, '-c', q], timeout=timeout)
+            return (r.stdout or '').strip() if r and r.returncode == 0 else None
+        except Exception:
+            return None
+
+    # 1. Topology — D4 is open; container and remote DBs are out of 10.2.0 scope.
+    try:
+        mode, db_host, _db_port = _tak_db_topology()
+    except Exception:
+        mode, db_host = 'local', 'localhost'
+    facts['db_mode'] = mode
+    if mode == 'container':
+        # Supported since W8b, by a different mechanism: TAK's documented export/import
+        # between the old PG15 container and the new PG18 one, because PostgreSQL 18
+        # cannot start on a PG15 data directory. Not a blocker any more, but the facts
+        # below (disk sizing off a host data dir, pg_upgrade assumptions) do not apply,
+        # so say so rather than reporting host numbers that mean nothing here.
+        facts['container_migration'] = True
+        warnings.append('This is a container deployment, so the upgrade exports the database '
+                        'and re-imports it into a PostgreSQL %d container rather than '
+                        'upgrading in place. That is row-by-row and takes considerably longer '
+                        'than a native migration on the same amount of data.' % TAK_PG_MAJOR)
+    elif mode == 'remote':
+        # 'remote' covers two DIFFERENT situations and they need different answers.
+        # _tak_db_topology() cannot tell them apart (it only sees a non-loopback host in
+        # CoreConfig), so read the deployment mode: a two-server DB is a host we manage
+        # over SSH, a managed/external DB is one we fundamentally cannot upgrade.
+        try:
+            _dep_mode = (_get_tak_deployment_config(load_settings()) or {}).get('mode') or ''
+        except Exception:
+            _dep_mode = ''
+        facts['deployment_mode'] = _dep_mode
+        if _dep_mode == 'external_db':
+            facts['external_db'] = True
+            # Ask the MANAGED instance, not the local cluster, and gate the refusal on
+            # the answer. The refusal used to be unconditional, which made the very
+            # instruction it gives impossible to satisfy: an operator who upgraded their
+            # RDS/Azure instance to 18 as told came back to the same blocker, for ever.
+            try:
+                _edb_cfg = (_get_tak_deployment_config(load_settings())
+                            or {}).get('external_db') or {}
+            except Exception:
+                _edb_cfg = {}
+            _mm, _mwhy = _tak58_managed_pg_major(_edb_cfg)
+            facts['managed_pg_major'] = _mm
+            if _mm is None:
+                blockers.append(
+                    'Could not read the PostgreSQL version of the managed database (%s): %s. '
+                    'TAK Server 5.8 requires PostgreSQL %d and this cannot be confirmed, so the '
+                    'upgrade will not start — proceeding blind is how a server ends up running '
+                    '5.8 against a database it cannot use.'
+                    % (db_host or 'remote host', _mwhy or 'unknown error', TAK_PG_MAJOR))
+            elif _mm < TAK_PG_MAJOR:
+                blockers.append(
+                    'This server uses a managed database (%s) running PostgreSQL %d. TAK Server '
+                    '5.8 requires PostgreSQL %d, and a managed engine can only be upgraded by the '
+                    'provider — AWS RDS or Azure, in their own console. Upgrade the instance to '
+                    'PostgreSQL %d first, confirm TAK can still authenticate to it, then return '
+                    'here and run the update. Step-by-step: '
+                    'docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md'
+                    % (db_host or 'remote host', _mm, TAK_PG_MAJOR, TAK_PG_MAJOR))
+            else:
+                warnings.append(
+                    'The managed database (%s) is already on PostgreSQL %d, so there is no engine '
+                    'upgrade for this release to do. Installing 5.8 will run its schema update '
+                    'against that instance — take a provider-side snapshot first, because the '
+                    'schema change is not something this console can roll back for you.'
+                    % (db_host or 'remote host', _mm))
+        else:
+            # W9 (2026-09-04) made the two-server migration real: Update drives it on Server
+            # One over SSH. This branch kept refusing it — "not supported in this release" —
+            # so a split-box operator read a red card above a button that would have run it
+            # (test8, v10.2.0 T&E 2026-09-21). A two-server box with a Server One host is a
+            # WARNING with instructions; only a remote database the console does not manage
+            # is a blocker. Server One's own major, disk and backup are checked when the
+            # migration starts (run_takserver_58_two_server_migration), not here.
+            try:
+                _s1_host = (((_get_tak_deployment_config(load_settings()) or {})
+                             .get('server_one') or {}).get('host') or '').strip()
+            except Exception:
+                _s1_host = ''
+            if _dep_mode == 'two_server' and _s1_host:
+                facts['two_server'] = True
+                facts['server_one_host'] = _s1_host
+                warnings.append(
+                    'The CoT database is on Server One (%s). Update migrates it there over SSH: '
+                    'upload the 5.8 takserver-core package for this host AND the 5.8 '
+                    'takserver-database package for Server One, then click Update. Server '
+                    "One's PostgreSQL version, free disk and backup are checked when the "
+                    'migration starts.' % _s1_host)
+            else:
+                blockers.append(
+                    'The CoT database is on a separate server (%s) that this console does not '
+                    'manage — no Server One is configured for it. The 5.8 migration has to run '
+                    'on that host: configure it as Server One (two-server deployment) or '
+                    'migrate it there by hand.' % (db_host or 'unknown'))
+
+    # 2. Which major is actually serving, and is 15 present at all?
+    #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
+    running_major = None
+    if facts.get('db_mode') == 'remote' and not facts.get('external_db'):
+        # Two-server: the database is on Server One, so there is no local cluster to ask.
+        # Without this the pre-flight added "Could not determine the running PostgreSQL
+        # version — is the database up?" underneath the real blocker, which reads as a
+        # second, unrelated fault and sends the operator looking at a database that is
+        # running perfectly well (dev-4 + dev-6, 2026-09-04).
+        facts['pg_running_major'] = None
+    elif facts.get('external_db'):
+        # Already answered over TCP above; the local cluster (if any) is irrelevant here
+        # and asking it is what produced the wrong number in the first place.
+        running_major = facts.get('managed_pg_major')
+        facts['pg_running_major'] = running_major
+    else:
+        sv = _sql('SHOW server_version_num;', db='postgres')
+        if sv and sv.isdigit():
+            running_major = int(sv) // 10000
+        facts['pg_running_major'] = running_major
+    if running_major is None:
+        # A remote database - two-server or managed - has already said why, in a better message, just above; adding a
+        # second blocker here would only repeat it. What must NOT happen is falling
+        # through to the comparisons below with None - that raised
+        # "'>=' not supported between instances of 'NoneType' and 'int'" and turned the
+        # whole pre-flight into a 500, so the operator saw a broken page instead of the
+        # refusal. Caught by the wrong-password control on dev5, 2026-09-03.
+        if not facts.get('external_db') and facts.get('db_mode') != 'remote':
+            blockers.append('Could not determine the running PostgreSQL version — is the '
+                            'database up?')
+    elif running_major >= TAK_PG_MAJOR:
+        facts['already_migrated'] = True
+    elif running_major != 15:
+        blockers.append('PostgreSQL %s is running. TAK 5.8 migrates from 15 only; upgrade-db.sh '
+                        'refuses anything else.' % running_major)
+
+    # 3. Our own cluster check (the vendor's is broken — see header).
+    #    Local-cluster and local-disk facts describe a machine that, on a managed
+    #    database, is not the one running PostgreSQL. Reporting them there is noise
+    #    at best and a false blocker at worst.
+    lsc = None if facts.get('external_db') else _sh(['pg_lsclusters', '--no-header'])
+    if lsc and lsc.returncode == 0:
+        rows = [l.split() for l in (lsc.stdout or '').splitlines() if l.strip()]
+        facts['clusters'] = ['%s/%s %s' % (r[0], r[1], r[3]) for r in rows if len(r) > 3]
+        if running_major == 15 and not any(r and r[0] == '15' for r in rows):
+            blockers.append('No PostgreSQL 15 cluster found — upgrade-db.sh will refuse.')
+
+    # 4. Disk: the new cluster needs 1.5x the old data dir, on ITS partition.
+    datadir = None if facts.get('external_db') else _sql('SHOW data_directory;', db='postgres')
+    facts['data_directory'] = datadir
+    if datadir:
+        target_parent = '/var/lib/pgsql' if datadir.startswith('/var/lib/pgsql') else '/var/lib/postgresql'
+
+        # Measure WITHOUT needing root. `du` and `df` are not on the broker's
+        # allow-list, so on a non-root console — which is every modern box — both
+        # calls were denied, the int() below raised, and the whole gate was skipped
+        # via the except. The card showed "database 0 B · 0 B free (needs 0 B)" and,
+        # far worse, the `avail < need` blocker NEVER RAN on the boxes it exists to
+        # protect: pg_upgrade copies the cluster, so a box without ~1.5x free can
+        # fill its disk mid-migration and there is nothing to stop it. Seen on dev-4
+        # 2026-09-21 in the operator's own browser, which is the only place it shows.
+        #
+        # Neither number needs privilege:
+        #   free  — shutil.disk_usage() stats the filesystem, no root, no broker.
+        #   size  — ask PostgreSQL. We can already query it (the row count above
+        #           comes from the same helper), and it is a better question than
+        #           `du` on the data directory anyway.
+        used = avail = None
+        try:
+            import shutil as _shutil
+            _probe = target_parent if os.path.exists(target_parent) else '/'
+            avail = _shutil.disk_usage(_probe).free
+        except Exception:
+            avail = None
+
+        _sz = _sql('SELECT COALESCE(sum(pg_database_size(datname)), 0)::bigint FROM pg_database;',
+                   db='postgres')
+        if _sz and _sz.strip().isdigit():
+            used = int(_sz.strip())
+        else:
+            # Root console (or a box where du IS reachable) — keep the old source.
+            _du = _sh(['du', '-sb', datadir], timeout=120)
+            try:
+                used = int((_du.stdout or '').split()[0])
+            except Exception:
+                used = None
+
+        if used is not None and avail is not None:
+            need = int(used * _TAK58_MIN_DISK_RATIO)
+            facts['data_bytes'], facts['avail_bytes'], facts['need_bytes'] = used, avail, need
+            if avail < need:
+                blockers.append(
+                    'Not enough disk for a rollback-safe migration: %s free on %s, %s needed '
+                    '(1.5x the %s database). pg_upgrade runs in copy mode so the PostgreSQL 15 '
+                    'cluster survives — that is the only way back if the upgrade fails.'
+                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used)))
+        else:
+            # Say that the CHECK did not run, not merely that a number is missing.
+            # The old wording read like a cosmetic gap; it meant the safety gate was off.
+            warnings.append(
+                'Could not measure %s, so the free-disk safety check did NOT run. pg_upgrade '
+                'copies the cluster and needs about 1.5x the database size free — confirm that '
+                'by hand on %s before starting, because nothing here will stop you.'
+                % ('the database size' if used is None else 'free disk space', target_parent))
+
+    # 5. The conditional expensive bit: cot_router's PK type and size.
+    if mode == 'local' and running_major:
+        idtype = _sql("SELECT data_type FROM information_schema.columns "
+                      "WHERE table_name = 'cot_router' AND column_name = 'id';")
+        facts['cot_router_id_type'] = idtype or None
+        rows_s = _sql('SELECT count(*) FROM cot_router;', timeout=120)
+        try:
+            facts['cot_router_rows'] = int(rows_s) if rows_s else None
+        except Exception:
+            facts['cot_router_rows'] = None
+        # MEASURED 2026-09-01 on a 5,000,004-row / 8.1 GB box, and it corrected the plan:
+        # 5.8 does NOT widen cot_router.id. The actual migration is
+        # V101__update_cot_router_chat_id_to_bigint.sql — the CHAT table, which is
+        # typically empty (0 rows here, 18 ms). The release notes' "cot_router.id
+        # integer -> bigint" does not happen: after a full 5.8 migration this box
+        # still reported cot_router.id = integer.
+        #
+        # So there is no expensive full-table rewrite, and warning about one was
+        # wrong. What IS true, and worth telling an operator, is the opposite: a box
+        # old enough to still have `integer` KEEPS it. Newer TAK installs create the
+        # column as bigint (dev-4 on 5.7-RELEASE43 and test12 both did; test6 did
+        # not), and 5.8 ships no migration to fix the old ones — so the 2.1-billion
+        # ceiling those boxes carry is not lifted by upgrading. That is an upstream
+        # gap, not something this release can fix, and it is not a reason to block.
+        if idtype == 'integer':
+            facts['pk_rewrite_expected'] = False
+            facts['cot_router_id_stays_integer'] = True
+            warnings.append(
+                'This database has cot_router.id as integer. TAK 5.8 does not widen it — its '
+                'schema update only widens cot_router_chat.id — so the column keeps its '
+                '2,147,483,647 row-id ceiling after the upgrade. Nothing to do now; worth '
+                'raising with TAK for boxes with long histories.')
+        elif idtype == 'bigint':
+            facts['pk_rewrite_expected'] = False
+            facts['cot_router_id_stays_integer'] = False
+
+    facts['pg_target_major'] = TAK_PG_MAJOR
+    # Pre-formatted for the template — Jinja should not be doing byte math.
+    facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
+    facts['avail_human'] = _cotdb_fmt_bytes(facts.get('avail_bytes') or 0)
+    facts['need_human'] = _cotdb_fmt_bytes(facts.get('need_bytes') or 0)
+    # The cot_router facts are only gathered for a LOCAL cluster (step 5 above is
+    # gated on `mode == 'local'`), so a container / remote / managed box reached this
+    # return with the keys ABSENT, not None. Jinja renders a missing key as Undefined,
+    # `Undefined is not none` is TRUE, and the card's `'{:,}'.format(...)` then raised
+    # `unsupported format string passed to Undefined.__format__` — a 500 on the whole
+    # TAK Server page for every containerised 5.7 box, i.e. the exact machines that
+    # need the page to upgrade (measured on aws-arm, plain 5.7 container, 2026-09-22).
+    # Establish the keys unconditionally; the template also guards with `is defined`.
+    facts.setdefault('cot_router_rows', None)
+    facts.setdefault('cot_router_id_type', None)
+    return {'ready': not blockers, 'blockers': blockers, 'warnings': warnings, 'facts': facts}
+
+
+@app.route('/api/takserver/58-preflight')
+@login_required
+def takserver_58_preflight():
+    """Read-only 5.8/PG18 readiness. Drives the upgrade card; W4 refuses on `ready`."""
+    try:
+        return jsonify({'ok': True, **_tak_58_preflight()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:300]}), 500
+
+
+# ── TAK 5.8 pre-migration backup (v10.2.0 W3) ───────────────────────────────
+# `upgrade-db.sh` takes NO backup — no dump, no snapshot. Its whole rollback story
+# is "the PostgreSQL 15 cluster is left intact", which is true on both families but
+# only helps if disk held both (W2's 1.5x gate) and covers only the database, not
+# CoreConfig or certs.
+#
+# So the backup is ours. It does NOT reinvent one: `_tak_snapshot()` already
+# captures TAK version, CoreConfig.xml, UserAuthenticationFile.xml,
+# /etc/default/takserver, the cot dump and /opt/tak/certs/files/, and it already
+# handles all three topologies (local, two_server, external_db). This wrapper adds
+# the one thing it does not do — PROVING the dump is readable.
+#
+# `_tak_snapshot` sets meta['db_dump'] only when a non-empty file lands. Non-empty
+# is not restorable: a truncated archive has bytes and fails to restore. Since this
+# dump is the only thing standing between an operator and an unrecoverable 5.8
+# migration, "it has bytes" is not a standard worth shipping. `pg_restore --list`
+# parses the archive's table of contents, so truncation and corruption both fail it.
+# Reporting a success we had not established is the fault the whole v10.1.40 release
+# was about; this is the same fault with a database attached.
+
+
+def _tak_58_backup(plog=None):
+    """Snapshot before the 5.8 migration, then PROVE the cot dump reads.
+
+    Returns {'ok', 'label', 'snapshot_path', 'dump_path', 'dump_bytes',
+             'toc_entries', 'error'}. `ok` is True only when pg_restore parsed the
+    archive — never merely because pg_dump exited 0.
+    """
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    label = 'pre-58-%s' % time.strftime('%Y%m%d-%H%M%S')
+    out = {'ok': False, 'label': label,
+           'snapshot_path': os.path.join(SNAPSHOT_DIR, label),
+           'dump_path': None, 'dump_bytes': 0, 'toc_entries': 0, 'error': None}
+
+    ok, meta = _tak_snapshot(label, plog=plog)
+    if not ok:
+        out['error'] = 'snapshot failed: %s' % str(meta)[:300]
+        plog('BACKUP FAILED — %s' % out['error'])
+        return out
+
+    # The snapshot can succeed overall while deliberately skipping the DB dump
+    # (external_db with no pg_dump client, for one). For a migration backup that
+    # is a hard stop, not a warning — the database is the irreplaceable part.
+    if not (isinstance(meta, dict) and meta.get('db_dump')):
+        out['error'] = ('the snapshot completed but captured NO database dump — refusing to '
+                        'treat that as a pre-migration backup.')
+        plog('BACKUP FAILED — %s' % out['error'])
+        return out
+
+    dump_path = os.path.join(out['snapshot_path'], 'cot.pgdump')
+    out['dump_path'] = dump_path
+    try:
+        st = subprocess.run(_sudo_wrap(['stat', '-c', '%s', dump_path]),
+                            capture_output=True, text=True, timeout=20)
+        out['dump_bytes'] = int((st.stdout or '0').strip() or 0)
+    except Exception:
+        out['dump_bytes'] = 0
+
+    # A managed-database dump was already proven readable by the snapshot itself,
+    # client-side, before it was copied into the root-owned snapshot directory —
+    # the broker's pg_restore op will not touch it, because its HMAC sidecar proves
+    # "the broker produced this dump" and a managed DB is necessarily dumped by the
+    # console over TCP. Same standard, verified at the only point where the file is
+    # readable without root. Trust it rather than re-asking the broker, which can
+    # only ever answer "not mine".
+    if meta.get('db_dump_toc'):
+        out['toc_entries'] = int(meta.get('db_dump_toc') or 0)
+        out['dump_bytes'] = int(meta.get('db_dump_bytes') or out['dump_bytes'] or 0)
+        out['ok'] = True
+        plog('  backup verified: %s, %d objects in the archive (%s)'
+             % (_cotdb_fmt_bytes(out['dump_bytes']), out['toc_entries'], out['snapshot_path']))
+        return out
+
+    # Prove it reads. This is the entire point of the wrapper.
+    #
+    # It must go through the broker, not `runuser -u postgres -- pg_restore`: the
+    # broker writes dumps root-owned 0600, so postgres gets EACCES on its own
+    # snapshot. Found the hard way on dev-4 — the migration correctly refused to
+    # proceed, but on a permissions bug rather than a real corruption. Reading a
+    # TOC needs no database, so the broker does it as root, and its HMAC sidecar
+    # check runs first: bytes intact AND archive well-formed.
+    plog('  verifying the backup is restorable (pg_restore --list)…')
+    try:
+        r = _broker_request({'op': 'pg_restore', 'path': dump_path,
+                             'list_only': True, 'timeout': 600}, timeout=660)
+        if not r.get('ok') or not r.get('toc_entries'):
+            out['error'] = ('backup verification FAILED — could not read the archive (%s). '
+                            'Do not proceed with the migration.'
+                            % (str(r.get('error') or '').strip()[:200] or 'empty table of contents'))
+            plog(out['error'])
+            return out
+        out['toc_entries'] = int(r.get('toc_entries') or 0)
+    except Exception as e:
+        out['error'] = 'backup verification FAILED: %s' % str(e)[:300]
+        plog(out['error'])
+        return out
+
+    out['ok'] = True
+    plog('  backup verified: %s, %d objects in the archive (%s)'
+         % (_cotdb_fmt_bytes(out['dump_bytes']), out['toc_entries'], out['snapshot_path']))
+    return out
+
+
+# ── TAK 5.8 guided migration (v10.2.0 W4) ───────────────────────────────────
+# ONE operation, deliberately. The 5.8 package detects PG 15 and REFUSES to
+# finish, printing "Please manually run sudo /opt/tak/db-utils/upgrade-db.sh".
+# Between that refusal and the DB script completing, the box is a broken server:
+# package installed, schema not migrated, TAK down. An operator who does the
+# first half by hand and stops there has an outage and no obvious way back.
+#
+# So there is NO button that performs half of this. The route below runs
+# pre-flight → backup → stop → install → upgrade-db.sh → start → verify, and if
+# it fails after the package landed it says so in those words and names the two
+# ways out. That single property is the reason this release exists; the version
+# gate (below) is only holding the fleet safe until it shipped.
+#
+# D1 (operator, 2026-09-01): call `upgrade-db.sh` BARE on both families — TAK's
+# supported path, rather than owning a migration we deviated from.
+#
+# The two costs that decision accepted are GONE as of 5.8-RELEASE75, verified by
+# extracting the script from the .deb on 2026-09-01: TAK now calls
+# `pg_upgradecluster -m upgrade 15 main` (lines 133/135). In RELEASE65 — which
+# UPSTREAM-TAK-5.8-RELEASE-NOTES.md analysed — the `-m` was absent, so Debian's
+# default `dump` method applied: a full dump/reload (hours) AND, because
+# pg_upgradecluster only passes --no-data-checksums when method eq 'upgrade',
+# data page checksums ON for Ubuntu vs OFF for RHEL. With `-m upgrade` both are
+# fixed upstream: file-level migration, checksums off, platforms uniform.
+#
+# Keep verifying this per release rather than trusting it — it changed once
+# already, and our estimates and our honesty about downtime both depend on it.
+tak58_log = []
+tak58_status = {'running': False, 'complete': False, 'error': False}
+
+_TAK58_UPGRADE_DB_SH = '/opt/tak/db-utils/upgrade-db.sh'
+
+
+def _tak58_log(msg):
+    tak58_log.append(msg)
+
+
+# ── 5.8 schema verification + the EL md5->scram heal (v10.2.0) ──────────────
+# `upgrade-db.sh` exits 0 and prints "Database updated with SchemaManager.jar"
+# EVEN WHEN SchemaManager failed. Measured on Rocky 9.8, 2026-09-03: SchemaManager
+# logged `FATAL: password authentication failed for user "martiuser"`, the script
+# still exited 0, and the console reported "Migration complete" over a database
+# still on schema_version 99. TAK Server 5.8 was left running against a 5.7 schema
+# — a broken server that reports healthy.
+#
+# So the exit code is not evidence. We ask the database instead.
+_TAK58_MIN_SCHEMA_VERSION = 100     # V100 adds flow_tags/username to cot_router
+
+
+def _tak58_schema_version():
+    """Highest successfully-applied TAK schema version, or None if unreadable."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'cot', '-c',
+                      'select coalesce(max(version::int), 0) from schema_version where success'],
+                     timeout=60)
+        if r and r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            return int(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _tak58_heal_md5_scram(say):
+    """Re-hash the TAK DB password under scram-sha-256, then re-run TAK's schema setup.
+
+    ROOT CAUSE (EL only, measured on Rocky 9.8 2026-09-03): TAK's 5.8 package installs
+    a pg_hba.conf demanding `scram-sha-256`, but `pg_upgrade` carries the old cluster's
+    password over as an **md5 hash**, and an md5 hash cannot satisfy scram — there is no
+    way to derive a scram verifier from it. So martiuser cannot authenticate to the new
+    cluster and SchemaManager silently fails. Debian escapes this because
+    `pg_upgradecluster` keeps the old cluster's pg_hba (md5), so nothing changes.
+
+    Re-issuing ALTER USER ... PASSWORD with password_encryption=scram-sha-256 stores a
+    scram verifier for the SAME password, which is why this needs no new credential and
+    changes nothing the operator has to know about. The password is read from CoreConfig
+    and never logged.
+    """
+    try:
+        cc = _read_coreconfig() or ''
+    except Exception:
+        cc = ''
+    m = re.search(r'<connection[^>]*password="([^"]+)"', cc)
+    if not m:
+        say('  Could not read the database password from CoreConfig.xml — cannot repair '
+            'authentication automatically.')
+        return False
+    pw = m.group(1)
+    say('  The new cluster requires scram-sha-256 but the migrated password is an md5 hash, '
+        'so TAK could not authenticate to update the schema. Re-encoding the same password '
+        'under scram-sha-256…')
+    try:
+        # Console-authored SQL only. The password is parameterised through psql's own
+        # quoting via a dollar-quoted literal chosen not to collide with the value.
+        tag = '$tak58pw$'
+        if tag.strip('$') in pw:
+            say('  Password contains the quoting tag — refusing to build this statement.')
+            return False
+        r = _pg_exec(['psql', '-q', '-d', 'postgres', '-c',
+                      "SET password_encryption = 'scram-sha-256'; "
+                      "ALTER USER martiuser PASSWORD %s%s%s;" % (tag, pw, tag)], timeout=60)
+        if not r or r.returncode != 0:
+            say('  Could not re-encode the password: %s'
+                % ((getattr(r, 'stderr', '') or '').strip()[:200]))
+            return False
+    except Exception as e:
+        say('  Could not re-encode the password: %s' % str(e)[:200])
+        return False
+    say('  Re-running TAK\'s database setup…')
+    rc = _tak58_run_setup_db()
+    if rc != 0:
+        say('  TAK database setup returned %d after the password repair.' % rc)
+    return True
+
+
+def _tak58_run_setup_db(timeout_sec=3600):
+    """Run TAK's takserver-setup-db.sh (which runs SchemaManager). Returns exit code."""
+    script = '/opt/tak/db-utils/takserver-setup-db.sh'
+    if not os.path.exists(script):
+        return 127
+    if _broker_should_route() and _broker_available():
+        try:
+            resp = _broker_request({'op': 'tak58_setup_db', 'timeout': timeout_sec},
+                                   timeout=timeout_sec + 60)
+            return int(resp.get('returncode') or (0 if resp.get('ok') else 1))
+        except Exception:
+            return 1
+    r = subprocess.run(_sudo_wrap(['sh', script]), capture_output=True, text=True,
+                       timeout=timeout_sec)
+    return r.returncode
+
+
+# -- 5.8 container migration: export/import between two live DB containers ---
+# TAK documents the container upgrade as an export/import, NOT an in-place
+# migration (docker/README_hardened_docker.md, "postgres database version
+# upgrades"). The old container is the only one with /usr/pgsql-15/bin/psql, so it
+# must stay alive to export from; the new one must already carry the 5.8 schema
+# (its init runs SchemaManager) because the dump is --data-only.
+#
+# `--column-inserts` is row-by-row and far slower than the native pg_upgrade path.
+# The native 142 s / 181 s figures do NOT transfer here - container downtime is its
+# own measurement.
+_TAK58_EXPORT_NAME = 'cot_data.sql'
+
+
+def _tak58_db_password():
+    """The cot DB password from CoreConfig, or None. Never logged."""
+    try:
+        m = re.search(r'<connection[^>]*password="([^"]+)"', _read_coreconfig() or '')
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+_TAK58_PG_BIN_LAYOUTS = ('/usr/pgsql-{major}/bin', '/usr/lib/postgresql/{major}/bin')
+_TAK58_EXPORT_IN_CONTAINER = f'/tmp/{_TAK58_EXPORT_NAME}'
+
+
+def _tak58_long_env():
+    """Environment for a broker call that legitimately runs longer than the broker's
+    600 s default (docker cp of a multi-GB export, a volume copy). The broker clamps
+    to its own MAX_TIMEOUT; anything that could exceed even that runs detached instead
+    (see _tak58_container_run_detached)."""
+    env = dict(os.environ)
+    env['TAKWERX_BROKER_TIMEOUT'] = '7200'
+    return env
+
+
+def _tak58_container_run_detached(container, pw, shell_cmd, tag, say, progress=None,
+                                  timeout=12 * 3600, every=30):
+    """Run `shell_cmd` INSIDE `container` detached, then poll until it writes its exit code.
+
+    Measured on dev-4 2026-09-03: the first import attempt died at exactly 600 s with
+    `takwerx_broker: TIMEOUT: command timed out` — the broker's per-exec ceiling, not
+    psql's. A multi-GB pg_dump/psql cannot be held open through the broker at all, so
+    the command is started with `docker exec -d`, writes `$?` to /tmp/<tag>.rc when it
+    finishes, and each poll is its own short broker call. `progress()` (optional)
+    returns a string logged once a minute so a long import is visibly alive.
+    Returns the command's exit code, or None on timeout.
+    """
+    rc_path = f'/tmp/{tag}.rc'
+    subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', rc_path]),
+                   capture_output=True, timeout=60)
+    r = subprocess.run(_sudo_wrap([
+        'docker', 'exec', '-d', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+        f'{shell_cmd}; echo $? > {rc_path}']), capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        say(f'  Could not start {tag} in {container}: {(r.stderr or "").strip()[:200]}')
+        return None
+    t0 = time.time()
+    last_note = 0
+    while time.time() - t0 < timeout:
+        time.sleep(every)
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'cat', rc_path]),
+                           capture_output=True, text=True, timeout=60)
+        s = (r.stdout or '').strip()
+        if r.returncode == 0 and s.lstrip('-').isdigit():
+            return int(s)
+        if progress and time.time() - last_note >= 60:
+            last_note = time.time()
+            try:
+                note = progress()
+            except Exception:
+                note = None
+            if note:
+                say(f'  … {note} ({int(time.time() - t0) // 60} min)')
+    say(f'  {tag} did not finish within {timeout // 3600} h.')
+    return None
+
+
+def _tak58_container_pgbin(container, major):
+    """Directory holding psql/pg_dump for PostgreSQL `major` inside `container`, or None.
+
+    Two layouts exist in the fleet: PGDG on UBI (`/usr/pgsql-N/bin` — the hardened 5.8
+    images) and the Debian official image (`/usr/lib/postgresql/N/bin` — what the
+    pre-hardened 5.7 bundle's Dockerfile.takserver-db builds FROM postgres:15.1). Every
+    customer migrating from 5.7 is on the second, so probing only the first reported
+    "not running PostgreSQL 15" against a container that was.
+    """
+    for layout in _TAK58_PG_BIN_LAYOUTS:
+        d = layout.format(major=major)
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'test', '-x', f'{d}/psql']),
+                           capture_output=True, timeout=60)
+        if r.returncode == 0:
+            return d
+    return None
+
+
+def _tak58_container_psql(container, pgbin, pw, sql, timeout=300):
+    """One console-authored SQL statement as martiuser over TCP inside `container`.
+    Returns stdout, or None when psql failed. Never pass request-derived SQL here."""
+    try:
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+            f'{pgbin}/psql', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
+            '-tAX', '-c', sql]), capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _tak58_container_counts(container, pgbin, pw):
+    """{table: EXACT row count} for the cot DB inside `container` (non-empty tables), or None.
+
+    Used to PROVE an import landed. A psql exit code of 0 says the file was read, not
+    that the rows arrived — the same distinction that hid a failed SchemaManager behind
+    upgrade-db.sh's exit 0 on the native path. count(*), not pg_stat_user_tables'
+    n_live_tup: that is an estimate the stats collector drifts on, and an estimate is
+    not evidence.
+    """
+    sql = ("select relname||' '||(xpath('/row/c/text()', query_to_xml("
+           "'select count(*) as c from '||quote_ident(schemaname)||'.'||quote_ident(relname),"
+           " false, true, '')))[1]::text from pg_stat_user_tables order by relname")
+    out = _tak58_container_psql(container, pgbin, pw, sql, timeout=1800)
+    if out is None:
+        return None
+    counts = {}
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+            counts[parts[0]] = int(parts[1])
+    return counts
+
+
+def _tak58_container_schema_version(container, pgbin, pw):
+    """Highest successfully-applied TAK schema version inside `container`, or None."""
+    out = _tak58_container_psql(
+        container, pgbin, pw,
+        'select coalesce(max(version::int), 0) from schema_version where success')
+    s = (out or '').strip()
+    return int(s) if s.isdigit() else None
+
+
+def _tak58_container_export(container, dest_path, pw, say):
+    """Export cot data from the OLD container to dest_path on the host. Bytes written, or 0.
+
+    pg_dump, not psql. TAK's README_hardened_docker.md shows `psql --data-only
+    --column-inserts --disable-triggers`; those are pg_dump options and psql rejects
+    them. The first version of this helper copied the README verbatim.
+
+    The dump is written INSIDE the container, verified there, then `docker cp`'d out:
+    streaming it through the exec proxy would hit the broker's 32 MiB per-response
+    cap, and a host-side `sh -c '… > file'` is denied outright (sh is on the broker's
+    deny list). Every fleet box runs the console as takwerx through the broker, so
+    either would have failed everywhere.
+    """
+    pgbin = _tak58_container_pgbin(container, 15)
+    if not pgbin:
+        say(f'  {container} has no PostgreSQL 15 client — cannot export from it.')
+        return 0
+    # Shape of the export, measured on dev-4 2026-09-03 with 896,510 cot_router rows:
+    # TAK's documented `--column-inserts` alone produced a 28 GB file (cot_router.groups is
+    # bit(32768) and every row carries a 32,768-character B'000…' literal) that imported at
+    # ~380 rows/s - one implicit transaction, and one fsync, per row. --rows-per-insert
+    # batches 500 rows per statement (column names kept: 5.8 added columns to cot_router,
+    # so positional inserts would be wrong), --on-conflict-do-nothing skips the rows the
+    # fresh 5.8 schema seeds itself (schema_version, default groups) instead of erroring
+    # on each, and the import side turns synchronous_commit off for the session.
+    say(f'  Exporting the database from {container} (this is the slow part)…')
+    t0 = time.time()
+
+    def _export_progress():
+        w = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'wc', '-c',
+                                       _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=60)
+        n = int((w.stdout or '0').split()[0]) if w.returncode == 0 else 0
+        return f'{_cotdb_fmt_bytes(n)} written so far'
+
+    rc = _tak58_container_run_detached(
+        container, pw,
+        f'{pgbin}/pg_dump -h localhost -U martiuser -d cot --data-only --column-inserts '
+        f'--rows-per-insert=500 --on-conflict-do-nothing --disable-triggers '
+        f'-f {_TAK58_EXPORT_IN_CONTAINER} 2>/tmp/cot_export.err',
+        'cot_export', say, progress=_export_progress)
+    if rc != 0:
+        e = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'head', '-c', '300',
+                                       '/tmp/cot_export.err']), capture_output=True, text=True,
+                           timeout=60)
+        say(f'  Export failed (pg_dump exit {rc}): {(e.stdout or "").strip()[:300]}')
+        return 0
+    # Verify where the file is. An export with no INSERT statements is a failure even
+    # though pg_dump exited 0.
+    size, inserts = 0, -1
+    try:
+        w = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'wc', '-c',
+                                       _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=300)
+        size = int((w.stdout or '0').split()[0])
+        g = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'grep', '-c',
+                                       '^INSERT INTO', _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=1800)
+        inserts = int((g.stdout or '0').strip() or 0)
+    except Exception:
+        pass
+    if size <= 0:
+        say('  Export produced an empty file — refusing to treat that as a backup.')
+        return 0
+    if inserts == 0:
+        say('  Export contains no INSERT statements — the database looked empty. '
+            'Refusing to continue on an export that captured nothing.')
+        return 0
+    # Copy the backup out to the host. Root-side docker cp; nothing crosses the socket.
+    dest_dir = os.path.dirname(dest_path)
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
+    except PermissionError:
+        _makedirs_priv(dest_dir, mode=0o700)
+    r = subprocess.run(_sudo_wrap(['docker', 'cp', f'{container}:{_TAK58_EXPORT_IN_CONTAINER}',
+                                   dest_path]), capture_output=True, text=True, timeout=7300,
+                       env=_tak58_long_env())
+    hsize = os.path.getsize(dest_path) if os.path.exists(dest_path) else -1
+    if r.returncode != 0 or hsize != size:
+        say(f'  Could not copy the export out of the container '
+            f'({(r.stderr or "").strip()[:160] or f"host copy is {hsize} bytes, container file is {size}"}).')
+        return 0
+    # The dump is the whole CoT database in plaintext, and `docker cp` lands it
+    # root-owned 0644 - world-readable on a box that may hold CJI. Lock it down, and
+    # drop the in-container copy now that it is safely on the host (it is the same
+    # 28 GB again inside the container's writable layer).
+    subprocess.run(_sudo_wrap(['chmod', '600', dest_path]), capture_output=True, timeout=60)
+    subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f',
+                               _TAK58_EXPORT_IN_CONTAINER]), capture_output=True, timeout=300)
+    say(f'  Exported {_cotdb_fmt_bytes(size)}'
+        + (f', {inserts:,} INSERT statements' if inserts > 0 else '')
+        + f', in {int(time.time() - t0)} s')
+    return size
+
+
+def _tak58_container_import(container, src_path, pw, say):
+    """Import the export into the NEW container. True only if psql ran to the end.
+
+    psql exits 0 even when individual statements fail, so this reports how many were
+    rejected and what they were — but it is the caller's row-count comparison that
+    decides whether the import counts as having worked.
+    """
+    pgbin = _tak58_container_pgbin(container, TAK_PG_MAJOR)
+    if not pgbin:
+        say(f'  {container} has no PostgreSQL {TAK_PG_MAJOR} client — cannot import into it.')
+        return False
+    say(f'  Copying the export into {container}…')
+    r = subprocess.run(_sudo_wrap(['docker', 'cp', src_path,
+                                   f'{container}:{_TAK58_EXPORT_IN_CONTAINER}']),
+                       capture_output=True, text=True, timeout=7300, env=_tak58_long_env())
+    if r.returncode != 0:
+        say(f'  Copy into the container failed: {(r.stderr or "").strip()[:200]}')
+        return False
+    # `docker cp` lands the file root-owned with the SOURCE's mode, and the host copy is
+    # deliberately 0600 (it is the whole CoT database in the clear). The hardened image
+    # runs psql as postgres, not root, so the import died on its own backup:
+    #   /tmp/cot_data.sql: Permission denied      -> psql exit 1
+    # Measured on aws-arm 2026-09-04 — the first migration run after that hardening, which
+    # is exactly why this did not show up on the x86 run before it. Hand the file to the
+    # database user rather than widening it: 0640, owned by postgres, group 0.
+    subprocess.run(_sudo_wrap(['docker', 'exec', '-u', '0', container, 'sh', '-c',
+                               f'chown postgres:0 {_TAK58_EXPORT_IN_CONTAINER} && '
+                               f'chmod 640 {_TAK58_EXPORT_IN_CONTAINER}']),
+                   capture_output=True, timeout=300)
+    say('  Importing (allow a long window on a large database)…')
+    t0 = time.time()
+    # Output stays inside the container: a per-statement tag for every INSERT, or a wall
+    # of errors, would exceed the broker's response cap and kill the call.
+    # synchronous_commit=off for this session only: each batched INSERT still commits,
+    # but the session does not wait for the WAL fsync — the data is on disk within
+    # wal_writer_delay, and a crash mid-import is a failed migration either way
+    # (the row-count gate decides, and the PG15 volume is untouched).
+    def _import_progress():
+        out = _tak58_container_psql(container, pgbin, pw,
+            "select coalesce(sum(n_live_tup),0) from pg_stat_user_tables", timeout=60)
+        s = (out or '').strip()
+        return f'about {int(s):,} rows landed' if s.isdigit() else None
+
+    rc = _tak58_container_run_detached(
+        container, pw,
+        f'{pgbin}/psql -h localhost -U martiuser -d cot -q -v ON_ERROR_STOP=0 '
+        f'-c "set synchronous_commit = off" '
+        f'-f {_TAK58_EXPORT_IN_CONTAINER} >/tmp/cot_import.out 2>/tmp/cot_import.err',
+        'cot_import', say, progress=_import_progress)
+    if rc != 0:
+        say(f'  Import failed (psql exit {rc}).')
+        return False
+    try:
+        e = subprocess.run(_sudo_wrap([
+            'docker', 'exec', container, 'sh', '-c',
+            "grep -c 'ERROR' /tmp/cot_import.err; grep 'ERROR' /tmp/cot_import.err "
+            "| cut -c1-150 | sort | uniq -c | sort -rn | head -8"]),
+            capture_output=True, text=True, timeout=600)
+        lines = [l for l in (e.stdout or '').splitlines() if l.strip()]
+        nerr = int(lines[0].strip()) if lines and lines[0].strip().isdigit() else -1
+        if nerr > 0:
+            say(f'  {nerr:,} statement(s) were rejected during the import — the row-count '
+                f'comparison below decides whether that matters:')
+            for l in lines[1:]:
+                say('    ' + l.strip())
+    except Exception:
+        pass
+    say(f'  Import finished in {int(time.time() - t0)} s')
+    return True
+
+
+def _tak58_volume_copy(src, dst, say):
+    """Copy a docker volume's contents to another volume, as the rollback artifact.
+
+    Docker cannot rename a volume, and the container upgrade has to hand the new PG18
+    image an EMPTY volume - PostgreSQL 18 refuses to start on a PG15 data directory,
+    which is exactly why the existing run_takserver_upgrade_container() (which
+    deliberately PRESERVES the volume) cannot be used for 5.8 as-is.
+    So the old data is copied aside first and never deleted. The caller stops the
+    database container first so the copy is a consistent, cleanly-shut-down cluster.
+    """
+    r = subprocess.run(_sudo_wrap(['docker', 'volume', 'create', dst]),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        say(f'  Could not create the rollback volume {dst}: {(r.stderr or "").strip()[:160]}')
+        return False
+    r = subprocess.run(_sudo_wrap([
+        'docker', 'run', '--rm', '--user', '0',
+        '-v', f'{src}:/from', '-v', f'{dst}:/to',
+        '--entrypoint', 'sh', TAK_CONTAINER, '-c', 'cp -a /from/. /to/ 2>&1']),
+        capture_output=True, text=True, timeout=7300, env=_tak58_long_env())
+    if r.returncode != 0:
+        say(f'  Could not copy {src} -> {dst}: {(r.stderr or r.stdout or "").strip()[:200]}')
+        return False
+    say(f'  PostgreSQL 15 data preserved in volume {dst} — this is your rollback.')
+    return True
+
+
+def run_takserver_58_container_migration(zip_path, log=None, status=None):
+    """Container 5.8 migration: export from the PG15 container, rebuild, import into PG18.
+
+    NOT a variant of the native path. TAK documents this as an export/import between
+    two containers (docker/README_hardened_docker.md) because PostgreSQL 18 will not
+    start on a PG15 data directory, so there is nothing for pg_upgrade to do in place.
+
+    Order matters and is dictated by --data-only: the new container must already carry
+    the 5.8 schema (its own init runs SchemaManager) before the data goes in.
+    """
+    _log = upgrade_log if log is None else log
+    _status = upgrade_status if status is None else status
+
+    def _say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry); print(entry, flush=True)
+
+    def fail(msg, rollback_note=None):
+        _say(f'✗ {msg}')
+        if rollback_note:
+            _say('')
+            _say(rollback_note)
+        # complete=False on a failure. The Update panel checks `complete` BEFORE
+        # `error` (static/takserver.js pollUpgradeLog), so complete=True here made a
+        # failed migration render as "Update complete - Done. Refreshing..." and
+        # reload the page out from under the operator. Observed on dev-4 2026-09-03
+        # when the import hit the broker timeout. run_takserver_upgrade_container()'s
+        # own _fail() already had this right.
+        _status.update({'running': False, 'complete': False, 'error': True})
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    old_vol = f'{TAK_DB_VOLUME}_pre58_{stamp}'
+    # OUTSIDE the bundle tree. On a container box /opt/tak is a symlink INTO the
+    # current bundle dir, and the rebuild below deletes that dir — an export kept
+    # under /opt/tak/snapshots would be gone before the import needed it.
+    export_path = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-58-container-{stamp}',
+                               _TAK58_EXPORT_NAME)
+    _started = 'Started TAK Server messaging Microservice'
+    _msglog = '/opt/tak/logs/takserver-messaging.log'
+
+    def _messaging_starts():
+        """How many times TAK has logged its messaging start — a counter, so a restart
+        can be waited on even though the old start line is still in the file."""
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-c',
+                                       _started, _msglog]), capture_output=True, text=True,
+                           timeout=60)
+        s = (r.stdout or '').strip()
+        return int(s) if s.isdigit() else 0
+
+    t_all = time.time()
+    t_down = None
+    try:
+        _say('Checking this server is ready to migrate…')
+        if not _tak_is_container():
+            return fail('This is not a container deployment.')
+        pw = _tak58_db_password()
+        if not pw:
+            return fail('Could not read the database password from CoreConfig.xml.')
+        pg15 = _tak58_container_pgbin(TAK_DB_CONTAINER, 15)
+        if not pg15:
+            return fail(f'{TAK_DB_CONTAINER} is not running PostgreSQL 15 — nothing to migrate '
+                        f'from, or the container is down.')
+
+        # Row counts BEFORE, from the live database. This is the only thing that can
+        # prove the import later; a psql exit code cannot.
+        before = _tak58_container_counts(TAK_DB_CONTAINER, pg15, pw)
+        if not before:
+            return fail('Could not read row counts from the current database — refusing to '
+                        'migrate without a baseline to verify against.')
+        total_before = sum(before.values())
+        _say(f'  {len(before)} tables, {total_before:,} rows to move.')
+
+        # 1. Export — this IS the backup, and it is verified before anything is touched.
+        #    TAK keeps serving while it runs; downtime has not started yet.
+        _say('')
+        _say('Backing up before anything is changed (TAK Server stays up for this)…')
+        t0 = time.time()
+        if not _tak58_container_export(TAK_DB_CONTAINER, export_path, pw, _say):
+            return fail('Backup/export failed — refusing to migrate without one.')
+        export_secs = int(time.time() - t0)
+        _say(f'  Backup: {export_path}')
+
+        # 2. Stop TAK. Downtime starts here. The database is stopped too so the volume
+        #    copy below is a cleanly-shut-down cluster, not a torn copy of a live one.
+        _say('')
+        _say('Stopping TAK Server — downtime starts now…')
+        t_down = time.time()
+        subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER, TAK_DB_CONTAINER]),
+                       capture_output=True, timeout=300)
+
+        # 3. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
+        #    volume must be emptied — the copy is what makes that reversible.
+        _say('Preserving the PostgreSQL 15 data…')
+        if not _tak58_volume_copy(TAK_DB_VOLUME, old_vol, _say):
+            subprocess.run(_sudo_wrap(['docker', 'start', TAK_DB_CONTAINER, TAK_CONTAINER]),
+                           capture_output=True, timeout=300)
+            return fail('Could not preserve the PostgreSQL 15 volume — refusing to continue, '
+                        'because emptying it would then be irreversible. TAK Server has been '
+                        'started again on 5.7.')
+
+        # 4. Empty the live volume so the new PG18 container initialises cleanly and
+        #    creates the 5.8 schema.
+        _say('')
+        _say('Rebuilding on TAK Server 5.8…')
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]),
+                       capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]),
+                       capture_output=True, timeout=60)
+
+        # 5. Reuse the existing container upgrade to unpack, build and start. It preserves
+        #    certs / CoreConfig / UserAuthenticationFile, which is what we want; the volume
+        #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
+        #    It writes the SAME status dict the Update panel polls, so it is told not to
+        #    mark the job complete — the data has not moved yet.
+        run_takserver_upgrade_container(zip_path, mark_complete=False)
+        if upgrade_status.get('error'):
+            return fail('The container rebuild failed — see the output above.',
+                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
+                        f'is at {export_path}.')
+        _status.update({'running': True, 'complete': False, 'error': False})
+
+        # 6. The new DB container must be up, on 18, with the 5.8 schema already applied.
+        pg18 = _tak58_container_pgbin(TAK_DB_CONTAINER, TAK_PG_MAJOR)
+        if not pg18:
+            return fail(f'The new {TAK_DB_CONTAINER} is not running PostgreSQL {TAK_PG_MAJOR}.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        sv = _tak58_container_schema_version(TAK_DB_CONTAINER, pg18, pw)
+        if sv is None:
+            return fail('Could not read schema_version from the new database — cannot confirm '
+                        'the 5.8 schema exists, so refusing to import into it.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        if sv < _TAK58_MIN_SCHEMA_VERSION:
+            return fail(f'The new database did not build the 5.8 schema (schema_version {sv}) — '
+                        f'importing data into a pre-5.8 schema would corrupt it.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        _say(f'  New database: PostgreSQL {TAK_PG_MAJOR}, schema_version {sv}.')
+
+        # 7. Import with TAK stopped: it must not write to the database mid-import, and it
+        #    has to re-read everything afterwards — its caches were built on an empty schema.
+        _say('')
+        _say('Loading the data into the new database…')
+        starts_before = _messaging_starts()
+        subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER]), capture_output=True,
+                       timeout=300)
+        if not _tak58_container_import(TAK_DB_CONTAINER, export_path, pw, _say):
+            return fail('The data import failed.',
+                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
+                        f'is at {export_path}.')
+        after = _tak58_container_counts(TAK_DB_CONTAINER, pg18, pw)
+        if not after:
+            return fail('Could not read row counts after the import — cannot confirm the data '
+                        'arrived, so this is being treated as a failure.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        total_after = sum(after.values())
+        missing = {t: (before[t], after.get(t, 0)) for t in before
+                   if after.get(t, 0) < before[t]}
+        if missing:
+            detail = ', '.join(f'{t} {a:,}/{b:,}' for t, (b, a) in list(missing.items())[:6])
+            return fail(f'The import lost rows: {detail}. '
+                        f'{total_after:,} of {total_before:,} rows arrived.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol} and the export is at '
+                        f'{export_path}. Do NOT put this server into service.')
+        _say(f'  Import verified: {total_after:,} rows across {len(after)} tables '
+             f'(source had {total_before:,} across {len(before)}).')
+        # Counts match, so the in-container copy of the dump has served its purpose.
+        # Reclaim it (28 GB on a 900k-row database) - the host copy stays as the backup.
+        subprocess.run(_sudo_wrap(['docker', 'exec', TAK_DB_CONTAINER, 'rm', '-f',
+                                   _TAK58_EXPORT_IN_CONTAINER]), capture_output=True, timeout=300)
+
+        # 8. Start TAK on the migrated data and wait for it to actually serve.
+        _say('')
+        _say('Starting TAK Server 5.8 on the migrated database…')
+        subprocess.run(_sudo_wrap(['docker', 'start', TAK_CONTAINER]), capture_output=True,
+                       timeout=120)
+        _up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if _messaging_starts() > starts_before:
+                _up = True
+                break
+            if waited and waited % 60 == 0:
+                _say(f'  ⏳ {waited // 60} min …')
+        if not _up:
+            return fail('TAK Server did not report its messaging service started within 10 '
+                        'minutes of the import.',
+                        f'The data is in the new database (verified by row count). PostgreSQL 15 '
+                        f'data is also intact in volume {old_vol}. Check `docker logs '
+                        f'{TAK_CONTAINER}`.')
+        down_secs = int(time.time() - t_down)
+        _say(f'  TAK Server is serving again. Downtime {down_secs} s '
+             f'(the {export_secs} s export ran before it, live); '
+             f'{int(time.time() - t_all)} s end to end.')
+
+        _say('')
+        _say(f'Migration complete. The PostgreSQL 15 data is kept in volume {old_vol} and can be '
+             f'removed once you are satisfied — it is your rollback until then.')
+        _say(f'Backup kept at {export_path}')
+        _status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail(f'Unexpected error: {str(e)[:400]}',
+             f'If the migration had started, PostgreSQL 15 data may be in volume {old_vol}.')
+
+
+def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
+    """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
+
+    EVERY box in the fleet runs the console as `takwerx`, so every box takes the
+    broker path — the direct branch below is only reached on root-era installs.
+    The broker enforces EXEC_ALLOW and `upgrade-db.sh` is deliberately NOT on it;
+    a generic "run any script" allowance would be a hole. Instead W4b adds a
+    dedicated op bounded to that one fixed path, the shape `pg_dump` already uses.
+    """
+    _L = (log if log is not None else tak58_log).append
+
+    if _broker_should_route() and _broker_available():
+        # W4b: dedicated broker op, bounded to that one fixed path — no argv, no
+        # cwd, and the broker re-checks root-ownership and write permissions at
+        # call time before running it. The op is synchronous and returns the full
+        # combined output at the end, so nothing streams during the migration;
+        # the operator is told to expect that rather than left watching a dead log.
+        _L('  Running the migration through the privilege broker. Output arrives when it')
+        _L('  finishes — on a large database this can be hours with no visible progress.')
+        try:
+            resp = _broker_request({'op': 'tak58_upgrade_db', 'timeout': timeout_sec},
+                                   timeout=timeout_sec + 60)
+        except Exception as e:
+            _L('  Broker call failed: %s' % str(e)[:300])
+            return 1
+        for line in (resp.get('output') or '').splitlines():
+            _L('  ' + line)
+        if not resp.get('ok') and resp.get('error'):
+            _L('  %s' % str(resp.get('error'))[:300])
+        return int(resp.get('returncode') or (0 if resp.get('ok') else 1))
+    argv = _sudo_wrap(['sh', _TAK58_UPGRADE_DB_SH])
+    proc = subprocess.Popen(argv, cwd='/', stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        # No shebang + bashisms mean dash emits noise on Ubuntu while the script
+        # still works. Noise is not failure — only the exit code decides.
+        for line in iter(proc.stdout.readline, ''):
+            if line:
+                _L('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
+def run_takserver_58_migration(pkg_path, log=None, status=None):
+    """Worker: the whole 5.8 + PG18 migration as one indivisible operation.
+
+    `log`/`status` let the normal Update button drive this into the log panel the
+    TAK Server page already polls, instead of a second stream the user would have
+    to know about. Defaults keep the standalone API route working.
+    """
+    _log = tak58_log if log is None else log
+    _status = tak58_status if status is None else status
+    def _say(m):
+        _log.append(m)
+
+    def fail(msg, wedged=False):
+        _say(msg)
+        if wedged:
+            _say('')
+            _say('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
+            _say('The 5.8 package is installed but the database migration did not complete.')
+            # Do NOT tell the operator to run the vendor script with sudo. On a
+            # born-non-root box — every modern install — there is no sudo for the
+            # console user, and the broker only permits upgrade-db.sh through its
+            # fixed-shape tak58_upgrade_db op, never as a shell command. The printed
+            # escape hatch was therefore impossible to follow on exactly the boxes
+            # that hit this, which is where nuc landed on 2026-09-21. Clicking
+            # Update again re-runs the same broker op, and the install step is a
+            # no-op the second time, so it is both correct and the shorter path.
+            _say('Two ways forward, in order of preference:')
+            _say('  1. Fix what the error above names, then click Update TAK Server on this')
+            _say('     page again. It re-runs the database migration; the package install')
+            _say('     is already done and will be skipped.')
+            _say('  2. Restore from the pre-migration backup taken at the start of this run')
+            _say('     (see the snapshot path above). The old PostgreSQL cluster was left')
+            _say('     intact by design and is still on disk.')
+        _status.update({'running': False, 'complete': False, 'error': True})
+
+    try:
+        # 1. Pre-flight — refuse before touching anything.
+        _say('Checking this server is ready to migrate…')
+        pf = _tak_58_preflight()
+        for w in pf.get('warnings', []):
+            _say('  NOTE: %s' % w)
+        if not pf.get('ready'):
+            for b in pf.get('blockers', []):
+                _say('  BLOCKED: %s' % b)
+            return fail('Pre-flight failed — nothing was changed on this server.')
+        f = pf.get('facts', {})
+        _say('  PostgreSQL %s → %s, database %s, %s free.'
+                   % (f.get('pg_running_major'), f.get('pg_target_major'),
+                      _cotdb_fmt_bytes(f.get('data_bytes') or 0),
+                      _cotdb_fmt_bytes(f.get('avail_bytes') or 0)))
+        if f.get('pk_rewrite_expected'):
+            _say('  This database still has cot_router.id as integer, so the 5.8 schema '
+                       'update will rewrite that table in full. Expect a long window.')
+
+        # 2. Backup — verified, not assumed. Refuse to continue without one.
+        _say('')
+        _say('Backing up before anything is changed…')
+        bk = _tak_58_backup(plog=_tak58_log)
+        if not bk.get('ok'):
+            return fail('Backup failed — refusing to migrate without one. %s'
+                        % (bk.get('error') or ''))
+        _say('  Backup: %s' % bk.get('snapshot_path'))
+
+        # 3. Stop TAK.
+        _say('')
+        _say('Stopping TAK Server…')
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']),
+                       capture_output=True, timeout=300)
+
+        # 4. Install the 5.8 package. After this line the box is mid-upgrade.
+        _say('Installing %s …' % os.path.basename(pkg_path))
+        if _distro_family() == 'rhel':
+            cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
+        else:
+            cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
+                   + shlex.quote(pkg_path) + ' 2>&1')
+        rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
+                                               tak58_log, timeout_sec=1800)
+        # The package is EXPECTED to complain about pg15 and stop short — that is
+        # the documented 5.8 behaviour, not an install failure. The database
+        # script below is what finishes it, so a non-zero rc here is reported and
+        # then superseded by whether upgrade-db.sh succeeds.
+        if rc != 0:
+            _say('  The package installer stopped short (exit %d). This is expected on a '
+                       'PostgreSQL 15 server — 5.8 refuses to finish until the database is '
+                       'migrated. Continuing to the database migration.' % rc)
+
+        # 5. The database half. WHICH database matters.
+        #
+        # On a MANAGED database there is no local cluster to pg_upgrade: the provider
+        # already moved the engine to 18 (our pre-flight refuses 5.8 until they have).
+        # Running the local path there is wrong twice over — upgrade-db.sh migrates a
+        # cluster that is not the one TAK uses, and the md5->scram repair re-encodes a
+        # password in a cluster nobody is authenticating against. Worse, the check that
+        # follows used the LOCAL helper, so on az-ubuntu-1 2026-09-19 it read 99 off the
+        # leftover local cluster while the managed instance had just reached 106, called
+        # a completely successful migration a failure, ran the repair against the wrong
+        # database, and left the box reading "THIS SERVER IS MID-UPGRADE AND TAK IS NOT
+        # RUNNING". Same fault as 7aca0f9 (asking the wrong server), one layer down.
+        _mig_edb = None
+        try:
+            _mig_cfg = _get_tak_deployment_config(load_settings()) or {}
+            if _mig_cfg.get('mode') == 'external_db':
+                _mig_edb = _mig_cfg.get('external_db') or {}
+                if not (_mig_edb.get('host') or '').strip():
+                    _mig_edb = None
+        except Exception:
+            _mig_edb = None
+
+        if _mig_edb:
+            _say('')
+            _say('Managed database (%s): the provider already runs PostgreSQL %d, so there is '
+                 'no cluster on this host to migrate. Applying the 5.8 schema updates to the '
+                 'managed instance instead.' % (_mig_edb.get('host'), TAK_PG_MAJOR))
+            if not os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
+                return fail('The 5.8 package did not provide SchemaManager.jar — cannot apply '
+                            'the schema updates.', wedged=True)
+            _smr = subprocess.run(
+                'cd /opt/tak && java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                shell=True, capture_output=True, text=True, timeout=3600)
+            for _l in ((_smr.stdout or '') + (_smr.stderr or '')).strip().split('\n')[:40]:
+                if _l.strip():
+                    _log.append('    %s' % _l.rstrip())
+            # Ask the MANAGED instance, never the local one.
+            _sv = _tak58_external_schema_version(_mig_edb)
+            if _sv is None or _sv < _TAK58_MIN_SCHEMA_VERSION:
+                return fail('The 5.8 schema updates did not apply to the managed database '
+                            '(schema_version %s, needed >= %d). TAK Server 5.8 must NOT be run '
+                            'against a pre-5.8 schema — it will appear healthy and behave '
+                            'incorrectly. See the output above.'
+                            % (_sv if _sv is not None else 'unreadable',
+                               _TAK58_MIN_SCHEMA_VERSION), wedged=True)
+            _say('  Managed database now at schema_version %d.' % _sv)
+        else:
+            # Local cluster: the vendor migration. Bare, per D1.
+            _say('')
+            _say('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
+                       'not interrupt it. Duration scales with database size, and with whether the '
+                       '5.8 schema update has to rewrite cot_router (see the note above).'
+                       % TAK_PG_MAJOR)
+            if not os.path.exists(_TAK58_UPGRADE_DB_SH):
+                return fail('The 5.8 package did not provide %s — cannot migrate the database.'
+                            % _TAK58_UPGRADE_DB_SH, wedged=True)
+
+            # pg_upgrade aborts if the OLD cluster references a loadable library the
+            # NEW major does not have — and it aborts AFTER TAK has been stopped.
+            # The one that bites us is our own: scripts/guarddog/tak-db-repack.sh
+            # installs pg_repack_<major> / postgresql-<major>-repack when Guard Dog's
+            # weekly online repack runs, so the old cluster carries pg_repack.so and
+            # nothing installs the new major's build. Measured on nuc (Rocky 9.8),
+            # 2026-09-21: "Checking for presence of required libraries  fatal",
+            # migration dead, TAK down, on a box whose only sin was running the
+            # maintenance job we ship.
+            #
+            # We installed it, so we install its counterpart — this is not something
+            # to hand back to the operator as a blocker. Narrowly scoped to pg_repack
+            # on purpose: a generic "diff the two lib directories" check is WRONG,
+            # because the new major is installed BY this migration and its lib dir is
+            # legitimately incomplete until then (that mistake produced 88 false
+            # positives and blocked a healthy box before this replaced it).
+            # A target-major cluster left over from a FAILED earlier attempt makes every
+            # retry impossible: pg_upgrade refuses with "New cluster database cot is not
+            # empty", and the recovery this console prints ("run Update again") can then
+            # never succeed. Measured on nuc 2026-09-21 after the pg_repack failure.
+            #
+            # Safe to clear ONLY when all three hold, which together mean it cannot be
+            # anyone's live data:
+            #   * the live database is still on the OLD major (the real data is there),
+            #   * the target-major cluster is NOT serving,
+            #   * we are mid-migration.
+            # Move it aside rather than delete it, so a wrong call stays recoverable.
+            _new_data = ('/var/lib/pgsql/%d/data' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
+                else ('/var/lib/postgresql/%d/main' % TAK_PG_MAJOR)
+            _new_svc = ('postgresql-%d' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
+                else ('postgresql@%d-main' % TAK_PG_MAJOR)
+            # NB: running_major is a local of _tak_58_preflight(), NOT of this function —
+            # referencing it here raised NameError and wedged a migration mid-run on nuc,
+            # 2026-09-21. The value is already in the pre-flight result computed above.
+            _live_major = (pf.get('facts') or {}).get('pg_running_major')
+            _new_serving = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _new_svc]),
+                                          capture_output=True, text=True,
+                                          timeout=30).stdout.strip() == 'active'
+            _new_exists = subprocess.run(_sudo_wrap(['test', '-d', _new_data]),
+                                         capture_output=True, timeout=30).returncode == 0
+            if _new_exists and not _new_serving and _live_major and _live_major != TAK_PG_MAJOR:
+                _stale = '%s.failed-%s' % (_new_data, time.strftime('%Y%m%d-%H%M%S'))
+                _say('  A PostgreSQL %d data directory already exists from an earlier failed '
+                     'attempt, and the live database is still on %d. pg_upgrade cannot write '
+                     'into it, so moving it aside to %s…' % (TAK_PG_MAJOR, _live_major, _stale))
+                _mv = subprocess.run(_sudo_wrap(['mv', _new_data, _stale]),
+                                     capture_output=True, text=True, timeout=120)
+                if _mv.returncode == 0:
+                    _say('  \u2713 Previous attempt moved aside (delete it once you are satisfied)')
+                else:
+                    _say('  \u26a0 Could not move it: %s' % ((_mv.stderr or '').strip()[:200]))
+
+            _is_rhel = _distro_family() == 'rhel'
+            _rp_installed = subprocess.run(
+                ("rpm -qa 2>/dev/null | grep -q '^pg_repack_'" if _is_rhel
+                 else "dpkg -l 2>/dev/null | grep -q 'postgresql-[0-9]*-repack'"),
+                shell=True, capture_output=True).returncode == 0
+            if _rp_installed:
+                _rp_new = ('pg_repack_%d' % TAK_PG_MAJOR) if _is_rhel \
+                    else ('postgresql-%d-repack' % TAK_PG_MAJOR)
+                _say('  pg_repack is installed for the old cluster (Guard Dog online repack) — '
+                     'installing %s so pg_upgrade can load it...' % _rp_new)
+                _ok_rp, _out_rp = _pkg_install(_rp_new, timeout=600)
+                if _ok_rp:
+                    _say('  ✓ %s installed' % _rp_new)
+                else:
+                    _say('  ⚠ Could not install %s: %s. pg_upgrade will refuse if the old '
+                         'cluster uses pg_repack — install it by hand and run Update again.'
+                         % (_rp_new, (_out_rp or '')[:160]))
+
+            rc = _tak58_run_upgrade_db(log=_log)
+            # The script has no shebang and uses bashisms, so under dash it emits
+            # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
+            # while still doing its job. Noise is NOT failure — only the exit code is.
+            if rc != 0:
+                return fail('The database migration failed (exit %d). See the output above.' % rc,
+                            wedged=True)
+
+            # The vendor script's exit code is NOT evidence that the schema updated — it
+            # exits 0 even when SchemaManager failed to authenticate. Ask the database.
+            _sv = _tak58_schema_version()
+            if _sv is not None and _sv < _TAK58_MIN_SCHEMA_VERSION:
+                _say('')
+                _say('The database migrated but the 5.8 schema updates did not apply '
+                     '(schema_version %d). Repairing…' % _sv)
+                _tak58_heal_md5_scram(_say)
+                _sv2 = _tak58_schema_version()
+                if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
+                    return fail('The 5.8 schema updates could not be applied (schema_version %s). '
+                                'TAK Server 5.8 must NOT be run against a pre-5.8 schema — it will '
+                                'appear healthy and behave incorrectly. See the output above.'
+                                % (_sv2 if _sv2 is not None else 'unknown'), wedged=True)
+                _say('  Schema updates applied — now at version %d.' % _sv2)
+            elif _sv is None:
+                _say('  WARNING: could not read schema_version to confirm the 5.8 schema updates '
+                     'applied. Verify by hand before putting this server back in service.')
+
+        # Finish the package. On Debian the 5.8 install DELIBERATELY exits non-zero on a
+        # PG-15 box ("A pg15 install has been detected…"), so dpkg is left holding a
+        # half-configured takserver even after the database migration succeeds and TAK
+        # runs perfectly well. Nothing looks wrong until the NEXT apt operation on that
+        # box reports "1 not fully installed or removed" and refuses — which is how this
+        # was found: an uninstall on dev-4 could not purge the package (2026-09-02).
+        # dpkg --configure -a is idempotent and a no-op when nothing is pending.
+        if _distro_family() != 'rhel':
+            _say('')
+            _say('Finishing the package installation…')
+            _cfg_rc = _run_dpkg_configure_a(_say, _log)
+            if _cfg_rc != 0:
+                _say('  WARNING: dpkg --configure -a returned %d. TAK Server may still be '
+                     'running correctly, but the package is not fully registered — the next '
+                     'apt operation on this server will report it. Run '
+                     '`sudo dpkg --configure -a` and check the output.' % _cfg_rc)
+
+        # 6. Start and verify it is actually SERVING — not merely "active".
+        _say('')
+        _say('Starting TAK Server…')
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']),
+                       capture_output=True, timeout=300)
+        post = _tak_58_preflight()
+        pf2 = post.get('facts', {})
+        running = pf2.get('pg_running_major')
+        if running != TAK_PG_MAJOR:
+            return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
+                        % (running, TAK_PG_MAJOR), wedged=True)
+        _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        _say('')
+        # Name the right rollback. On a managed database there IS no local PostgreSQL 15
+        # cluster holding their data — the only local cluster is the vestigial one TAK's
+        # own package pulls in, which nothing uses. Telling a managed customer that is
+        # their rollback points them at the wrong thing at the worst possible moment.
+        if _mig_edb:
+            _say('Migration complete. Your rollback is the provider-side snapshot you took '
+                 'before the engine upgrade, plus the verified pre-migration dump below — '
+                 'there is no PostgreSQL 15 cluster on this host holding your data.')
+        else:
+            _say('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
+                       'removed once you are satisfied — it is your rollback until then.')
+        _say('Backup kept at %s' % bk.get('snapshot_path'))
+        _status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail('Unexpected error: %s' % str(e)[:400], wedged=True)
+
+
+@app.route('/api/takserver/58-migrate', methods=['POST'])
+@login_required
+def takserver_58_migrate():
+    """Start the guided 5.8 + PG18 migration. There is deliberately no way to run
+    only half of it — see the module comment above."""
+    if tak58_status.get('running'):
+        return jsonify({'error': 'A migration is already in progress'}), 409
+    # @login_required proves a session; it does not prove the person at the keyboard
+    # meant to migrate a production database. Same contract as every uninstall route.
+    _gate = _require_admin_password()
+    if _gate is not None:
+        return _gate
+    try:
+        cands = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(('.deb', '.rpm'))]
+    except Exception:
+        cands = []
+    pkgs = [f for f in cands if (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM]
+    if not pkgs:
+        return jsonify({'error': 'Upload the TAK Server 5.8 package (.deb or .rpm) first.'}), 400
+    pkg = os.path.join(UPLOAD_DIR, sorted(
+        pkgs, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+    tak58_log.clear()
+    tak58_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_takserver_58_migration, args=(pkg,), daemon=True).start()
+    return jsonify({'success': True, 'package': os.path.basename(pkg)})
+
+
+@app.route('/api/takserver/58-migrate/log')
+@login_required
+def takserver_58_migrate_log():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': tak58_log[idx:], 'total': len(tak58_log),
+                    'running': tak58_status['running'],
+                    'complete': tak58_status['complete'],
+                    'error': tak58_status['error']})
+
+
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
-# package on a PG-15 box through our update flow wedges TAK mid-upgrade
-# (SchemaManager runs against the wrong PG major) and there is no clean way back
-# without a restore. Until the guided migration ships, the console REFUSES 5.8+
-# artifacts. Background: private notes ROADMAP.md, "Ubuntu 24.04 LTS
-# transition", Phase 0.5.
+# package on a PG-15 box through THIS path wedges TAK mid-upgrade: the package
+# refuses to finish, TAK stays down, and nothing migrates the database.
+#
+# v10.2.0 W5: the gate STAYS. Its job changed rather than ended. The guided flow
+# now exists (/api/takserver/58-migrate), so the message points there instead of
+# saying "coming in a future release" — but the old update path is still exactly
+# as dangerous as it always was, and deleting the gate because a better route
+# exists would just re-open the wedge for anyone who uses the wrong button.
 TAK_GATE_BLOCK_FROM = (5, 8)
 TAK_GATE_MESSAGE = (
-    'STOP - TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration. '
-    'Do not install it manually. Console support for a guided upgrade is coming '
-    'in an upcoming release.'
+    'TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration, so it cannot go '
+    'through the normal update - that path installs the package and stops, leaving TAK '
+    'Server down. Use the "TAK Server 5.8 requires PostgreSQL 18" card at the top of this '
+    'section instead: it backs up, upgrades and migrates as one operation.'
 )
 # First major.minor after "takserver" in the artifact name. Covers every shape
 # we accept: takserver_5.7-RELEASE43_all.deb, takserver-5.8-RELEASE1.noarch.rpm,
@@ -66796,6 +69256,115 @@ def takserver_update():
     if not os.path.exists('/opt/tak'):
         return jsonify({'error': 'TAK Server not installed. Deploy TAK Server first.'}), 400
     settings = load_settings()
+
+    # ── v10.2.0 W5: 5.8 goes through THIS button, not a second one ──────────
+    # 5.8 needs a PostgreSQL 15->18 migration, which the plain package install
+    # cannot do — it installs, refuses to finish, and leaves TAK down. That used
+    # to be a refusal telling the operator to wait for a future release. It is
+    # now a ROUTE: the same Update button detects a 5.8 artifact on a PG-15 box
+    # and runs the guided migration instead of the plain upgrade, writing to the
+    # same upgrade_log the page already polls. One button, one log, no parallel
+    # path for a user to discover.
+    #
+    # The gate below still fires for anything the migration cannot handle
+    # (container TAK, remote DB) — routing is not the same as always allowing.
+    # The 5.8 detection must see the artifact a CONTAINER box actually uploads — the
+    # takserver-docker .zip. Listing only .deb/.rpm here meant _is58 was never true on a
+    # container box, so a 5.8 zip fell through to the data-preserving container upgrade
+    # (a PG18 image on the PG15 volume) whenever the gate let it — measured on dev-4
+    # 2026-09-03: the route answered a plain {"success": true} and rebuilt on 5.8 with
+    # the migration never invoked.
+    _pending, _pending_zips = [], []
+    try:
+        for f in os.listdir(UPLOAD_DIR):
+            if f.endswith(('.deb', '.rpm')):
+                _pending.append(f)
+            elif f.lower().endswith('.zip') and 'docker' in f.lower():
+                _pending_zips.append(f)
+    except OSError:
+        pass
+    _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM
+                for f in (_pending_zips if _tak_is_container() else _pending))
+    if _is58 and _tak_is_container():
+        # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
+        # existing data-preserving container upgrade cannot be used - it deliberately
+        # keeps the volume. Route to the export/import migration instead.
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        _zips = [f for f in os.listdir(UPLOAD_DIR)
+                 if f.lower().endswith('.zip') and 'docker' in f.lower()]
+        if not _zips:
+            return jsonify({'error': 'Container 5.8 upgrade: upload the takserver-docker '
+                                     'hardened .zip bundle.'}), 400
+        _zip = os.path.join(UPLOAD_DIR, sorted(
+            _zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_58_container_migration,
+                         args=(_zip,), kwargs={'log': upgrade_log, 'status': upgrade_status},
+                         daemon=True).start()
+        return jsonify({'success': True, 'migration': True, 'container': True,
+                        'message': 'TAK Server 5.8 detected on a container deployment — '
+                                   'exporting the database, rebuilding on PostgreSQL %d, then '
+                                   'importing. The PostgreSQL 15 volume is preserved as your '
+                                   'rollback.' % TAK_PG_MAJOR})
+    if _is58 and not _tak_is_container():
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        # ── v10.2.0 W9: split-box 5.8 ────────────────────────────────────
+        # A two-server pair used to hit the generic pre-flight and be told the
+        # migration "is not supported in this release" — true when it was written,
+        # and a dead end for every split-box customer once 5.8 became mandatory.
+        # The database half simply happens on Server One over SSH.
+        _ts_cfg = _get_tak_deployment_config(settings)
+        if (_ts_cfg or {}).get('mode') == 'two_server':
+            _s1 = (_ts_cfg.get('server_one') or {})
+            if not (_s1.get('host') or '').strip():
+                return jsonify({'error': 'Two-server mode is set but Server One has no host '
+                                         'configured.'}), 400
+            _is_rhel = _distro_family() == 'rhel'
+            _exts = ('.rpm',) if _is_rhel else ('.deb',)
+            _all = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(_exts)]
+            _core = next((f for f in _all if 'core' in f.lower()
+                          and (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM), '')
+            # The database package belongs to SERVER ONE's family, which may differ from
+            # this host's (see the upload gate — that is why it is accepted either way).
+            _dbp = next((f for f in os.listdir(UPLOAD_DIR)
+                         if 'database' in f.lower() and f.endswith(('.deb', '.rpm'))
+                         and (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM), '')
+            if not _core or not _dbp:
+                return jsonify({'error': 'Two-server 5.8 upgrade needs BOTH the 5.8 '
+                                         'takserver-core package for this host and the 5.8 '
+                                         'takserver-database package for Server One. Upload '
+                                         'both, then try again.'}), 400
+            upgrade_log.clear()
+            upgrade_status.update({'running': True, 'complete': False, 'error': False})
+            threading.Thread(target=run_takserver_58_two_server_migration,
+                             args=(os.path.join(UPLOAD_DIR, _core),
+                                   os.path.join(UPLOAD_DIR, _dbp), _s1, _ts_cfg),
+                             kwargs={'log': upgrade_log, 'status': upgrade_status},
+                             daemon=True).start()
+            return jsonify({'success': True, 'migration': True, 'two_server': True,
+                            'message': 'TAK Server 5.8 detected on a two-server deployment — '
+                                       'backing up and migrating the database on Server One '
+                                       '(%s) to PostgreSQL %d, then upgrading this core.'
+                                       % (_s1.get('host'), TAK_PG_MAJOR)})
+        _pf = _tak_58_preflight()
+        if not _pf.get('ready'):
+            return jsonify({'error': 'TAK Server 5.8 cannot be installed on this server yet: '
+                                     + '; '.join(_pf.get('blockers') or ['pre-flight failed'])}), 400
+        _pkg = os.path.join(UPLOAD_DIR, sorted(
+            [f for f in _pending if (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM],
+            key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_58_migration,
+                         args=(_pkg,), kwargs={'log': upgrade_log, 'status': upgrade_status},
+                         daemon=True).start()
+        return jsonify({'success': True, 'migration': True,
+                        'message': 'TAK Server 5.8 detected — running the guided upgrade '
+                                   '(backup, install, database migration to PostgreSQL '
+                                   '%d, restart) as one operation.' % TAK_PG_MAJOR})
     # v10.0.1: a container box must NEVER take the .deb/dpkg/apt upgrade path — it does not
     # upgrade the image and litters the host. Run the data-preserving container upgrade instead:
     # rebuild the image from the new takserver-docker-*.zip while KEEPING the DB volume + certs.
@@ -67336,11 +69905,21 @@ def _tak_snapshot(label, plog=None):
             _ep = int(_snap_edb.get('port') or 5432)
             _en = _snap_edb.get('name') or 'cot'
             _eu = _snap_edb.get('user') or 'martiuser'
-            if not _shu.which('pg_dump'):
-                plog("  snapshot: external-DB mode but no pg_dump client on this box — DB dump skipped "
-                     "(managed-DB automated backups still apply; install postgresql client tools to capture dumps in snapshots)")
+            # Resolve a pg_dump at least as new as the MANAGED server, installing the
+            # versioned client if needed. A bare `pg_dump` is whatever TAK's own
+            # postgresql-15 dependency put on PATH, and it refuses to dump an 18
+            # server — which is the state every managed box is in once the engine has
+            # been upgraded for 5.8. See _pg_client_bin().
+            _emaj, _ewhy = _tak58_managed_pg_major(_snap_edb)
+            _pgdump = _pg_client_bin('pg_dump', _emaj, plog=plog) if _emaj else _shu.which('pg_dump')
+            if not _pgdump:
+                plog("  snapshot: external-DB mode but no pg_dump client able to read PostgreSQL %s "
+                     "on this box — DB dump skipped (managed-DB automated backups still apply; "
+                     "install the postgresql client tools to capture dumps in snapshots)"
+                     % (_emaj if _emaj else '?'))
             else:
-                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}")
+                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}"
+                     + (f" (client {_pgdump})" if _emaj else ""))
                 import tempfile
                 _fd, _tmp_dump = tempfile.mkstemp(prefix='cot-snap-', suffix='.pgdump')
                 os.close(_fd)
@@ -67349,14 +69928,46 @@ def _tak_snapshot(label, plog=None):
                     _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
                     with open(_tmp_dump, 'wb') as _f:
                         r2 = subprocess.run(
-                            ['pg_dump', '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            [_pgdump, '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
                             stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
                     if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
-                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
-                        if _cp.returncode == 0:
-                            meta['db_dump'] = True
-                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written ({os.path.getsize(_tmp_dump) // 1024} KB)")
+                        # Prove the archive READS, here, while the console still owns the
+                        # file. The broker cannot vouch for this one: its pg_restore op
+                        # requires an HMAC sidecar proving the BROKER produced the dump,
+                        # and a managed database is dumped client-side over TCP (the
+                        # broker has no remote-host pg_dump, and giving it outbound
+                        # credentialed database access to satisfy a check is a far bigger
+                        # surface change than the check is worth). So the same standard is
+                        # met the same way — pg_restore --list parses the table of
+                        # contents, which catches truncation and corruption that a
+                        # non-zero byte count does not — just on this side of the copy.
+                        _toc_n = 0
+                        _prbin = _pg_client_bin('pg_restore', _emaj, plog=plog) if _emaj else _shu.which('pg_restore')
+                        if _prbin:
+                            try:
+                                _pr = subprocess.run([_prbin, '--list', _tmp_dump],
+                                                     capture_output=True, text=True, timeout=600)
+                                _toc_n = len([l for l in (_pr.stdout or '').splitlines()
+                                              if l.strip() and not l.lstrip().startswith(';')])
+                                if _pr.returncode != 0 or not _toc_n:
+                                    plog("  snapshot: external-DB dump did NOT verify (%s) — "
+                                         "refusing to record it as a backup"
+                                         % ((_pr.stderr or '').strip()[:200] or 'empty table of contents'))
+                                    _toc_n = 0
+                            except Exception as _pe:
+                                plog(f"  snapshot: could not verify the external-DB dump: {str(_pe)[:160]}")
+                                _toc_n = 0
                         else:
+                            plog("  snapshot: no pg_restore able to read PostgreSQL %s — cannot verify the dump"
+                                 % (_emaj if _emaj else '?'))
+                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120) if _toc_n else None
+                        if _toc_n and _cp is not None and _cp.returncode == 0:
+                            meta['db_dump'] = True
+                            meta['db_dump_toc'] = _toc_n
+                            meta['db_dump_bytes'] = os.path.getsize(_tmp_dump)
+                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written and verified "
+                                 f"({os.path.getsize(_tmp_dump) // 1024} KB, {_toc_n} objects)")
+                        elif _toc_n:
                             plog(f"  snapshot: pg_dump copy into snapshot FAILED: {(_cp.stderr or b'').decode()[:160]}")
                     else:
                         plog(f"  snapshot: external-DB pg_dump FAILED (check network path + client-vs-server version): {(r2.stderr or b'').decode()[:200]}")
@@ -67539,6 +70150,9 @@ def _tak_rollback(label, plog=None):
             subprocess.run(
                 _sudo_wrap(['chown', f'{_ru}:{_rg}', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
+            if _tak_is_container():
+                subprocess.run(_sudo_wrap(['chmod', '640', '/opt/tak/UserAuthenticationFile.xml']),
+                               capture_output=True, timeout=10)
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
             plog(f"  rollback: UserAuthenticationFile.xml restore failed: {e}")
@@ -67568,6 +70182,9 @@ def _tak_rollback(label, plog=None):
             subprocess.run(
                 _sudo_wrap(['chown', '-R', f'{_cu}:{_cg}', '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
+            if _tak_is_container():
+                subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', '/opt/tak/certs/files']),
+                               capture_output=True, timeout=15)
             plog("  rollback: certs/ restored")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
@@ -68445,7 +71062,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
 
-def run_takserver_upgrade_container(zip_path):
+def run_takserver_upgrade_container(zip_path, mark_complete=True):
     """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
     takserver-docker-*.zip and recreates the containers while KEEPING the database (the
     TAK_DB_VOLUME named volume) and the existing CA/certs + CoreConfig + UserAuthenticationFile.
@@ -68453,7 +71070,12 @@ def run_takserver_upgrade_container(zip_path):
     the old one (both inside the allowlisted bundle root) and carries certs/CoreConfig over in
     place, NEVER `docker volume rm`s the DB, and does NO cert-gen / DB re-provision. Logs to
     upgrade_log/upgrade_status (the Update panel). SACRED: the DB volume must never be removed
-    on this path — that is the whole point of an upgrade vs a redeploy."""
+    on this path — that is the whole point of an upgrade vs a redeploy.
+
+    mark_complete=False leaves upgrade_status 'running' at the end: the 5.8 container
+    migration calls this as a STEP (rebuild) and has the data import still to do, and
+    the Update panel stops polling — and reloads the page as "Update complete" — the
+    moment it sees running=False."""
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
@@ -68494,9 +71116,10 @@ def run_takserver_upgrade_container(zip_path):
                         except OSError: pass
         except Exception as e:
             return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
+        _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
         entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
                    if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                   and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))
+                   and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))
                    and os.path.join(TAK_DOCKER_ROOT, d) != old_ctx]
         entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
         if not entries:
@@ -68524,17 +71147,29 @@ def run_takserver_upgrade_container(zip_path):
 
         # 4) Build the new-version images.
         ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
-        _patch_tak_db_dockerfile(new_ctx, ulog)         # GH #69 — EOL bullseye, see the helper
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1'):
+        _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
+        if not _app_df:
+            return _fail('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
+        # Both, and in this order: the resolver picks WHICH Dockerfile (5.8 hardened renamed
+        # them — GH #66), the patcher fixes the stock one's EOL bullseye sources (GH #69). The
+        # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
+        # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
+        _patch_tak_db_dockerfile(new_ctx, ulog)
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1'):
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
             return _fail("TAK Server image build failed.")
         ulog("✓ Images built")
+        # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
+        # mount was written by the console user (and the certs carried over from the old
+        # bundle keep their old ownership). Same fix as the deploy path, same reason —
+        # a no-op on the pre-hardened images, which run as root inside the container.
+        _container_own_tree(new_tak, ulog)
 
         # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
         ulog("Step 5/6: Recreating containers (DB volume reused)...")
         rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
-        rc(f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+        rc(f'docker run {_tak_db_volume_mount(new_ctx)} '
            f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
            f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
         time.sleep(8)
@@ -68575,11 +71210,459 @@ def run_takserver_upgrade_container(zip_path):
         except Exception as _tpe:
             ulog(f"  ⚠ TAK Portal cert sync skipped: {str(_tpe)[:120]}")
         ulog("")
-        ulog("✓ Container upgrade complete — database and certificates preserved.")
-        upgrade_status.update({'running': False, 'complete': True, 'error': False})
+        if mark_complete:
+            ulog("✓ Container upgrade complete — database and certificates preserved.")
+            upgrade_status.update({'running': False, 'complete': True, 'error': False})
+        else:
+            ulog("✓ Containers rebuilt — continuing.")
     except Exception as e:
         ulog(f"✗ Container upgrade failed: {str(e)[:200]}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+
+# ==========================================================================
+# v10.2.0 W9 — the two-server 5.8 migration
+# ==========================================================================
+# Until now the console refused this outright ("driving a two-server migration from
+# here is not supported in this release"), which was honest but left every split-box
+# customer with no path to a MANDATORY release. The work is the same as the
+# single-server migration, only the database half happens on Server One over SSH:
+# TAK's own upgrade-db.sh does the PostgreSQL 15->18 move, and we do what the
+# single-server path already learned to do around it — verify the backup can be read,
+# and never trust upgrade-db.sh's exit code (it prints "Database updated" and exits 0
+# with the schema unapplied; see _tak58_run_upgrade_db).
+
+def _tak58_s1_sql(s1, sql, db='postgres', timeout=120):
+    """One psql query on Server One as the postgres role. Returns stripped stdout or None.
+    `cd /tmp` first: postgres cannot read the SSH user's home and psql warns noisily."""
+    ok, out = _ssh_probe(
+        s1, 'cd /tmp && sudo -u postgres psql -tAX -d %s -c %s 2>/dev/null'
+            % (shlex.quote(db), shlex.quote(sql)), timeout=timeout)
+    if not ok:
+        return None
+    val = (out or '').strip().splitlines()
+    return val[-1].strip() if val else None
+
+
+def _tak58_s1_pg_major(s1):
+    """PostgreSQL major actually serving on Server One, or None."""
+    v = _tak58_s1_sql(s1, 'SHOW server_version_num;')
+    return int(v) // 10000 if v and v.isdigit() else None
+
+
+def _tak58_s1_schema_version(s1):
+    """Highest applied TAK schema version on Server One, or None if unreadable."""
+    v = _tak58_s1_sql(s1, 'select coalesce(max(version::int), 0) from schema_version '
+                          'where success', db='cot')
+    return int(v) if v and v.isdigit() else None
+
+
+def _tak58_s1_preflight(s1, say):
+    """Read-only readiness of Server One. Returns (ok, facts)."""
+    facts = {}
+    major = _tak58_s1_pg_major(s1)
+    facts['pg_major'] = major
+    if major is None:
+        say('✗ Could not read the PostgreSQL version on Server One — is it up and reachable?')
+        return False, facts
+    say('  Server One is running PostgreSQL %d.' % major)
+    if major >= TAK_PG_MAJOR:
+        facts['already'] = True
+        say('  Server One is already on PostgreSQL %d — the database half is done.' % major)
+        return True, facts
+    if major != 15:
+        say('✗ Server One runs PostgreSQL %d. TAK 5.8 migrates from 15 only.' % major)
+        return False, facts
+    # Disk, on the partition the data directory actually lives on. Same 1.5x rule as the
+    # single-server path: pg_upgrade runs in copy mode, so the old cluster survives — and
+    # that surviving cluster IS the rollback.
+    datadir = _tak58_s1_sql(s1, 'SHOW data_directory;')
+    facts['data_directory'] = datadir
+    if datadir:
+        ok, out = _ssh_probe(s1, 'sudo du -sb %s 2>/dev/null | cut -f1; df -B1 --output=avail %s '
+                                 '2>/dev/null | tail -1' % (shlex.quote(datadir),
+                                                            shlex.quote(datadir)), timeout=180)
+        nums = [int(t) for t in (out or '').split() if t.isdigit()]
+        if len(nums) >= 2:
+            used, avail = nums[0], nums[1]
+            need = int(used * _TAK58_MIN_DISK_RATIO)
+            facts.update({'data_bytes': used, 'avail_bytes': avail, 'need_bytes': need})
+            say('  Database %s, %s free on Server One (need %s).'
+                % (_cotdb_fmt_bytes(used), _cotdb_fmt_bytes(avail), _cotdb_fmt_bytes(need)))
+            if avail < need:
+                say('✗ Not enough disk on Server One for a rollback-safe migration: %s free, '
+                    '%s needed (1.5x the database). pg_upgrade copies, so the PostgreSQL 15 '
+                    'cluster survives — that is the only way back.'
+                    % (_cotdb_fmt_bytes(avail), _cotdb_fmt_bytes(need)))
+                return False, facts
+        else:
+            say('  ⚠ Could not measure disk on Server One — verify by hand before continuing.')
+    return True, facts
+
+
+def _tak58_s1_backup(s1, say):
+    """pg_dump the cot database ON Server One and prove the archive is readable.
+
+    Same reason as the single-server backup: `pg_dump` exiting 0 is not evidence. The
+    first W3 attempt produced an archive that could not be read back, and only
+    `pg_restore --list` caught it.
+    """
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    path = '/var/lib/postgresql/tak58-pre-migration-%s.dump' % stamp
+    say('  Backing up the cot database on Server One…')
+    ok, out = _ssh_probe(s1, 'sudo -u postgres pg_dump -Fc -d cot -f %s 2>&1; echo RC=$?'
+                             % shlex.quote(path), timeout=6 * 3600)
+    if 'RC=0' not in (out or ''):
+        say('✗ Backup failed on Server One: %s' % (out or '')[:300])
+        return None
+    ok, out = _ssh_probe(s1, 'sudo stat -c %%s %s 2>/dev/null; sudo -u postgres pg_restore '
+                             '--list %s >/dev/null 2>&1; echo LIST_RC=$?'
+                             % (shlex.quote(path), shlex.quote(path)), timeout=1800)
+    size = next((int(t) for t in (out or '').split() if t.isdigit()), 0)
+    if 'LIST_RC=0' not in (out or '') or size <= 0:
+        say('✗ The backup on Server One is not readable (%s) — refusing to migrate without a '
+            'restorable one.' % (out or '')[:200])
+        return None
+    say('  ✓ Backup verified readable on Server One: %s (%s)' % (path, _cotdb_fmt_bytes(size)))
+    return path
+
+
+def _tak58_s1_run_upgrade_db(s1, say, timeout=6 * 3600):
+    """Run TAK's own upgrade-db.sh on Server One. Returns its exit code (or None).
+
+    Mode 0544, so `sudo bash` rather than executing it directly — same packaging habit
+    that made the Server One repair look for a script it could not execute.
+    """
+    say('  Running TAK\'s upgrade-db.sh on Server One. On a large database this takes a '
+        'long time and prints nothing until it finishes.')
+    ok, out = _ssh_probe(s1, 'if [ -f %s ]; then cd /opt/tak/db-utils && sudo bash %s '
+                             '</dev/null 2>&1 | tail -25; echo RC=${PIPESTATUS[0]}; '
+                             'else echo NO_UPGRADE_DB_SH; fi'
+                             % (shlex.quote(_TAK58_UPGRADE_DB_SH), shlex.quote(_TAK58_UPGRADE_DB_SH)),
+                         timeout=timeout)
+    for line in (out or '').strip().splitlines()[-20:]:
+        if line.strip():
+            say('    ' + line.rstrip()[:180])
+    if 'NO_UPGRADE_DB_SH' in (out or ''):
+        say('✗ %s is not on Server One — is the 5.8 database package installed there?'
+            % _TAK58_UPGRADE_DB_SH)
+        return None
+    m = re.search(r'RC=(\d+)', out or '')
+    return int(m.group(1)) if m else None
+
+
+def _tak58_s1_carry_db_tls(s1, say):
+    """Carry infra-TAK's database TLS from the OLD cluster onto the freshly upgraded one.
+
+    WHY THIS EXISTS (measured on test8 / Server One 190.102.110.222, 2026-09-27).
+    `_enable_server_one_db_tls()` puts four managed lines marked `# infra-TAK-dbtls` into
+    Server One's postgresql.conf, keeps the cert/key INSIDE that cluster's data directory,
+    and adds a `hostssl` rule to pg_hba.conf. `pg_upgradecluster` builds the new cluster with
+    NONE of it: measured afterwards, the PG18 conf had zero ssl lines, zero hostssl lines, and
+    `sslmode=require` was refused outright. CoreConfig demands sslEnabled="true"
+    sslMode="verify-full", so TAK could not connect at all — 37 database errors, zero pool
+    connections, while the migration happily reported success off an open port.
+
+    This is not an edge case: `_server_one_tls_step()` runs in the deploy tail for BOTH the
+    Debian and RHEL Server One paths, and `_migrate_split_db_tls()` retrofits existing
+    splits, so every two-server customer has this TLS.
+
+    Everything is derived from PostgreSQL itself (`SHOW config_file` / `hba_file` /
+    `data_directory`) rather than assuming a Debian layout, so a RHEL Server One works too.
+    Returns True when TLS is on afterwards, False when it could not be restored.
+    """
+    say('')
+    say('  Restoring the database TLS configuration on the new cluster…')
+    # The heredoc runs on Server One. Note the newline guard before appending to pg_hba:
+    # PG15's file had no trailing newline, and a naive append fused two rules into
+    # "md5hostssl", which made PostgreSQL refuse to start (agent error, same day).
+    script = r'''
+set -u
+OLDCONF=$(grep -l '# infra-TAK-dbtls' /etc/postgresql/*/main/postgresql.conf \
+                                      /var/lib/pgsql/*/data/postgresql.conf 2>/dev/null | head -1)
+if [ -z "$OLDCONF" ]; then echo "TLSCARRY: no infra-TAK-dbtls block anywhere — nothing to carry"; exit 0; fi
+OLDCRT=$(grep -E "^ssl_cert_file.*# infra-TAK-dbtls" "$OLDCONF" | sed -E "s/.*=\s*'([^']+)'.*/\1/")
+OLDKEY=$(grep -E "^ssl_key_file.*# infra-TAK-dbtls"  "$OLDCONF" | sed -E "s/.*=\s*'([^']+)'.*/\1/")
+OLDHBA=$(dirname "$OLDCONF")/pg_hba.conf
+NEWCONF=$(sudo -u postgres psql -tAX -c 'SHOW config_file' 2>/dev/null | tail -1)
+NEWHBA=$(sudo -u postgres psql -tAX -c 'SHOW hba_file' 2>/dev/null | tail -1)
+NEWDATA=$(sudo -u postgres psql -tAX -c 'SHOW data_directory' 2>/dev/null | tail -1)
+[ -n "$NEWCONF" ] && [ -n "$NEWDATA" ] || { echo "TLSCARRY-FAIL: could not ask the new cluster where its config lives"; exit 1; }
+[ "$NEWCONF" = "$OLDCONF" ] && { echo "TLSCARRY: new cluster already carries the block"; exit 0; }
+[ -f "$OLDCRT" ] && [ -f "$OLDKEY" ] || { echo "TLSCARRY-FAIL: cert/key missing at $OLDCRT / $OLDKEY"; exit 1; }
+sudo install -o postgres -g postgres -m 644 "$OLDCRT" "$NEWDATA/$(basename "$OLDCRT")"
+sudo install -o postgres -g postgres -m 600 "$OLDKEY" "$NEWDATA/$(basename "$OLDKEY")"
+sudo test -s "$NEWDATA/$(basename "$OLDCRT")" && sudo test -s "$NEWDATA/$(basename "$OLDKEY")" \
+  || { echo "TLSCARRY-FAIL: could not copy the cert/key into $NEWDATA"; exit 1; }
+# Keep a copy of both files we are about to edit. A conf that PostgreSQL refuses would leave a
+# customer's database server DOWN, so this path rolls itself back rather than hoping.
+sudo cp -p "$NEWCONF" "$NEWCONF.infratak-pre-tlscarry"
+[ -n "$NEWHBA" ] && sudo cp -p "$NEWHBA" "$NEWHBA.infratak-pre-tlscarry"
+sudo sed -i '/# infra-TAK-dbtls$/d' "$NEWCONF"
+printf "ssl = on # infra-TAK-dbtls\nssl_cert_file = '%s/%s' # infra-TAK-dbtls\nssl_key_file = '%s/%s' # infra-TAK-dbtls\npassword_encryption = scram-sha-256 # infra-TAK-dbtls\n" \
+  "$NEWDATA" "$(basename "$OLDCRT")" "$NEWDATA" "$(basename "$OLDKEY")" | sudo tee -a "$NEWCONF" >/dev/null
+if ! sudo grep -qE '^hostssl' "$NEWHBA" 2>/dev/null; then
+  # guarantee a trailing newline before appending, then carry the rules over
+  sudo sed -i -e '$a\' "$NEWHBA"
+  sudo grep -E '^hostssl' "$OLDHBA" 2>/dev/null | sudo tee -a "$NEWHBA" >/dev/null
+fi
+PGMAJ=$(sudo -u postgres psql -tAX -c 'SHOW server_version' 2>/dev/null | tail -1 | cut -d. -f1)
+sudo pg_ctlcluster "$PGMAJ" main restart 2>/dev/null \
+  || sudo systemctl restart "postgresql-$PGMAJ" 2>/dev/null \
+  || sudo systemctl restart postgresql 2>/dev/null
+sleep 5
+SSLNOW=$(sudo -u postgres psql -tAX -c "select current_setting('ssl')" 2>/dev/null | tail -1)
+if [ -z "$SSLNOW" ]; then
+  # the cluster did not come back: put both files back and restart, then say so plainly
+  sudo cp -p "$NEWCONF.infratak-pre-tlscarry" "$NEWCONF" 2>/dev/null
+  [ -n "$NEWHBA" ] && sudo cp -p "$NEWHBA.infratak-pre-tlscarry" "$NEWHBA" 2>/dev/null
+  sudo pg_ctlcluster "$PGMAJ" main restart 2>/dev/null \
+    || sudo systemctl restart "postgresql-$PGMAJ" 2>/dev/null \
+    || sudo systemctl restart postgresql 2>/dev/null
+  sleep 5
+  BACK=$(sudo -u postgres psql -tAX -c 'select 1' 2>/dev/null | tail -1)
+  echo "TLSCARRY-FAIL: the new cluster would not start with the TLS configuration; rolled it back (cluster reachable again: ${BACK:-NO})"
+  exit 1
+fi
+echo "TLSCARRY-SSL=$SSLNOW"
+'''
+    ok, out = _ssh_probe(s1, script, timeout=300)
+    for line in (out or '').strip().splitlines():
+        if line.strip().startswith('TLSCARRY'):
+            say('    ' + line.strip()[:170])
+    if 'TLSCARRY-SSL=on' in (out or ''):
+        say('  ✓ Database TLS restored on the new cluster.')
+        return True
+    if 'nothing to carry' in (out or ''):
+        say('  This deployment does not use infra-TAK database TLS — nothing to carry.')
+        return True
+    say('  ✗ Could not restore the database TLS on the new cluster. TAK Server requires it '
+        '(CoreConfig uses sslMode="verify-full"), so it will NOT be able to connect.')
+    return False
+
+
+def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg,
+                                          log=None, status=None):
+    """TAK 5.8 + PostgreSQL 18 on a split-box pair. Core here, database on Server One.
+
+    Order follows TAK's guide and the single-server migration: back up first and PROVE
+    the backup is readable, upgrade the core, upgrade the database package on Server
+    One, let TAK's own upgrade-db.sh do the 15->18 move there, then verify by asking
+    the database rather than trusting an exit code.
+
+    The rollback is the PostgreSQL 15 cluster, which pg_upgrade leaves behind in copy
+    mode — plus the verified dump. Neither is deleted.
+    """
+    _log = upgrade_log if log is None else log
+    _status = upgrade_status if status is None else status
+    s1_host = (s1_cfg.get('host') or '').strip()
+
+    def say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry); print(entry, flush=True)
+
+    def fail(msg, note=None):
+        say(f'✗ {msg}')
+        if note:
+            say('')
+            say(note)
+        _status.update({'running': False, 'complete': False, 'error': True})
+
+    t_all = time.time()
+    try:
+        say('=' * 50)
+        say('TAK Server 5.8 — two-server migration')
+        say(f'  Core (this host): {os.path.basename(core_pkg_path)}')
+        say(f'  Server One ({s1_host}): {os.path.basename(db_pkg_path)}')
+        say('=' * 50)
+
+        say('')
+        say('Checking Server One is ready…')
+        ok, facts = _tak58_s1_preflight(s1_cfg, say)
+        if not ok:
+            return fail('Server One is not ready to migrate. Nothing has been changed.')
+        rows_before = _tak58_s1_sql(s1_cfg, 'select count(*) from cot_router', db='cot')
+        if rows_before and rows_before.isdigit():
+            say(f'  cot_router holds {int(rows_before):,} rows before the migration.')
+
+        backup = None
+        if not facts.get('already'):
+            say('')
+            say('Backing up before anything is changed…')
+            backup = _tak58_s1_backup(s1_cfg, say)
+            if not backup:
+                return fail('Refusing to migrate without a restorable backup.')
+
+        say('')
+        say('Stopping TAK Server on the core…')
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True,
+                       timeout=300)
+        t_down = time.time()
+
+        say('')
+        say('Upgrading the core to 5.8…')
+        # argv, not a shell string. `sh` is on the broker's DENY list, so
+        # _sudo_wrap(['sh', '-c', …]) is refused the moment broker enforcement is
+        # switched on — it only works today because the broker runs permissive and
+        # executes what it would otherwise deny. That makes this line a latent break
+        # on every non-root split-box, timed to the enforcement rollout rather than to
+        # anything an operator does. The other two 5.8 `sh` call sites already branch
+        # to their dedicated broker ops (tak58_upgrade_db / tak58_setup_db) and fall
+        # back to `sh` only when running as root; this one never got the same
+        # treatment. dnf/apt-get are both allow-listed with `install` gated, so the
+        # shell buys nothing here. DEBIAN_FRONTEND goes in the environment, where the
+        # broker can carry it, instead of an inline assignment only a shell can parse.
+        if _distro_family() == 'rhel':
+            _inst_argv = ['dnf', '-y', 'install', core_pkg_path]
+            _inst_env = None
+        else:
+            _inst_argv = ['apt-get', 'install', '-y', '--allow-downgrades', core_pkg_path]
+            _inst_env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+        r = subprocess.run(_sudo_wrap(_inst_argv), capture_output=True, text=True,
+                           timeout=1800, env=_inst_env)
+        for line in ((r.stdout or '') + (r.stderr or '')).strip().splitlines()[-8:]:
+            say('    ' + line[:170])
+        # Ask the package manager what is actually installed, on either family.
+        _q = ("rpm -q --qf '%{VERSION}' takserver-core 2>/dev/null"
+              if _distro_family() == 'rhel' else
+              "dpkg-query -W -f '${Version}' takserver-core 2>/dev/null")
+        _iv = (subprocess.run(_q, shell=True, capture_output=True, text=True,
+                              timeout=30).stdout or '').strip()
+        if not _iv.startswith('5.8'):
+            return fail(f'The core package did not install (reports {_iv or "nothing"}) — TAK '
+                        f'Server is stopped and the database has not been touched.',
+                        f'Server One is untouched and your backup is at {backup}.'
+                        if backup else 'Server One is untouched.')
+        say('  ✓ Core upgraded.')
+
+        if facts.get('already'):
+            say('')
+            say('Server One is already on PostgreSQL %d — skipping the database migration.'
+                % TAK_PG_MAJOR)
+        else:
+            say('')
+            say(f'Upgrading the database package on Server One ({s1_host})…')
+            ok, out = _scp_to_host(s1_cfg, db_pkg_path, '/tmp/', timeout=1800)
+            if not ok:
+                return fail('Could not copy the database package to Server One: '
+                            + (out or '')[:200],
+                            f'Nothing on Server One has changed. Backup: {backup}')
+            db_name = os.path.basename(db_pkg_path)
+            if db_name.endswith('.rpm'):
+                inst = f'cd /tmp && sudo dnf -y install ./{shlex.quote(db_name)} 2>&1'
+            else:
+                inst = (f'cd /tmp && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y '
+                        f'--allow-downgrades ./{shlex.quote(db_name)} 2>&1')
+            ok, out = _ssh_probe(s1_cfg, inst + '; echo RC=$?', timeout=1800)
+            for line in (out or '').strip().splitlines()[-10:]:
+                if line.strip():
+                    say('    ' + line.rstrip()[:170])
+            # The package is EXPECTED to stop short and tell you to run upgrade-db.sh
+            # ("A pg15 install has been detected"), so its exit code is not the verdict.
+            say('')
+            say('Migrating PostgreSQL 15 → %d on Server One…' % TAK_PG_MAJOR)
+            rc = _tak58_s1_run_upgrade_db(s1_cfg, say)
+            if rc is None:
+                return fail('The database migration could not be started on Server One.',
+                            f'The PostgreSQL 15 cluster is untouched and your backup is at '
+                            f'{backup}.')
+
+            # upgrade-db.sh exits 0 and prints "Database updated with SchemaManager.jar" even
+            # when SchemaManager failed. Ask the database instead.
+            major_after = _tak58_s1_pg_major(s1_cfg)
+            sv = _tak58_s1_schema_version(s1_cfg)
+            say(f'  Server One now reports PostgreSQL {major_after}, schema_version {sv}.')
+            if major_after != TAK_PG_MAJOR or sv is None or sv < _TAK58_MIN_SCHEMA_VERSION:
+                return fail(
+                    f'Server One did not finish the migration (PostgreSQL {major_after}, '
+                    f'schema_version {sv}). upgrade-db.sh exits 0 even when its schema step '
+                    f'fails, which is why this is checked rather than assumed.',
+                    f'The PostgreSQL 15 cluster is still on Server One and is your rollback; '
+                    f'the verified dump is at {backup}. TAK Server here is stopped and on 5.8 '
+                    f'— do not put it into service until Server One is fixed.')
+            rows_after = _tak58_s1_sql(s1_cfg, 'select count(*) from cot_router', db='cot')
+            if rows_before and rows_after and rows_before.isdigit() and rows_after.isdigit():
+                say(f'  Rows: {int(rows_before):,} before, {int(rows_after):,} after.')
+                if int(rows_after) < int(rows_before):
+                    return fail(
+                        f'Server One lost rows in the migration: {int(rows_after):,} of '
+                        f'{int(rows_before):,}.',
+                        f'The PostgreSQL 15 cluster survives on Server One and the dump is at '
+                        f'{backup}. Do NOT put this server into service.')
+
+        # The upgraded cluster is bare: pg_upgradecluster does not carry our TLS block, and
+        # TAK's CoreConfig demands verify-full. Do this BEFORE starting TAK, or TAK comes up
+        # unable to reach its own database.
+        _tls_ok = _tak58_s1_carry_db_tls(s1_cfg, say)
+
+        say('')
+        say('Starting TAK Server on the migrated database…')
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True,
+                       timeout=300)
+        # An open port is NOT proof of life. On 2026-09-27 this loop passed on 8089 while TAK
+        # held ZERO database connections and logged 37 straight connection failures, and the
+        # migration printed "TAK Server is serving again". The same blind spot is why the
+        # 2026-09-04 split-box cell passed: every acceptance check was database-side, so none
+        # of them noticed TAK could not reach the database. Require BOTH: the listener, and
+        # TAK actually connected — asked of the database, not of TAK.
+        # Stray psql sessions are excluded by application_name: a remote psql also has a
+        # non-null client_addr, so counting one would let the gate green itself. TAK's pool
+        # reports application_name='PostgreSQL JDBC Driver' (measured on test8 2026-09-27).
+        up = False
+        connected = False
+        for waited in range(0, 900, 15):
+            time.sleep(15)
+            if not up:
+                _lp = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True,
+                                     capture_output=True, text=True, timeout=10)
+                up = ':8089' in (_lp.stdout or '')
+            if up:
+                _c = _tak58_s1_sql(
+                    s1_cfg,
+                    "select count(*) from pg_stat_activity where datname='cot' "
+                    "and client_addr is not null "
+                    "and coalesce(application_name,'') not like 'psql%' "
+                    "and coalesce(application_name,'') not like 'pg_dump%'", db='cot')
+                if _c and _c.strip().isdigit() and int(_c.strip()) > 0:
+                    connected = True
+                    break
+            if waited and waited % 120 == 0:
+                say(f'  ⏳ {waited // 60} min …'
+                    + ('' if not up else ' (listening; waiting for it to reach the database)'))
+        if not up:
+            return fail('TAK Server did not start listening on 8089 within 15 minutes.',
+                        'The database migrated and was verified; this is the core. Check '
+                        '`journalctl -u takserver` and /opt/tak/logs/.')
+        if not connected:
+            return fail(
+                'TAK Server is listening on 8089 but has NOT connected to the database on '
+                'Server One within 15 minutes. An open port is not a working server.',
+                ('The database itself migrated and was verified, so your data is intact and '
+                 'the PostgreSQL 15 cluster plus the dump at %s remain your rollback. The '
+                 'usual cause is the database TLS: TAK uses sslMode="verify-full" and the '
+                 'upgraded cluster must present the infra-TAK certificate. Check '
+                 '/opt/tak/logs/takserver-api.log for "does not support SSL".' % backup)
+                + ('' if _tls_ok else ' NOTE: restoring that TLS configuration already failed '
+                                      'above — that is almost certainly the cause.'))
+        _enc = _tak58_s1_sql(
+            s1_cfg,
+            "select count(*) filter (where s.ssl) from pg_stat_activity a "
+            "left join pg_stat_ssl s on s.pid=a.pid "
+            "where a.datname='cot' and a.client_addr is not null "
+            "and coalesce(a.application_name,'') not like 'psql%'", db='cot')
+        say(f'  ✓ TAK Server is serving again and connected to the database'
+            + (f' ({_enc.strip()} encrypted connection(s))' if _enc and _enc.strip().isdigit()
+               else '')
+            + f'. {int(time.time() - t_down)} s of downtime, '
+              f'{int(time.time() - t_all)} s end to end.')
+        say('')
+        say('Migration complete. On Server One the PostgreSQL 15 cluster is still on disk and '
+            'is your rollback until you remove it.')
+        if backup:
+            say(f'Backup kept on Server One at {backup}')
+        _status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail(f'Unexpected error: {str(e)[:400]}')
 
 
 def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg):
@@ -68910,7 +71993,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         for line in (install_out or '').strip().split('\n')[-12:]:
             if line.strip(): upgrade_log.append("  " + line)
         # dnf can exit non-zero on a re-install though the pkg is fine — verify PG + cot on Server One.
-        verify_cmd = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; '
+        verify_cmd = (_PG_REMOTE_PGSVC_SH + ' '
                       'sudo -u postgres psql -lqt 2>/dev/null | grep -qw cot && systemctl is-active "$PGSVC" >/dev/null 2>&1 && echo PG_OK')
         vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=15)
         if 'PG_OK' in (vout or ''):
@@ -69280,7 +72363,7 @@ def deploy_takserver():
         if not (_edb_cfg.get('host') or '').strip():
             return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
         if not (_edb_cfg.get('password') or '').strip():
-            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database with all 5 Azure extensions whitelisted, then Test Connection (step 3), before deploying.'}), 400
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, set the azure.extensions server parameter first — the TAK Server page shows the exact value), then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -69825,6 +72908,48 @@ def _tak_container_running(name):
 
 
 @_with_authentik_deploy_guard
+def _tak_bundle_repair_exec_bits(root, log=None):
+    """Make every .sh under an unpacked TAK docker bundle executable.
+
+    UPSTREAM PACKAGING BUG (5.8 hardened, verified 2026-09-03): several db-utils
+    scripts are recorded in the zip WITHOUT the execute bit, while their siblings
+    in the same directory have it:
+
+      -rw-rw-rw-  db-utils/configureInDocker.sh     <- the DB container's ENTRYPOINT
+      -rw-rw-rw-  db-utils/upgrade-db.sh
+      -rw-rw-rw-  db-utils/takserver-setup-db.sh
+      -rwxrwxrwx  db-utils/start.sh, configure.sh, restore-data.sh, ...
+
+    Docker execs the entrypoint directly, so the database container cannot start
+    at all: `OCI runtime create failed: exec: ".../configureInDocker.sh":
+    permission denied` (exit 126). This is not our extraction losing modes — the
+    zipfile loops faithfully restore external_attr, and the zip genuinely records
+    0666. It affects anyone deploying this bundle, not just us.
+
+    Repair it rather than special-casing filenames: every .sh in a TAK bundle is
+    meant to be runnable, and chmod +x on an already-executable file is a no-op.
+    Shared by the fresh container deploy and the container upgrade — the upgrade
+    unpacks the same bundle and would otherwise hit the same exit 126.
+    """
+    fixed = 0
+    for _root, _dirs, _files in os.walk(root):
+        for _f in _files:
+            if not _f.endswith('.sh'):
+                continue
+            _fp = os.path.join(_root, _f)
+            try:
+                _m = os.stat(_fp).st_mode
+                if not (_m & 0o111):
+                    os.chmod(_fp, _m | 0o755 & 0o7777)
+                    fixed += 1
+            except OSError:
+                pass
+    if fixed and log:
+        log(f"  repaired {fixed} bundle script(s) shipped without the execute bit "
+            f"(upstream packaging issue — the DB container entrypoint is one of them)")
+    return fixed
+
+
 def _deploy_takserver_container(config):
     """v10.0.1 — Deploy TAK Server as Docker containers from the official
     takserver-docker-*.zip. Used on arm64 (forced — no native arm TAK package)
@@ -69884,20 +73009,24 @@ def _deploy_takserver_container(config):
         except Exception as _ze:
             log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
             deploy_status.update({'error': True, 'running': False}); return
+        _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, log_step)
+        # Ownership is fixed AFTER the images exist (see the cert step) - it is done
+        # from inside a root container, which cannot run before the image is built.
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
-            # Only consider dirs that are an actual bundle (have docker/Dockerfile.takserver),
+            # Only consider dirs that are an actual bundle (_tak_is_bundle_dir: either naming),
             # and pick the NEWEST (the one just extracted) so a leftover dir from a prior
             # version can never shadow the upload even if cleanup somehow left one behind.
             entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
                        if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                       and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))]
+                       and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))]
             entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
             build_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0]) if entries else TAK_DOCKER_ROOT
         except Exception:
             build_ctx = TAK_DOCKER_ROOT
         tak_dir = os.path.join(build_ctx, 'tak')
-        if not os.path.isfile(os.path.join(build_ctx, 'docker', 'Dockerfile.takserver')):
+        _app_df, _db_df = _tak_bundle_dockerfiles(build_ctx)
+        if not _app_df:
             log_step(f"✗ Dockerfile.takserver not found under {build_ctx}/docker — is this an official takserver-docker zip?")
             deploy_status.update({'error': True, 'running': False}); return
         log_step(f"  Build context: {build_ctx}")
@@ -69909,11 +73038,12 @@ def _deploy_takserver_container(config):
 
         # ── Step 3/9: Build images (multi-arch base → native arm64 build) ───
         log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
-        log_step("  (first build pulls postgres:15.1 + eclipse-temurin:17-jammy — minutes on arm64)")
+        log_step("  (first build pulls the bundle's base images — minutes on arm64)")
+        log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1', "Building takserver_db image..."):
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1', "Building takserver image..."):
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
             log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Images built")
 
@@ -69948,7 +73078,7 @@ def _deploy_takserver_container(config):
         # keeps the old/empty-password role and auth fails.
         run_cmd(f'docker volume rm {TAK_DB_VOLUME} >/dev/null 2>&1; docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
         run_cmd(
-            f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+            f'docker run {_tak_db_volume_mount(build_ctx)} '
             f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
             f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db',
             "Starting database container...")
@@ -70025,6 +73155,11 @@ def _deploy_takserver_container(config):
                         lines[i] = f'{indent}{var}="{safe}"\n'
                         break
             _write_priv(cm_path, ''.join(lines))
+            # The hardened 5.8 image runs as tak:0 (uid 1001), not root, so a 0600
+            # file owned by the console user is unreadable inside the container and
+            # cert generation fails with a misleading config.cfg error. See
+            # _container_readable().
+            _container_readable(cm_path, log_step)
         except Exception as _e:
             log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
@@ -70051,6 +73186,13 @@ def _deploy_takserver_container(config):
                 deploy_status.update({'running': False, 'error': True})
                 return False
             return True
+        # LAST thing before the cert scripts run. It has to be here, not earlier:
+        # _write_priv() rewrites cert-metadata.sh a few lines above and resets it to
+        # 0600 uid 1000, so an ownership fix applied before that write is undone by it.
+        # The scripts run as the image's non-root user and read that file for $DIR and
+        # $CAPASS, so if it is unreadable they fail with a misleading missing-config.cfg.
+        if _tak_is_container():
+            _container_own_tree(os.path.realpath('/opt/tak'), log_step)
         log_step(f"Creating Root CA: {root_ca}...")
         if not _certrun(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh', f"Root CA {root_ca}"):
             return
@@ -70542,8 +73684,46 @@ def run_takserver_deploy(config):
                 log_step("  /opt/tak missing after install — forcing reinstall from .deb...")
                 run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y --allow-downgrades {pkg} 2>&1', check=False)
                 run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
-            if not os.path.exists('/opt/tak'):
-                log_step("✗ FATAL: /opt/tak not found after install (even after forced reinstall) — run `dpkg --purge --force-all takserver && rm -rf /opt/tak` on the host and retry")
+            # Verify the PACKAGE installed, not merely that /opt/tak exists.
+            #
+            # An empty root-owned /opt/tak satisfies os.path.exists() and is exactly
+            # what a FAILED unpack leaves behind, so this guard passed over a dpkg
+            # error and the deploy went on to print "✓ TAK Server installed", then
+            # "✓ All certificates created" against a directory with no certs in it.
+            # Measured on dev-4 2026-09-21. A customer would have read a fully green
+            # deploy off a server that had never installed.
+            _pkg_state = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True).stdout.strip()
+            _tak_installed = ('install ok installed' in _pkg_state
+                              and os.path.exists('/opt/tak/CoreConfig.example.xml'))
+            if not _tak_installed:
+                # Name the cause when we can. Converting a split-box (two-server) box
+                # back to single-server leaves takserver-core / takserver-database
+                # registered, and the combined package then cannot unpack:
+                #   trying to overwrite '/opt/tak/TAKServer.bat', which is also in
+                #   package takserver-core 5.8-RELEASE75
+                # Purging `takserver` alone does not clear that — which is precisely
+                # the wrong thing the old FATAL message told the operator to do.
+                _conflicts = []
+                for _p in ('takserver-core', 'takserver-database'):
+                    _st = subprocess.run(
+                        "dpkg-query -W -f='${Status} ${Version}' " + _p + " 2>/dev/null",
+                        shell=True, capture_output=True, text=True).stdout.strip()
+                    if 'install ok installed' in _st:
+                        _conflicts.append(f'{_p} {_st.split()[-1]}')
+                if _conflicts:
+                    log_step("✗ FATAL: TAK Server did not install — %s still registered, and the "
+                             "combined package cannot overwrite files owned by it. This box was "
+                             "previously a two-server (split) install. Remove the split packages "
+                             "first: `sudo dpkg --purge --force-all %s` then retry."
+                             % (' and '.join(_conflicts),
+                                ' '.join(c.split()[0] for c in _conflicts)))
+                else:
+                    log_step("✗ FATAL: TAK Server did not install (dpkg state: %r, /opt/tak "
+                             "contents missing). Check the apt/dpkg output above — run "
+                             "`sudo dpkg --purge --force-all takserver && sudo rm -rf /opt/tak` "
+                             "and retry." % (_pkg_state or 'not registered'))
                 deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
 
@@ -70555,6 +73735,23 @@ def run_takserver_deploy(config):
             _edb_port_early = int(_edb_early.get('port') or 5432)
             _edb_pass_early = (_edb_early.get('password') or '').strip()
             _edb_user_early = (_edb_early.get('username') or 'martiuser').strip()
+            # TAK's .deb/.rpm ships CoreConfig.example.xml only — CoreConfig.xml does not
+            # exist until takserver first starts and writes one. So guarding this pre-patch
+            # on CoreConfig.xml existing meant it NEVER ran on a fresh external_db install:
+            # TAK started, wrote a CoreConfig pointing at 127.0.0.1, and from then on owned
+            # the file (measured on Azure 2026-09-19). Seed it from the example now so the
+            # very first start already targets the managed database.
+            if _edb_host_early and not os.path.exists('/opt/tak/CoreConfig.xml') \
+                    and os.path.exists('/opt/tak/CoreConfig.example.xml'):
+                try:
+                    _seed = subprocess.run(['cat', '/opt/tak/CoreConfig.example.xml'],
+                                           capture_output=True, text=True, timeout=5).stdout or ''
+                    if _seed.strip():
+                        _write_priv('/opt/tak/CoreConfig.xml', _seed)
+                        log_step("External DB: seeded CoreConfig.xml from CoreConfig.example.xml "
+                                 "(TAK has not written one yet)")
+                except Exception as _e:
+                    log_step(f"⚠ Could not seed CoreConfig.xml from the example: {_e}")
             if _edb_host_early and os.path.exists('/opt/tak/CoreConfig.xml'):
                 log_step(f"External DB: pre-patching CoreConfig JDBC → {_edb_host_early}:{_edb_port_early} (before first start)...")
                 try:
@@ -70673,16 +73870,38 @@ def run_takserver_deploy(config):
             except Exception as e:
                 log_step(f"  ✗ {e}")
                 return False
-        _tak_cert(['/opt/tak/certs/makeRootCa.sh'], inp=f'{root_ca}\n', desc=f"Creating Root CA: {root_ca}...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'ca', int_ca], inp='y\n', desc=f"Creating Intermediate CA: {int_ca}...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], desc="Creating server certificate...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'admin'], desc="Creating admin certificate...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'user'], desc="Creating user certificate...")
+        # Every one of these returned a bool that every caller threw away, and the
+        # "✓ All certificates created" below printed unconditionally. Measured on
+        # dev-4 2026-09-21: with /opt/tak/certs absent, each step logged
+        # "✗ [Errno 2] No such file or directory: '/opt/tak/certs'" and the deploy
+        # still reported all certificates created AND the truststore imported. A
+        # TAK Server with no certificates cannot serve a single client, so this is
+        # not a warning — it ends the deploy.
+        _cert_steps = [
+            ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
+            ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
+            ("server cert", ['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], None, "Creating server certificate..."),
+            ("admin cert", ['/opt/tak/certs/makeCert.sh', 'client', 'admin'], None, "Creating admin certificate..."),
+            ("user cert", ['/opt/tak/certs/makeCert.sh', 'client', 'user'], None, "Creating user certificate..."),
+        ]
+        _cert_failed = [name for name, argv, inp, desc in _cert_steps
+                        if not _tak_cert(argv, inp=inp, desc=desc)]
+        if _cert_failed:
+            log_step("✗ FATAL: certificate generation failed (%s). TAK Server cannot serve any "
+                     "client without these, so the deploy stops here rather than reporting "
+                     "success over a server nothing can connect to. See the errors above."
+                     % ', '.join(_cert_failed))
+            run_cmd('systemctl stop takserver', check=False)
+            deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
         log_step("Importing root CA into TAK clients truststore...")
-        _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
-                   '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
-                   '-storepass', cert_pass, '-noprompt'])
+        if not _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
+                          '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
+                          '-storepass', cert_pass, '-noprompt']):
+            log_step("✗ FATAL: could not import the root CA into the clients truststore — enrolled "
+                     "clients would not trust this server. See the errors above.")
+            run_cmd('systemctl stop takserver', check=False)
+            deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
@@ -70858,6 +74077,43 @@ def run_takserver_deploy(config):
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
 
+        # For external_db: re-assert the JDBC target now that TAK is STOPPED.
+        #
+        # The patch above runs while takserver is still up, and TAK Server rewrites
+        # CoreConfig.xml from its own in-memory config as it shuts down — it also drops
+        # its own CoreConfig.xml.backup beside it. Measured on Azure 2026-09-19: our edit
+        # landed at 00:15:28, `systemctl stop takserver` ran at 00:15:32, and at 00:15:34
+        # TAK wrote the file back with jdbc:postgresql://127.0.0.1:5432/cot. Everything
+        # downstream — SchemaManager, and then the server itself — then used the LOCAL
+        # cluster that TAK's own .deb had installed and populated, while the managed
+        # database sat empty and the deploy reported COMPLETE.
+        #
+        # A config edit that races the process which owns the file is not an edit. Re-apply
+        # it here, with nothing running to overwrite it.
+        if config.get('external_db') and config.get('tak_deploy_cfg'):
+            _edb_late = config['tak_deploy_cfg'].get('external_db', {})
+            _h_late = (_edb_late.get('host') or '').strip()
+            _p_late = int(_edb_late.get('port') or 5432)
+            _pw_late = (_edb_late.get('password') or '').strip()
+            if _h_late:
+                try:
+                    _cc_late = subprocess.run(['cat', '/opt/tak/CoreConfig.xml'],
+                                              capture_output=True, text=True, timeout=5).stdout or ''
+                    if _cc_late and f'//{_h_late}:{_p_late}/' not in _cc_late:
+                        log_step(f"External DB: CoreConfig was rewritten by TAK on shutdown — "
+                                 f"re-pointing JDBC at {_h_late}:{_p_late} with the server stopped...")
+                        _cc_late = re.sub(r'jdbc:postgresql://[^"]*',
+                                          f'jdbc:postgresql://{_h_late}:{_p_late}/cot', _cc_late)
+                        if _pw_late:
+                            _pw_late_xml = html.escape(_pw_late, quote=True)
+                            _cc_late = re.sub(r'(<connection[^>]*password=")[^"]*(")',
+                                              lambda m: m.group(1) + _pw_late_xml + m.group(2), _cc_late)
+                        _cc_late = _coreconfig_db_tls_converge(_cc_late)
+                        _write_priv('/opt/tak/CoreConfig.xml', _cc_late)
+                        log_step(f"✓ JDBC re-asserted → {_h_late}:{_p_late}")
+                except Exception as _e:
+                    log_step(f"⚠ Could not re-assert the JDBC target: {_e}")
+
         # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
         # points at the correct host. SchemaManager has no CLI JDBC flags — it reads
         # CoreConfig.xml from the working directory. Run from /opt/tak so it finds the
@@ -70872,10 +74128,63 @@ def run_takserver_deploy(config):
             for line in sm_out.strip().split('\n')[:30]:
                 if line.strip():
                     deploy_log.append(f"  {line.rstrip()}")
-            if sm_r.returncode == 0 or 'SchemaManager complete' in sm_out or 'already up to date' in sm_out.lower():
-                log_step("✓ SchemaManager upgrade complete (RDS schema ready)")
+            # Do not trust the exit code, and do not settle for a warning. Measured on a
+            # fresh RDS PostgreSQL 18 instance 2026-09-04: SchemaManager exited 2 with
+            # "function addgeometrycolumn(...) does not exist" (PostGIS was never created
+            # in the target database), the deploy logged this as a WARNING, went on to
+            # report "DEPLOYMENT COMPLETE", and left TAK 5.8 running against a database
+            # whose schema_version was 0. Ask the database what version it reached.
+            # NB `config['external_db']` on this path is a BOOLEAN flag, not the
+            # connection block — reading it as a dict raised
+            # "'bool' object has no attribute 'get'" and turned the deploy's own
+            # verification step into a FATAL ERROR (dev5, 2026-09-04). The connection
+            # details live in the saved deployment config.
+            try:
+                _edb_conn = (_get_tak_deployment_config(load_settings())
+                             or {}).get('external_db') or {}
+            except Exception:
+                _edb_conn = {}
+            _edb_sv = _tak58_external_schema_version(_edb_conn)
+            # The floor depends on WHICH TAK is being installed, not on the release
+            # this code shipped in. _TAK58_MIN_SCHEMA_VERSION is 100 because V100 is
+            # where 5.8 adds flow_tags/username — but 5.7's schema TOPS OUT AT 99, so
+            # holding every deploy to 100 failed a 5.7 install whose SchemaManager had
+            # just reported "Successfully applied 94 update(s)" and left the managed
+            # database correctly at 99 (az-test-rds, 2026-09-19). A version-specific
+            # ceiling is not a defect to fail on.
+            _pkg_ver = _tak_artifact_version(config.get('package_path') or '')
+            _min_sv = _TAK58_MIN_SCHEMA_VERSION if (_pkg_ver and _pkg_ver >= TAK_GATE_BLOCK_FROM) else 1
+            if _edb_sv is not None and _edb_sv >= _min_sv:
+                log_step(f"✓ SchemaManager complete — managed database at schema_version {_edb_sv}"
+                         + (f" (>= {_min_sv} required for TAK {_pkg_ver[0]}.{_pkg_ver[1]})" if _pkg_ver else ""))
+            elif sm_r.returncode == 0 and _edb_sv is None:
+                # Ran clean but we could not read it back (no psql client, say). Say so
+                # rather than claiming either outcome.
+                # log_step auto-captures anything carrying the warning marker, so no
+                # explicit append here (that would list it twice in the summary).
+                log_step("⚠ SchemaManager reported success but the schema version could not be "
+                         "read back from the managed database — verify it by hand before "
+                         "putting this server into service.")
             else:
-                log_step(f"⚠ SchemaManager exited {sm_r.returncode} — check logs above. TAK Server may still start if schema was partially applied.")
+                log_step(f"✗ FATAL: SchemaManager did not build the schema (exit {sm_r.returncode}, "
+                         f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}, "
+                         f"needed >= {_min_sv}). "
+                         f"The managed database is not usable, so this deploy is NOT complete. "
+                         f"The most common cause is PostGIS missing from the database: re-run "
+                         f"Provision Database, which creates it. On Azure the azure.extensions "
+                         f"server parameter must allow POSTGIS, PGCRYPTO, FUZZYSTRMATCH and "
+                         f"POSTGIS_TOPOLOGY \u2014 the last two because SchemaManager DROPs them "
+                         f"before building the schema, and Azure rejects a DROP naming an "
+                         f"extension it does not allow.")
+                # Do NOT start TAK and do NOT report COMPLETE. A server pointed at a
+                # schemaless managed database is not a working server, and every time this
+                # has been downgraded to a warning the deploy has gone on to print
+                # DEPLOYMENT COMPLETE over a broken install — RDS 2026-09-04 (SchemaManager
+                # exit 2) and Azure 2026-09-19 (schema built in a local cluster instead).
+                log_step("  Stopping TAK Server (managed database has no schema, deploy incomplete)...")
+                run_cmd('systemctl stop takserver', check=False)
+                deploy_status.update({'error': True, 'running': False})
+                return
 
         run_cmd('systemctl start takserver')
         log_step("Waiting 10 minutes for full initialization before promoting admin...")

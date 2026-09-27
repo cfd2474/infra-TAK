@@ -52,6 +52,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import signal
 import socket
 import socketserver
@@ -390,6 +391,20 @@ PATH_ALLOW = (
                                  # netplan YAML (additive AP add, validate-before-apply).
                                  # Root-owned dir; console cannot symlink-plant here.
     '/opt/tak/',
+    # PostgreSQL cluster data directories, both families. The console ALREADY
+    # creates, upgrades, dumps and destroys these as root through this broker —
+    # initdb, pg_upgrade, pg_dump and the uninstall's DROP DATABASE all go through
+    # here — so this grants no destructive power it does not already have. What it
+    # fixes is the console being able to build a cluster but not clean up its own
+    # FAILED attempt: a 5.8 migration that aborts part-way leaves
+    # /var/lib/pgsql/<new>/data behind, every retry then dies on "New cluster
+    # database cot is not empty", and the recovery the console prints ("run Update
+    # again") can never succeed. On a born-non-root box the operator has no shell
+    # route either, so the box is stuck with no way out through the product.
+    # Measured on nuc, 2026-09-21. Same dead end exists on Debian; it was simply
+    # never hit there because that migration did not fail.
+    '/var/lib/pgsql/',
+    '/var/lib/postgresql/',
     '/opt/tak-guarddog/',
     TAK_BUNDLE_DIR + '/',        # console-owned TAK docker bundle (ln source for /opt/tak)
     '/usr/local/etc/',
@@ -1773,6 +1788,111 @@ def _check_pg_dump(req):
         raise Denied(f'pg_dump: only container {_PG_DUMP_CONTAINER} allowed: {container!r}')
 
 
+
+# ── TAK 5.8 database migration (infra-TAK v10.2.0 W4b) ──────────────────────
+# TAK 5.8's package refuses to finish on a PostgreSQL 15 server and tells the
+# operator to run /opt/tak/db-utils/upgrade-db.sh by hand. Between those two
+# steps TAK is DOWN, so infra-TAK drives both as one operation — which means the
+# unprivileged console must be able to run that script.
+#
+# This is a real privilege grant: the script runs as root, calls pg_upgrade,
+# su - postgres, and systemctl. It is bounded as tightly as that allows:
+#   * ONE hard-coded path. Not caller-supplied, not a prefix, not a glob.
+#   * NO caller argv, env, or cwd reaches it.
+#   * The file must be root-owned and not group/world-writable — checked at call
+#     time, not trusted from install time. If a non-root user can rewrite the
+#     script, running it would launder their code to root through us; refusing on
+#     a bad mode is the difference between a bounded grant and a backdoor.
+#   * It must be a regular file, not a symlink (checked with lstat), so a swapped
+#     symlink cannot redirect the grant at another executable.
+# Vendor-owned content is the residual risk we accept: we are choosing to run
+# TAK's migration script as root, deliberately, because the alternative is an
+# operator doing exactly that by hand with the server already down.
+_TAK58_UPGRADE_DB = '/opt/tak/db-utils/upgrade-db.sh'
+# TAK's schema setup, which runs SchemaManager. Needed as its own op because the
+# 5.8 migration can leave the schema un-applied (EL md5->scram, see app.py) and the
+# repair has to re-run it. Same bound: one fixed path, no caller argv.
+_TAK58_SETUP_DB = '/opt/tak/db-utils/takserver-setup-db.sh'
+
+
+def _check_tak58_script(req, path, opname):
+    if req.get('argv') or req.get('cwd') or req.get('env'):
+        raise Denied('%s: takes no argv/cwd/env' % opname)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise Denied(f'{opname}: {path} not present (is TAK Server 5.8 installed?)')
+    if stat.S_ISLNK(st.st_mode):
+        raise Denied(f'{opname}: refusing a symlink')
+    if not stat.S_ISREG(st.st_mode):
+        raise Denied(f'{opname}: not a regular file')
+    # OWNERSHIP — measured, not assumed. TAK 5.8-RELEASE75 ships this script
+    # `tak:tak` mode 544 (verified on dev-4, 2026-09-01), NOT root-owned, so a
+    # root-only rule refuses every real box. Accept root or the `tak` service
+    # account that the package installs it under, and nothing else.
+    #
+    # Residual risk, stated plainly rather than engineered around: the `tak` user
+    # can chmod and rewrite a file it owns, so tak -> root is reachable through
+    # this op. That is NOT a risk we introduce — TAK's own documented instruction
+    # is `sudo /opt/tak/db-utils/upgrade-db.sh`, which grants exactly the same
+    # thing to exactly the same user, and TAK Server already runs as `tak`. We
+    # automate the vendor's step; we do not widen it. What we DO add over the
+    # manual path is the write-permission check below: a script any *other* local
+    # user could edit is refused outright.
+    _allowed_uids = {0}
+    try:
+        _allowed_uids.add(pwd.getpwnam('tak').pw_uid)
+    except KeyError:
+        pass
+    if st.st_uid not in _allowed_uids:
+        raise Denied(f'{opname}: {path} is owned by uid {st.st_uid}, expected root or the '
+                     'tak service account — refusing to run it as root')
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Denied(f'{opname}: {path} is group/world-writable '
+                     f'(mode {oct(st.st_mode & 0o7777)}) — refusing to run it as root')
+    return True
+
+
+def _check_tak58_upgrade_db(req):
+    return _check_tak58_script(req, _TAK58_UPGRADE_DB, 'tak58_upgrade_db')
+
+
+def _check_tak58_setup_db(req):
+    return _check_tak58_script(req, _TAK58_SETUP_DB, 'tak58_setup_db')
+
+
+def _do_tak58_script(req, path, opname):
+    """Run the vendor migration, streaming combined output back to the caller.
+
+    The script has no shebang and uses bashisms, so /bin/sh (dash on Ubuntu) emits
+    noise while still doing its job — the exit code is the only verdict, and the
+    caller is told as much. Deliberately run under `sh` exactly as the vendor's own
+    instructions do, so we reproduce the supported path rather than a variant.
+    """
+    _check_tak58_script(req, path, opname)
+    sh = shutil.which('sh', path=BROKER_TRUSTED_PATH)
+    if not sh:
+        return {'ok': False, 'error': 'sh not found on trusted PATH'}
+    timeout = min(int(req.get('timeout') or 6 * 3600), 6 * 3600)
+    try:
+        proc = subprocess.run([sh, path], cwd='/',
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': f'{opname} exceeded {timeout}s'}
+    out = (proc.stdout or b'').decode(errors='replace')
+    return {'ok': proc.returncode == 0, 'returncode': proc.returncode,
+            'output': out[-60000:]}
+
+
+def _do_tak58_upgrade_db(req):
+    return _do_tak58_script(req, _TAK58_UPGRADE_DB, 'tak58_upgrade_db')
+
+
+def _do_tak58_setup_db(req):
+    return _do_tak58_script(req, _TAK58_SETUP_DB, 'tak58_setup_db')
+
+
 def _do_pg_dump(req):
     path = _abs(req.get('path'))
     db = req.get('db') or 'cot'
@@ -1820,6 +1940,50 @@ def _check_pg_restore(req):
     _check_pg_dump(req)
 
 
+def _newest_pg_client(name):
+    """Highest-versioned PostgreSQL client binary on this host, else PATH lookup.
+
+    pg_restore REFUSES an archive written by a newer pg_dump:
+
+        pg_restore: error: unsupported version (1.16) in file header
+
+    `shutil.which` returns Debian's pg_wrapper, which selects the DEFAULT cluster
+    version — on a TAK box that is 15, because TAK's own package depends on
+    postgresql-15. Once a managed database has been upgraded to 18 (which the 5.8
+    pre-flight requires), the console dumps it with an 18 client and this
+    verification step could no longer read the result, failing the pre-migration
+    backup and blocking the update with a message about a corrupt archive when the
+    archive was fine. Measured against az-test-rds 18.6, 2026-09-19: pg_restore 15
+    rejected the file header, pg_restore 18 read 522 TOC entries from it.
+
+    Only versioned binaries in the distributions' own root-owned directories are
+    considered, by exact pattern — this must not become a way to point the broker
+    at an attacker-writable binary, which is the whole reason BROKER_TRUSTED_PATH
+    exists. Each candidate must be a regular file, owned by root, and not writable
+    by group or other.
+    """
+    best = None
+    for pattern in ('/usr/lib/postgresql/%d/bin/', '/usr/pgsql-%d/bin/'):
+        for major in range(30, 8, -1):
+            cand = (pattern % major) + name
+            try:
+                st = os.stat(cand)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                continue
+            if not os.access(cand, os.X_OK):
+                continue
+            if best is None or major > best[0]:
+                best = (major, cand)
+            break
+    if best:
+        return best[1]
+    return shutil.which(name, path=BROKER_TRUSTED_PATH)
+
+
 def _do_pg_restore(req):
     """Symmetric to _do_pg_dump (v10.0.8 §B): the broker opens the snapshot dump
     as root and feeds it to pg_restore's stdin — the dump never crosses the
@@ -1843,6 +2007,24 @@ def _do_pg_restore(req):
     if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
         return {'ok': False, 'code': 'DENIED',
                 'error': 'dump failed authenticity check — not a broker-produced snapshot'}
+    # v10.2.0 W3: list_only — prove an archive is READABLE without restoring it.
+    # The console cannot do this itself: broker-written dumps are root-owned 0600,
+    # and `runuser -u postgres -- pg_restore` therefore gets EACCES. Reading the
+    # TOC needs no database at all, so it runs as root here and returns a count.
+    # The HMAC compare above already proves the bytes are intact; parsing the TOC
+    # additionally proves the archive is well-formed, which is what a pre-migration
+    # backup check is actually claiming.
+    if req.get('list_only'):
+        pg_restore = _newest_pg_client('pg_restore')
+        if not pg_restore:
+            return {'ok': False, 'error': 'pg_restore not found on trusted PATH'}
+        proc = subprocess.run([pg_restore, '--list', path],
+                              capture_output=True, timeout=600)
+        out = (proc.stdout or b'').decode(errors='replace')
+        toc = [l for l in out.splitlines() if l.strip() and not l.lstrip().startswith(';')]
+        return {'ok': proc.returncode == 0 and bool(toc),
+                'returncode': proc.returncode, 'toc_entries': len(toc),
+                'error': (proc.stderr or b'').decode(errors='replace')[:400]}
     if req.get('container'):
         docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
         if not docker:
@@ -2482,6 +2664,10 @@ def _evaluate(req):
             _check_disk_reclaim(req)
         elif op == 'takportal_sudoers':
             _check_takportal_sudoers(req)
+        elif op == 'tak58_upgrade_db':
+            _check_tak58_upgrade_db(req)
+        elif op == 'tak58_setup_db':
+            _check_tak58_setup_db(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -2563,7 +2749,8 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers'):
+    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
+              'tak58_upgrade_db', 'tak58_setup_db'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -2571,6 +2758,10 @@ def _dispatch(req, peer):
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
             summary = f"action={req.get('action')} user={BROKER_USER}"
+        elif op == 'tak58_upgrade_db':
+            summary = _TAK58_UPGRADE_DB
+        elif op == 'tak58_setup_db':
+            summary = _TAK58_SETUP_DB
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -2586,6 +2777,10 @@ def _dispatch(req, peer):
             return _do_disk_reclaim(req)
         if op == 'takportal_sudoers':
             return _do_takportal_sudoers(req)
+        if op == 'tak58_upgrade_db':
+            return _do_tak58_upgrade_db(req)
+        if op == 'tak58_setup_db':
+            return _do_tak58_setup_db(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)

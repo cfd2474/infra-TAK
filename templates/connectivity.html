@@ -109,6 +109,12 @@ textarea.form-input{resize:vertical}
 
   <div class="card" id="anchor-card" style="display:none">
     <div class="card-title" id="anchor-card-title">Connect a Relay</div>
+    <div id="anchor-optional-note" style="display:none;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.25);border-radius:10px;padding:12px 16px;font-size:13px;line-height:1.6;margin-bottom:14px">
+      <b>Optional for this network.</b> Detection found a path that should work without a
+      relay, so this is not the recommended route here — but it is fully supported and you
+      may still want it: no router access, an ISP that blocks the TAK ports, or a single
+      fixed public address that stays the same no matter which network this box is on.
+    </div>
 
     <div id="anchor-connected" style="display:none">
       <div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:16px 18px">
@@ -138,7 +144,7 @@ textarea.form-input{resize:vertical}
 
     <div id="anchor-form">
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
-      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
+      <span id="anchor-lead">Your box has no public inbound, so it</span> dials OUT to a small always-free public VPS (the relay).
       Friends connect to the relay's public address with no VPN, from any network your box is on.
       Create the relay VM first (Oracle Free Tier — <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELAY-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">step-by-step guide &#8599;</a>); then just enter its IP and
       upload its key below, and this box sets up the whole tunnel for you.
@@ -354,9 +360,32 @@ function renderResult(res){
   document.getElementById('result-reasons').innerHTML =
     (res.reasons || []).map(r => '• ' + esc(r)).join('<br>');
   document.getElementById('reco-banner').innerHTML = RECO_TEXT[res.recommendation] || '';
-  // Reveal the relay card when the relay is recommended; refreshAnchorStatus also
-  // reveals it if a relay is already configured, and won't hide a connected one.
-  if(res.recommendation === 'anchor'){ document.getElementById('anchor-card').style.display = 'block'; }
+  // Always reveal the relay card, and say whether it is the recommended path.
+  //
+  // It used to appear ONLY when res.recommendation === 'anchor'. A box that "stays in one
+  // place" on a clean public IP is recommended ddns_portforward, so the relay card never
+  // appeared at all — the capability was invisible rather than merely not-recommended.
+  // AD1CT (GitHub #78) had to go back and claim the box "moves with me" to reach the form,
+  // and reported that as the workaround. A relay is a legitimate choice for a stationary
+  // box: no router access, an ISP that blocks the TAK ports, or simply not wanting to open
+  // one. Recommending a path is not a reason to hide the others.
+  const relayRecommended = (res.recommendation === 'anchor');
+  document.getElementById('anchor-card').style.display = 'block';
+  const relayNote = document.getElementById('anchor-optional-note');
+  if(relayNote){
+    relayNote.style.display = relayRecommended ? 'none' : 'block';
+  }
+  // The card's body was written for the case where a relay is the RECOMMENDED path, so it
+  // opens "Your box has no public inbound". That card never used to appear on a box with a
+  // clean public IP — now that it does, that sentence is simply false there, and it
+  // contradicts the note directly above it. Caught by the operator's browser run on a
+  // Class A box (GitHub #78), which is the thing no SSH session could have told us.
+  const relayLead = document.getElementById('anchor-lead');
+  if(relayLead){
+    relayLead.textContent = relayRecommended
+      ? 'Your box has no public inbound, so it'
+      : 'With a relay, this box';
+  }
   refreshAnchorStatus();
 }
 
@@ -390,6 +419,13 @@ async function refreshAnchorStatus(){
     const connected = d.up && d.handshake_secs != null && d.handshake_secs < 180;
     if((d.configured || connected) && !anchorReconfiguring){
       document.getElementById('anchor-card').style.display = 'block';
+      // A box that already HAS a relay must never be told the relay is "optional for this
+      // network" — that note is for someone who has none and whose network was not recommended
+      // one. Without this, a box with a live tunnel showed "Optional for this network ... not
+      // the recommended route here" directly above "Tunnel up", which reads like a bug.
+      // Caught by the operator asking whether to test on a box that is using a relay.
+      var _optNote = document.getElementById('anchor-optional-note');
+      if(_optNote){ _optNote.style.display = 'none'; }
       showRelayForm(false);
       const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
         + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||51820) : ''))

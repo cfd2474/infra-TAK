@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.85-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.85-alpha)**
+**Current release: [v10.2.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.0-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.0-alpha — 2026-09-27 — TAK Server 5.8 and PostgreSQL 18, upgraded from the browser
+
+**Headline: TAK Server 5.8 with PostgreSQL 18 is now a guided upgrade you run from the console, on single-server, two-server and containerised deployments alike — including ARM64.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.0-alpha)) The console reads what your box actually is, tells you what it will do, takes a backup and **proves it is readable before touching anything**, then moves the database from PostgreSQL 15 to 18 and brings TAK Server up on 5.8. The old cluster is left on disk alongside the verified dump, so the rollback is real rather than theoretical. Hardened container bundles install correctly, and the upgrade was validated on a real 5.7 box on each shape rather than only on fresh installs.
+
+Three health-monitoring and migration defects are fixed in the same release. On two-server deployments the upgrade could finish and report success while TAK Server could not reach its database at all — the new cluster did not carry the database's TLS configuration, and the old check only watched for a port to open; the configuration is now carried across (and rolled back automatically if the database will not accept it), and success now means TAK is genuinely connected. Guard Dog reported "database down" forever on two kinds of healthy box — RHEL/Rocky servers after the upgrade, and any deployment running TAK in containers — sending an alert email every hour about a database that was fine. Both are fixed, and the fix reaches existing installs on the next console restart with no redeployment.
+
+Also in this release: the Connectivity wizard no longer hides the relay option on a box that stays in one place, CloudTAK reconfiguration no longer deletes settings it did not write, and a CloudTAK install whose object-store image cannot be downloaded now explains why instead of showing a registry error.
+
+> **Upgrade note.** Update the console first, then open the TAK Server page — it will tell you whether an upgrade is available for your deployment and what it will do. Take the offered backup. **On a two-server deployment, upgrade during a window you can watch**, as the database moves on Server One. Deployments using an external or managed database (Azure Flexible Server, Amazon RDS) should be upgraded deliberately with your database administrator; that path is supported but the provider performs the version upgrade, not infra-TAK. New CloudTAK installations are currently blocked upstream by MinIO withdrawing its container images — existing CloudTAK deployments are unaffected, and CloudTAK is replacing that component; see issue #73.
 
 ### v10.1.85-alpha — 2026-09-22 — CloudTAK: a failed update can no longer offer to remove a working install; TAK Client Feed works on split deployments out of the box
 

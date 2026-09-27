@@ -295,10 +295,86 @@ function takPurgeFailed(){
 {% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
+{% if tak58 and tak58.facts %}{% if tak58.facts.already_migrated %}
+<div style="border-left:3px solid var(--green);background:rgba(34,197,94,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px">PostgreSQL {{ tak58.facts.pg_running_major }} &mdash; clear to run TAK Server 5.8+</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">This server has been migrated. Normal updates apply from here.</div>
+</div>
+{% elif tak58.facts.external_db %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8 on a managed database</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong> and this server's database is on <strong>PostgreSQL {{ tak58.facts.pg_running_major }}</strong>. It is a <strong>managed database</strong>, so only your provider can upgrade the engine &mdash; the console cannot do it for you, and it will keep refusing a 5.8 install until the database is on {{ tak58.facts.pg_target_major }} so you cannot end up half-migrated.</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-top:10px">
+<strong style="color:var(--text-primary)">Three steps, in this order:</strong><br>
+1. Snapshot the instance, then upgrade it to PostgreSQL {{ tak58.facts.pg_target_major }} in the AWS RDS or Azure console.<br>
+2. Confirm TAK's database user can still sign in afterwards &mdash; a provider upgrade can leave the stored password in an older format, and the symptom is a server that looks healthy with its schema never migrated.<br>
+3. Come back here, upload the 5.8 package and click Update. This card turns green once {{ tak58.facts.pg_target_major }} is actually serving.
+</div>
+<details style="margin-top:12px;border:1px solid rgba(234,179,8,0.28);border-radius:8px;overflow:hidden">
+<summary style="padding:10px 14px;background:rgba(234,179,8,0.10);cursor:pointer;font-size:12px;color:var(--yellow);font-family:'JetBrains Mono',monospace;font-weight:600;list-style:none"><span style="font-size:14px">&#9729;</span> Exact steps in your provider's console &mdash; and the two defaults that silently do nothing</summary>
+<div style="padding:14px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">AWS RDS</p>
+<ol style="margin:0 0 12px;padding-left:18px">
+<li style="margin-bottom:6px">Take a snapshot. The 5.8 schema change is not one this console can roll back for you.</li>
+<li style="margin-bottom:6px">AWS Console &rarr; search <strong>RDS</strong> &rarr; <strong>Databases</strong> &rarr; click your instance. Check the region selector top-right is the region it lives in, or it will not be listed.</li>
+<li style="margin-bottom:6px"><strong>Modify</strong> (top right) &rarr; <strong>DB engine version</strong> &rarr; pick an <strong>18.x</strong> release &rarr; <strong>Continue</strong>.</li>
+<li style="margin-bottom:6px">On the summary page set <strong>Scheduling of modifications</strong> to <strong>Apply immediately</strong>.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Apply during the next maintenance window</em>. Leave it there and nothing happens now &mdash; which looks exactly like the upgrade failing.</div></li>
+</ol>
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">Azure Database for PostgreSQL Flexible Server</p>
+<ol style="margin:0 0 10px;padding-left:18px">
+<li style="margin-bottom:6px">Take a snapshot / backup first, same reason.</li>
+<li style="margin-bottom:6px">Azure Portal &rarr; search for <strong>Azure Database for PostgreSQL flexible servers</strong> &rarr; click your server.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; Not <em>Azure SQL</em> &mdash; that is Microsoft SQL Server and is a different product entirely. The one you want has &ldquo;PostgreSQL&rdquo; in the name.</div></li>
+<li style="margin-bottom:6px"><strong>Settings &rarr; Server parameters</strong> &rarr; search <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">azure.extensions</code> &rarr; set it to exactly this, then <strong>Save</strong>:</li>
+</ol>
+<div style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--green);margin:0 0 10px 18px;word-break:break-all">FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO</div>
+<div style="margin:0 0 10px 18px;font-size:11px;color:var(--text-dim)">TAK's schema tool <strong>drops</strong> fuzzystrmatch and postgis_topology before it builds the schema, and Azure refuses a DROP naming an extension that is not allow-listed &mdash; even one that is not installed. Without these the upgrade fails with no schema built.</div>
+<ol start="3" style="margin:0 0 12px;padding-left:18px">
+<li style="margin-bottom:6px">Back on the same server &rarr; <strong>Overview</strong> &rarr; <strong>Upgrade</strong> on the top toolbar &rarr; set <em>PostgreSQL version to upgrade</em> to <strong>{{ tak58.facts.pg_target_major }}</strong>.</li>
+<li style="margin-bottom:6px">Set <strong>Action</strong> to <strong>Validate and upgrade</strong>.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Validate only</em>, which runs the checks, reports success, and leaves your server on {{ tak58.facts.pg_running_major }}.</div></li>
+</ol>
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">Either provider</p>
+<ul style="margin:0 0 10px;padding-left:18px">
+<li style="margin-bottom:6px"><strong>The instance goes offline.</strong> Measured on small databases: <strong>~3 minutes</strong> on RDS, <strong>~4&ndash;5 minutes</strong> on Azure after about 3 minutes of validation. A large database takes longer &mdash; treat these as a floor when you book the window.</li>
+<li style="margin-bottom:6px"><strong>PostGIS does not move the same way.</strong> Azure carries its version forward; RDS leaves yours as it was. TAK 5.8 works either way; run <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">ALTER EXTENSION postgis UPDATE;</code> afterwards if you want the newer one.</li>
+<li style="margin-bottom:6px">When it is back, click <strong>Test Connection</strong> above. TAK's database user must still sign in &mdash; on Azure it also confirms the extensions are allow-listed.</li>
+</ul>
+
+<p style="margin:0;font-size:11px;color:var(--text-dim)">Then upload the 5.8 package below and click Update. The console reads <code style="background:#0a0e1a;padding:1px 4px;border-radius:3px">schema_version</code> back off your instance afterwards and only reports success once it reaches {{ tak58.facts.pg_target_major }}&rsquo;s schema &mdash; it will not tell you it worked when it did not.</p>
+</div>
+</details>
+<div style="font-size:12px;margin-top:10px"><a href="https://github.com/takwerx/infra-TAK/blob/main/docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Full step-by-step guide &#8599;</a></div>
+</div>
+{% elif tak58.facts.two_server %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8 on a two-server deployment</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong>. This server's database is on <strong>Server One ({{ tak58.facts.server_one_host }})</strong>, and the console migrates it there over SSH.</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-top:10px">
+<strong style="color:var(--text-primary)">Two uploads, one click:</strong><br>
+1. Upload the 5.8 <strong>takserver-core</strong> package for this server below.<br>
+2. Upload the 5.8 <strong>takserver-database</strong> package for Server One in the two-server panel on this page &mdash; it must match Server One's OS family, not this server's.<br>
+3. Click <strong>Update</strong>. The console checks Server One's PostgreSQL version and free disk, takes a backup it proves readable, runs TAK's migration there, then verifies PostgreSQL {{ tak58.facts.pg_target_major }} is serving with the schema applied and no rows lost. Measured: 498&nbsp;s end to end on an 11,000-row database; larger databases take longer.
+</div>
+</div>
+{% elif tak58.blockers %}
+<div style="border-left:3px solid var(--red);background:rgba(239,68,68,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:4px">TAK Server 5.8 cannot be installed on this server yet</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">{% for b in tak58.blockers %}&bull; {{ b }}<br>{% endfor %}</div>
+</div>
+{% else %}
 <div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
 <div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8?</div>
-<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">5.8 includes a PostgreSQL database migration (15 to 18). This console will <strong>block 5.8 installs</strong> until guided-upgrade support ships in an upcoming release. Uploading a 5.8 package is safe &mdash; the update itself is what is refused.</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong> and this server is on <strong>PostgreSQL {{ tak58.facts.pg_running_major }}</strong>. Upload the 5.8 package below and click Update as normal &mdash; the console detects it and runs the whole thing as <strong>one operation</strong>: verified backup, package install, database migration, then restart. TAK Server is down for the duration and must not be interrupted. The PostgreSQL 15 cluster is kept on disk as your rollback.</div>
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-top:8px;font-family:'JetBrains Mono',monospace">database {{ tak58.facts.data_human }} &middot; {{ tak58.facts.avail_human }} free (needs {{ tak58.facts.need_human }}){% if tak58.facts.cot_router_rows is defined and tak58.facts.cot_router_rows is not none %} &middot; cot_router {{ '{:,}'.format(tak58.facts.cot_router_rows) }} rows{% endif %}{% if tak58.facts.cot_router_id_stays_integer %} &middot; id is integer (5.8 does not widen it){% endif %}</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6;margin-top:8px"><strong style="color:var(--text-primary)">How long it takes:</strong> {% if tak_is_container %}measured <strong>939 s of downtime</strong> on x86 and <strong>426 s</strong> on ARM64, each against roughly <strong>900,000</strong> <span style="font-family:'JetBrains Mono',monospace">cot_router</span> rows &mdash; the container path exports and re-imports the database, so it is slower than the native one.{% else %}measured <strong>181 s</strong> on a <strong>1,000,000-row / 2.0 GB</strong> database (Rocky 9, PostgreSQL 15&rarr;18) and <strong>142 s</strong> on Ubuntu.{% endif %} {% if tak58.facts.cot_router_rows is defined and tak58.facts.cot_router_rows is not none %}This server has <strong>{{ '{:,}'.format(tak58.facts.cot_router_rows) }}</strong> rows, so expect the time to scale roughly with that.{% else %}Time scales roughly with database size.{% endif %} These are measured runs, not estimates &mdash; a much larger database will take proportionally longer.</div>
+{% for w in tak58.warnings %}<div style="font-size:12px;color:var(--yellow);line-height:1.5;margin-top:6px">&#9888; {{ w }}</div>{% endfor %}
 </div>
+{% endif %}{% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
 <div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>

@@ -1185,6 +1185,13 @@ function initTakDeployModeUI(rootEl){
       '<div class="form-field"><label>Database Name</label><input type="text" id="edb_name" value="cot"></div>',
       '<div class="form-field"><label>Username</label><input type="text" id="edb_user" value="martiuser"></div>',
       '</div>',
+      '<div style="margin-bottom:14px;padding:12px 14px;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.3);border-left:3px solid var(--yellow);border-radius:8px">',
+      '<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:6px">Create the instance on PostgreSQL 18 &mdash; not the default</div>',
+      '<div style="font-size:12px;color:var(--text-secondary);line-height:1.7">TAK Server 5.8 requires <strong>PostgreSQL 18</strong>. Both AWS RDS and Azure offer older majors first, and Azure&rsquo;s new-server form defaults to one, so it is easy to create a 15 or 16 instance without noticing.',
+      '<div style="margin-top:6px">If you create it on an older major, this deploy fails when it builds TAK&rsquo;s schema. Fixing it afterwards means a <strong>major-version upgrade in your cloud console</strong> &mdash; a separate, scheduled outage &mdash; so it is far cheaper to pick 18 now.</div>',
+      '<div style="margin-top:6px;color:var(--text-dim);font-size:11px">AWS: RDS &rarr; Create database &rarr; PostgreSQL &rarr; <strong>Engine version 18.x</strong>. &nbsp;Azure: search <strong>Azure Database for PostgreSQL flexible servers</strong> (not Azure SQL &mdash; that is Microsoft SQL Server) &rarr; Create &rarr; <strong>PostgreSQL version 18</strong>.</div>',
+      '</div>',
+      '</div>',
       '<details style="margin-bottom:14px;border:1px solid rgba(59,130,246,0.25);border-radius:8px;overflow:hidden">',
       '<summary style="padding:10px 14px;background:rgba(59,130,246,0.08);cursor:pointer;font-size:12px;color:var(--accent);font-family:\'JetBrains Mono\',monospace;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px">',
       '<span style="font-size:14px">☁</span> Using Azure Database for PostgreSQL? — Required pre-flight steps',
@@ -1901,7 +1908,7 @@ function pollUpgradeLog(){
   function poll(){
     fetch('/api/takserver/update/log?index='+upgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
       if(d.entries&&d.entries.length){if(upgradeLogIndex===0)el.textContent='';el.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);el.scrollTop=el.scrollHeight;upgradeLogIndex=d.total;}
-      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){window.location.reload();},1200);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
+      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed - read the log above';m.style.color='var(--red)';}}else if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){window.location.reload();},1200);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
       else{setTimeout(poll,800);}
     });
   }
