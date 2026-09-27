@@ -144,7 +144,7 @@ textarea.form-input{resize:vertical}
 
     <div id="anchor-form">
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
-      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
+      <span id="anchor-lead">Your box has no public inbound, so it</span> dials OUT to a small always-free public VPS (the relay).
       Friends connect to the relay's public address with no VPN, from any network your box is on.
       Create the relay VM first (Oracle Free Tier — <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELAY-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">step-by-step guide &#8599;</a>); then just enter its IP and
       upload its key below, and this box sets up the whole tunnel for you.
@@ -374,6 +374,17 @@ function renderResult(res){
   const relayNote = document.getElementById('anchor-optional-note');
   if(relayNote){
     relayNote.style.display = relayRecommended ? 'none' : 'block';
+  }
+  // The card's body was written for the case where a relay is the RECOMMENDED path, so it
+  // opens "Your box has no public inbound". That card never used to appear on a box with a
+  // clean public IP — now that it does, that sentence is simply false there, and it
+  // contradicts the note directly above it. Caught by the operator's browser run on a
+  // Class A box (GitHub #78), which is the thing no SSH session could have told us.
+  const relayLead = document.getElementById('anchor-lead');
+  if(relayLead){
+    relayLead.textContent = relayRecommended
+      ? 'Your box has no public inbound, so it'
+      : 'With a relay, this box';
   }
   refreshAnchorStatus();
 }
