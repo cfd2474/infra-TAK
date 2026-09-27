@@ -38755,6 +38755,97 @@ def _cloudtak_store_image_status(cloudtak_dir, log=None):
         return True, ''
 
 
+def _cloudtak_adopt_local_store_image(cloudtak_dir, log=None):
+    """If the pinned store image cannot be fetched, use a store image the operator built.
+
+    WHY (2026-09-27, GitHub #73). MinIO withdrew its images from every public registry, so a
+    new CloudTAK install cannot pull its `store` service. habr05 did the obvious thing —
+    built MinIO from source themselves — and STILL could not get past the deploy, because
+    nothing they could edit survives: a reinstall does `rm -rf ~/CloudTAK && git clone`, and
+    infra-TAK regenerates docker-compose.override.yml from scratch every deploy. Their image
+    was sitting right there on the box, unusable.
+
+    So adopt it instead of making them fight us. Deliberately narrow: this runs ONLY when the
+    pinned image is neither pullable NOR already cached — that is, only on an install that is
+    otherwise going to fail — and it refuses to guess when the box offers more than one
+    candidate. On every healthy box it is inert.
+
+    Returns the adopted image ref, or None.
+    """
+    def _say(m):
+        if log:
+            log(m)
+        else:
+            print(m, flush=True)
+    try:
+        compose = os.path.join(cloudtak_dir or '', 'docker-compose.yml')
+        if not os.path.isfile(compose):
+            compose = os.path.join(cloudtak_dir or '', 'compose.yaml')
+        if not os.path.isfile(compose):
+            return None
+        with open(compose) as f:
+            body = f.read()
+        m = re.search(r'(?m)^(\s*image:\s*)(\S*minio/minio:\S+)\s*$', body)
+        if not m:
+            return None
+        pinned = m.group(2).strip().strip('"\'')
+        # cached or pullable -> leave everything alone
+        if subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', pinned]),
+                          capture_output=True, timeout=30).returncode == 0:
+            return None
+        if subprocess.run(_sudo_wrap(['docker', 'manifest', 'inspect', pinned]),
+                          capture_output=True, timeout=90).returncode == 0:
+            return None
+        r = subprocess.run(_sudo_wrap(
+            ['docker', 'images', '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']),
+            capture_output=True, text=True, timeout=60)
+        # Group by image ID, not by ref. A box that has ever run CloudTAK carries the SAME
+        # MinIO image under two tags (minio/minio:X and quay.io/minio/minio:X) — counting
+        # those as two rival candidates made this refuse to act on exactly the boxes it
+        # exists to rescue (measured on test6). Two refs for one ID are one candidate.
+        by_id = {}
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            iid, ref = parts[0].strip(), parts[1].strip()
+            if not ref or ref.endswith(':<none>') or ref.startswith('<none>'):
+                continue
+            if 'minio' not in ref.lower() or ref == pinned:
+                continue
+            by_id.setdefault(iid, []).append(ref)
+        if not by_id:
+            _say('    If you build a MinIO image yourself, tag it with "minio" in the name')
+            _say('    (e.g. `docker build -t myminio:local .`) and run the install again —')
+            _say('    infra-TAK will pick up a locally built store image automatically.')
+            return None
+        def _official(refs):
+            return any(x.split(':', 1)[0] in ('minio/minio', 'quay.io/minio/minio',
+                                              'docker.io/minio/minio') for x in refs)
+        if len(by_id) > 1:
+            # Prefer a real MinIO over something merely named like one; only refuse when
+            # even that does not disambiguate.
+            off = [i for i, refs in by_id.items() if _official(refs)]
+            if len(off) == 1:
+                by_id = {off[0]: by_id[off[0]]}
+            else:
+                _say('    Several different MinIO-like images are present, so infra-TAK will')
+                _say('    not guess which one is the store: %s'
+                     % ', '.join(sorted(v[0] for v in by_id.values())[:6]))
+                _say('    Remove the ones you do not want, or retag the right one, and re-run.')
+                return None
+        cands = sorted(next(iter(by_id.values())))
+        adopted = cands[0]
+        with open(compose, 'w') as f:
+            f.write(body[:m.start(2)] + adopted + body[m.end(2):])
+        _say('    ✓ Using the store image you built on this box: %s' % adopted)
+        _say('      (the pinned %s cannot be fetched from any registry any more)' % pinned)
+        return adopted
+    except Exception as e:
+        _say('    (could not adopt a local store image: %s)' % str(e)[:120])
+        return None
+
+
 def _patch_cloudtak_minio_registry(cloudtak_dir=None):
     """Repoint CloudTAK's minio image at quay.io. Returns True if a file changed.
 
@@ -39603,7 +39694,9 @@ def run_cloudtak_deploy(cfg=None):
             # 2026-09-27 the quay.io mirror lost the tag too, so the repoint alone is no
             # longer enough: say so plainly rather than letting a registry error speak.
             _patch_cloudtak_minio_registry(cloudtak_dir)
-            _cloudtak_store_image_status(cloudtak_dir, log=plog)
+            if not _cloudtak_store_image_status(cloudtak_dir, log=plog)[0]:
+                # the pin is unfetchable: use an image the operator built, if there is one
+                _cloudtak_adopt_local_store_image(cloudtak_dir, log=plog)
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
