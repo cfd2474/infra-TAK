@@ -53282,17 +53282,24 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
     bypassing pgbouncer) as "direct". Unix-socket / null client_addr is the
     psql probe itself and is ignored.
 
+    v10.2.1: the worker connects to Postgres directly BY DESIGN
+    (_ensure_authentik_worker_direct_pg). Its connections are counted in
+    `worker_direct`, not `direct`, so `direct` keeps meaning "something is
+    bypassing PgBouncer that should not be".
+
     Returns: dict with keys:
       pgbouncer_ip      — str or None (resolution failed)
       via_pgbouncer     — int (count of idle+active conns from pgbouncer IP)
+      worker_direct     — int (count from the authentik-worker-1 container's IPs)
       direct            — int (count from any other non-null client_addr)
       by_addr           — list of (client_addr, count) tuples, all rows
-      total             — int (sum of via_pgbouncer + direct)
+      total             — int (sum of via_pgbouncer + worker_direct + direct)
       error             — str or None
     """
     out = {
         'pgbouncer_ip': None,
         'via_pgbouncer': 0,
+        'worker_direct': 0,
         'direct': 0,
         'by_addr': [],
         'total': 0,
@@ -53306,6 +53313,14 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
         out['pgbouncer_ip'] = ips[0] if ips else None
     except Exception as _ie:
         out['error'] = f'docker inspect failed: {_ie}'
+    worker_ips = set()
+    try:
+        wip_r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}', 'authentik-worker-1']), capture_output=True, text=True, timeout=5
+        )
+        worker_ips = {ln.strip() for ln in (wip_r.stdout or '').splitlines() if ln.strip()}
+    except Exception:
+        pass
 
     try:
         r = subprocess.run(
@@ -53327,9 +53342,11 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
             out['by_addr'].append((addr, cnt))
             if out['pgbouncer_ip'] and addr == out['pgbouncer_ip']:
                 out['via_pgbouncer'] += cnt
+            elif addr in worker_ips:
+                out['worker_direct'] += cnt
             else:
                 out['direct'] += cnt
-        out['total'] = out['via_pgbouncer'] + out['direct']
+        out['total'] = out['via_pgbouncer'] + out['worker_direct'] + out['direct']
     except Exception as _e:
         out['error'] = (out['error'] or '') + f' | probe error: {_e}'
     return out
@@ -54293,7 +54310,11 @@ def _ensure_authentik_pgbouncer(plog):
 
     server_compose_host = _read_svc_pg_host(services.get('server'))
     worker_compose_host = _read_svc_pg_host(services.get('worker'))
-    compose_env_wired = (server_compose_host == 'pgbouncer' and worker_compose_host == 'pgbouncer')
+    # v10.2.1: only the SERVER belongs on PgBouncer. The worker goes to Postgres
+    # directly (LISTEN + session advisory locks do not survive transaction pooling —
+    # see _ensure_authentik_worker_direct_pg). Requiring the worker on pgbouncer here
+    # would flip it back on every console boot.
+    compose_env_wired = (server_compose_host == 'pgbouncer')
 
     # v2.2 (2026-05-15 PM): the v1 install was silently incomplete. The Authentik
     # compose template hardcodes `AUTHENTIK_POSTGRESQL__HOST: postgresql` in
@@ -54306,15 +54327,15 @@ def _ensure_authentik_pgbouncer(plog):
     # PgBouncer. The fix: also patch services.{server,worker}.environment.
     if pgbouncer_in_compose and pgbouncer_in_env and compose_env_wired:
         plog("  pgbouncer install: already installed (compose + .env + "
-             "server/worker compose env all wired to pgbouncer) — idempotent no-op")
+             "server compose env wired to pgbouncer) — idempotent no-op")
         return False
     if pgbouncer_in_compose and pgbouncer_in_env and not compose_env_wired:
         plog(f"  pgbouncer install: PARTIAL INSTALL DETECTED (v0.9.23-alpha v1 bug). "
              f"pgbouncer container is present and .env is wired, but "
              f"services.server.environment.AUTHENTIK_POSTGRESQL__HOST={server_compose_host!r} "
-             f"and services.worker.environment.AUTHENTIK_POSTGRESQL__HOST={worker_compose_host!r} "
-             f"(both should be 'pgbouncer'). Compose `environment:` overrides `env_file:` per "
-             f"Docker Compose semantics — Authentik is bypassing PgBouncer. Applying v2.2 "
+             f"(should be 'pgbouncer'; the worker is direct by design, currently "
+             f"{worker_compose_host!r}). Compose `environment:` overrides `env_file:` per "
+             f"Docker Compose semantics — the server is bypassing PgBouncer. Applying v2.2 "
              f"compose env fixup + force-recreate now.")
 
     if current_host is not None and current_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
@@ -54390,11 +54411,16 @@ def _ensure_authentik_pgbouncer(plog):
             svc['depends_on'] = {'pgbouncer': {'condition': 'service_healthy'}}
             plog(f"  pgbouncer install: created {svc_name}.depends_on with pgbouncer")
 
-        # v2.2 fix: also rewrite services.{server,worker}.environment.AUTHENTIK_POSTGRESQL__HOST
+        # v2.2 fix: also rewrite services.server.environment.AUTHENTIK_POSTGRESQL__HOST
         # from 'postgresql' → 'pgbouncer'. The compose template hardcodes this in
         # `environment:` which takes PRECEDENCE over `env_file:` — so rewriting .env
         # alone is silently ignored. See idempotency gate comment above for the full
         # forensic trace. This change is what makes the install actually take effect.
+        # v10.2.1: SERVER only. The worker keeps the template's direct `postgresql`
+        # (_ensure_authentik_worker_direct_pg) — its dramatiq broker needs LISTEN and
+        # session advisory locks, which transaction pooling cannot carry.
+        if svc_name != 'server':
+            continue
         env = svc.setdefault('environment', {})
         if isinstance(env, dict):
             prev = env.get('AUTHENTIK_POSTGRESQL__HOST')
@@ -54606,7 +54632,8 @@ def _ensure_authentik_pgbouncer(plog):
         plog(f"  pgbouncer install: post-install probe partial: {_probe['error']}")
 
     plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer} "
-         f"(from {pgb_ip or 'unknown-ip'}), direct={direct}")
+         f"(from {pgb_ip or 'unknown-ip'}), worker_direct={_probe['worker_direct']} "
+         f"(by design), direct={direct}")
     if _probe.get('by_addr'):
         for _addr, _cnt in _probe['by_addr']:
             _tag = '←pgbouncer' if pgb_ip and _addr == pgb_ip else ''
@@ -54691,6 +54718,181 @@ def _ensure_authentik_pgbouncer(plog):
     else:
         plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
              "(transaction pool, ≤90 real PG conns)")
+    return True
+
+
+def _ensure_authentik_worker_direct_pg(plog):
+    """v10.2.1: connect the Authentik WORKER straight to Postgres; the server stays on PgBouncer.
+
+    Authentik 2026.x's task broker (django-dramatiq-postgres) needs two things a
+    transaction-pooling PgBouncer cannot carry — both are "Never" in the transaction
+    column of https://www.pgbouncer.org/features.html:
+
+      * LISTEN authentik.tasks.default.enqueue — how the worker hears about a new task.
+        Through PgBouncer the notification never arrives, so every task waits for the
+        AUTHENTIK_WORKER__CONSUMER_LISTEN_TIMEOUT fallback poll (30s). Measured on
+        test6/test8/test12 2026-09-30, empty queue: p50 17-30s from "Task has been
+        queued" to "Task is being processed", for every actor. A password-reset email
+        is one of those tasks — Justin Davis (TN TAK) reported reset emails delayed.
+      * pg_advisory_lock / pg_advisory_unlock per message — the unlock lands on a
+        different pooled backend than the lock, so the lock leaks until that backend
+        recycles: 647-1123 "you don't own a lock" Postgres warnings per box per day.
+        A retried message keeps its message_id, so its leaked lock can block it.
+
+    Worker on direct Postgres (test12, 2026-09-30): queued→processing 0.08-0.23s, and
+    0 lock warnings where the hour before had 33.
+
+    Only the worker moves. PgBouncer exists to cap upstream #20714's connection leak,
+    which lives in the server's gunicorn workers; the worker's own footprint is small
+    and fixed (processes × threads, plus one listen and one lock connection).
+
+    Upstream fixed this in 2026.8.0 (goauthentik/authentik#23013): an optional
+    `postgresql.direct.*` block that routes only LISTEN and the advisory locks direct.
+    When a 2026.8.x release is vetted, move to that and retire this.
+
+    Acts only on the bundled topology — compose has `postgresql` and `pgbouncer`, the
+    server is on pgbouncer, the worker is on pgbouncer. A worker already on
+    `postgresql` is a no-op; any other host (external PG) is left alone. Recreates the
+    worker only — never the server or the LDAP outpost.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, compose
+    rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  worker direct-pg: PyYAML unavailable — skipped (the pgbouncer step bootstraps it; next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+    except Exception as e:
+        plog(f"  worker direct-pg: compose unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    if not isinstance(services, dict) or 'postgresql' not in services or 'pgbouncer' not in services:
+        return False
+    worker = services.get('worker')
+    if not isinstance(worker, dict):
+        return False
+
+    def _svc_pg_host(svc):
+        env = svc.get('environment') if isinstance(svc, dict) else None
+        if isinstance(env, dict):
+            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            return None if v is None else str(v).strip().strip('"').strip("'")
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    return item.split('=', 1)[1].strip().strip('"').strip("'")
+        return None
+
+    worker_host = _svc_pg_host(worker)
+    if worker_host == 'postgresql':
+        return False
+    if worker_host != 'pgbouncer' or _svc_pg_host(services.get('server')) != 'pgbouncer':
+        plog(f"  worker direct-pg: worker host {worker_host!r} is not the bundled PgBouncer — left alone")
+        return False
+
+    env = worker.get('environment')
+    if isinstance(env, dict):
+        env['AUTHENTIK_POSTGRESQL__HOST'] = 'postgresql'
+    elif isinstance(env, list):
+        worker['environment'] = [
+            'AUTHENTIK_POSTGRESQL__HOST=postgresql'
+            if isinstance(i, str) and i.startswith('AUTHENTIK_POSTGRESQL__HOST=') else i
+            for i in env]
+    else:
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-worker-direct-pg.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            s['authentik_worker_direct_pg'] = {
+                'last_outcome': outcome,
+                'last_attempt_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'version': VERSION,
+                'compose_backup': compose_bak,
+            }
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_worker():
+        return subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'worker']),
+            cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    plog("  worker direct-pg: moving the Authentik worker off PgBouncer onto Postgres "
+         "(task pickup waits on the 30s fallback poll behind a transaction pooler)")
+    with _authentik_compose_lock('worker-direct-pg', plog=plog) as _locked:
+        if not _locked:
+            plog("  worker direct-pg: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(compose_bak, 'w') as f:
+                f.write(raw_compose)
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+        except Exception as e:
+            plog(f"  ✗ worker direct-pg: compose write failed ({e}) — restoring")
+            try:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_worker()
+        if r.returncode != 0:
+            plog(f"  ✗ worker direct-pg: worker recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            _compose_up_worker()
+            _record('recreate-failed')
+            return None
+
+    # Verify the RUNTIME, not the file: the live container must be running with the new
+    # host. This runs inside the synchronous boot path, so the wait is short. Health
+    # `starting` at the deadline is not a failure — the compose healthcheck's 600s
+    # start_period means Docker cannot report `unhealthy` inside this window anyway;
+    # a worker that cannot reach Postgres shows up as exited/restarting instead.
+    status = ''
+    for _ in range(12):
+        time.sleep(5)
+        h = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-worker-1']), capture_output=True, text=True, timeout=10)
+        status = (h.stdout or '').strip()
+        if status.endswith('healthy') or status.split(' ')[0] in ('exited', 'dead', 'restarting'):
+            break
+    e = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'printenv',
+                                   'AUTHENTIK_POSTGRESQL__HOST']), capture_output=True, text=True, timeout=10)
+    live_host = (e.stdout or '').strip()
+    if not status.startswith('running') or status.endswith('unhealthy') or live_host != 'postgresql':
+        plog(f"  ✗ worker direct-pg: worker {status or 'state unknown'}, live host {live_host!r} — "
+             f"rolling back to PgBouncer")
+        with _authentik_compose_lock('worker-direct-pg-rollback', plog=plog) as _locked:
+            if _locked:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+                _compose_up_worker()
+            else:
+                plog(f"  ✗ worker direct-pg: compose lock busy — rollback NOT applied; "
+                     f"restore {compose_bak} by hand")
+        _record('rolled-back')
+        return None
+    plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
+         f"server unchanged on PgBouncer")
+    _record('applied')
     return True
 
 
@@ -60342,6 +60544,7 @@ entries:
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             _ensure_authentik_pgbouncer(plog)
+            _ensure_authentik_worker_direct_pg(plog)
             plog("  ✓ redis + pgbouncer up inline — no restart needed")
         except Exception as _opt_e:
             plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
@@ -63097,6 +63300,7 @@ def authentik_pgbouncer_api():
     _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6)
     via_bouncer = _probe['via_pgbouncer'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
     direct = _probe['direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
+    worker_direct = _probe['worker_direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
 
     return jsonify({
         'installed': bool(cfg.get('installed')),
@@ -63114,6 +63318,7 @@ def authentik_pgbouncer_api():
         'pgbouncer_container_ip': _probe.get('pgbouncer_ip'),
         'pg_stat_activity_via_pgbouncer': via_bouncer,
         'pg_stat_activity_direct': direct,
+        'pg_stat_activity_worker_direct': worker_direct,
         'pg_stat_activity_by_addr': [{'addr': a, 'count': c} for (a, c) in (_probe.get('by_addr') or [])],
         'pg_stat_activity_probe_error': _probe.get('error'),
         'live_pools_raw': pools_raw,
@@ -81475,6 +81680,15 @@ def _startup_migrations():
                 _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
+
+        # v10.2.1: the worker's task broker needs LISTEN/NOTIFY and session advisory
+        # locks, which PgBouncer's transaction pooling cannot carry — every Authentik
+        # task (password-reset email included) waited up to 30s for pickup. Existing
+        # boxes have the worker on pgbouncer; move it (worker only) to Postgres.
+        try:
+            _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_wd_err:
+            print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
 
         # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
         # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
