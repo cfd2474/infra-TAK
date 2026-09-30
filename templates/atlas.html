@@ -2015,12 +2015,15 @@ function renderChannels(d) {
 
   const parts = [];
   if (d.install_tag) {
-    // ⚠️ Said plainly, because it is the one place the channel does not apply.
-    // A dev-channel operator deploying a new agency gets the pinned release and
-    // an immediate update prompt; without this line that reads as a bug.
-    parts.push('A new deployment always installs ' + d.install_tag
-      + ' — the pin is a verified commit, where a channel is a branch that '
-      + 'moves — and is then offered this channel’s release.');
+    // ⚠️ Said plainly, including the fallback: it is the one case where a
+    // dev-channel operator gets the stable release, and unexplained it reads
+    // as a bug (GH #81).
+    parts.push('A new deployment installs this channel’s release ('
+      + d.install_tag + '), checked against the branch before it is built.');
+    if (d.install_fallback_tag && d.install_fallback_tag !== d.install_tag) {
+      parts.push('If GitHub cannot be reached it installs the pinned '
+        + d.install_fallback_tag + ' instead.');
+    }
   }
   note.textContent = parts.join(' ');
 }
