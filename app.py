@@ -3001,9 +3001,74 @@ def _probe_run(*a, **kw):
     # Up). Route through the shims. No-op as root / when shims absent.
     kw["env"] = _broker_shim_env(kw.get("env"))
     try:
+        if a and len(a) == 1 and _broker_inprocess_eligible(a[0], kw):
+            return _broker_exec_inprocess(a[0], **kw)
         return subprocess.run(*a, **kw)
     except Exception:
         return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
+
+
+# v10.2.2 W4: a probe _sudo_wrap() routed to the broker client is sent over the
+# broker socket from THIS process instead of starting python for the client
+# (test6 p50: 17 ms in-process vs 88 ms through the client). Same request the
+# client sends, same exit-code contract (125 unreachable/garbled, 126 refused,
+# else the command's), same CompletedProcess shape subprocess.run would return.
+# Only plain capturing calls qualify; anything else runs as before.
+_BROKER_INPROCESS_KW = frozenset({'capture_output', 'text', 'universal_newlines', 'encoding',
+                                  'errors', 'timeout', 'env', 'cwd', 'check'})
+
+
+def _broker_client_prefix():
+    return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--']
+
+
+def _broker_inprocess_eligible(args, kw):
+    if not isinstance(args, (list, tuple)) or not kw.get('capture_output'):
+        return False
+    if not set(kw) <= _BROKER_INPROCESS_KW:     # shell, input, stdin, stdout, … -> subprocess
+        return False
+    pre = _broker_client_prefix()
+    return len(args) > len(pre) and list(args[:len(pre)]) == pre
+
+
+def _broker_exec_inprocess(args, capture_output=True, text=False, universal_newlines=None,
+                           encoding=None, errors=None, timeout=None, env=None, cwd=None,
+                           check=False):
+    argv = [os.fsdecode(x) for x in args[len(_broker_client_prefix()):]]
+    req = {'op': 'exec', 'argv': argv,
+           'cwd': os.path.realpath(cwd) if cwd else os.getcwd(), 'input_b64': None}
+    try:
+        _env_t = int((env if env is not None else os.environ).get('TAKWERX_BROKER_TIMEOUT') or 0)
+    except ValueError:
+        _env_t = 0
+    if _env_t > 0:
+        req['timeout'] = min(_env_t, 7200)
+    sock_timeout = timeout if timeout is not None else (req.get('timeout') or 600) + 60
+    try:
+        resp = _broker_request(req, timeout=sock_timeout)
+        if not isinstance(resp, dict):
+            raise ValueError('response is not a JSON object')
+    except _socket.timeout:
+        raise subprocess.TimeoutExpired(args, timeout)
+    except (BrokerError, OSError, ValueError) as e:
+        rc, out, err = 125, b'', f'takwerx_broker: cannot reach broker: {e}\n'.encode()
+    else:
+        if not resp.get('ok'):
+            rc, out = 126, b''
+            err = f"takwerx_broker: {resp.get('code')}: {resp.get('error')}\n".encode()
+        else:
+            rc = int(resp.get('returncode', 0))
+            out = _b64.b64decode(resp.get('stdout_b64') or '')
+            err = _b64.b64decode(resp.get('stderr_b64') or '')
+    if text or universal_newlines or encoding or errors:
+        def _dec(b):
+            s = b.decode(encoding or 'utf-8', errors or 'strict')
+            return s.replace('\r\n', '\n').replace('\r', '\n')
+        out, err = _dec(out), _dec(err)
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, args, out, err)
+    return subprocess.CompletedProcess(args, rc, out, err)
+
 
 def _cleanup_caddy_leftovers():
     """Remove a Caddy that Uninstall All left behind (binary still there, unit disabled
