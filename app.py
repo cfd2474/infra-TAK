@@ -18075,9 +18075,15 @@ _F2B_OWNED_FILTERS = {
         "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
         "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
         "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# v10.2.2: network-level read errors are IGNORED. `recvAddress(..) failed with\n"
+        "# error(-104): Connection reset by peer` (and -103 abort, -110 timeout) is a client\n"
+        "# dropping its TCP connection, which phones do on every tower/network change or app\n"
+        "# suspend. Counting them banned every phone behind one carrier NAT address (field\n"
+        "# report 2026-10-01). Every other error on these lines, including kinds not seen\n"
+        "# yet, still counts.\n"
         "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
         "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
-        "ignoreregex =\n"
+        "ignoreregex = Cause: recvAddress\\(\\.\\.\\) failed with error\\(-\\d+\\)\n"
         "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
         "              {^LN-BEG}\n"
     ),
@@ -18140,6 +18146,20 @@ _F2B_OWNED_FILTERS = {
 # fed, and logging invalid_login, and still matched 0 lines because the on-disk filter
 # was the old login_failed one.
 _F2B_LEGACY_FILTERS = {
+    'takserver': [
+        # v0.9.x–v10.2.1: counted EVERY NioNettyServerHandler error, connection resets
+        # included, so phones behind one carrier NAT address were banned for ordinary
+        # network drops (field report 2026-10-01). Byte-identical on every dev box.
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex =\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n",
+    ],
     'authentik': [
         # v0.9.0–v10.1.11: matched "action": "login_failed", a string Authentik never
         # logs. login_failed is a Django signal name, not a log field. Never matched once.
