@@ -486,7 +486,7 @@ def _copy_presets(plog):
 
 def _video_base(ctx, settings):
     """rtsp://<host>:8554 when MediaMTX or TAK Video Restreamer is installed, else ''."""
-    modules = ctx['detect_modules']()
+    modules = ctx['detect_modules'](fresh=True)
     if not (modules.get('mediamtx', {}).get('installed') or modules.get('tak_video_restreamer', {}).get('installed')):
         return ''
     host = (settings.get('fqdn') or '').strip() or (settings.get('server_ip') or '').strip()
@@ -620,7 +620,7 @@ def deploy(ctx, job, params):
         settings = ctx['load_settings']()
         version = ctx.get('VERSION', 'dev')
         plog('━━━ Step 1/7: Pre-flight ━━━')
-        modules = ctx['detect_modules']()
+        modules = ctx['detect_modules'](fresh=True)
         problems = []
         if not modules.get('takserver', {}).get('installed'):
             problems.append('TAK Server is not installed on this box')

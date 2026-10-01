@@ -91,6 +91,12 @@ def job_state(key):
     return _job(key)
 
 
+def running_jobs():
+    """Keys of modules whose job is in flight. app.py's module-status cache treats a
+    job starting or finishing as a state change (v10.2.2 W2)."""
+    return [k for k, j in list(_JOBS.items()) if j.get('running')]
+
+
 def job_log(key, msg):
     """The ONE plog: timestamped append to the module's job log (+ journal)."""
     entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -158,7 +164,7 @@ def _missing_requirement(desc, ctx):
     if not reqs:
         return None
     try:
-        all_mods = ctx['detect_modules']() or {}
+        all_mods = ctx['detect_modules'](fresh=True) or {}
     except Exception as e:
         print(f"[{desc.get('key')}] requires-check skipped: {str(e)[:200]}", flush=True)
         return None
@@ -190,7 +196,7 @@ def _active_conflict(desc, ctx):
     if not conflicts:
         return None
     try:
-        all_mods = ctx['detect_modules']() or {}
+        all_mods = ctx['detect_modules'](fresh=True) or {}
     except Exception as e:
         print(f"[{desc.get('key')}] conflict-check skipped: {str(e)[:200]}", flush=True)
         return None

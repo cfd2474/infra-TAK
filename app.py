@@ -2981,7 +2981,34 @@ def _probe_run(*a, **kw):
     except Exception:
         return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
 
-def detect_modules():
+def _cleanup_caddy_leftovers():
+    """Remove a Caddy that Uninstall All left behind (binary still there, unit disabled
+    and stopped). v10.2.2 W2: moved out of detect_modules() — a cached or background
+    status read must never delete anything. Runs at startup and after Uninstall All."""
+    _run = _probe_run
+    try:
+        if _run(['which', 'caddy'], capture_output=True).returncode != 0:
+            return
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
+        if (r.stdout or '').strip() == 'active':
+            return
+        r = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
+        if (r.stdout or '').strip() != 'disabled':
+            return
+        for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
+            if os.path.exists(path):
+                _run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)  # v10.0.5 non-root: /usr root-owned
+        if os.path.exists('/etc/caddy'):
+            _run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
+        _run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+        print('Caddy: removed leftovers of an uninstall (binary present, unit disabled + stopped)', flush=True)
+    except Exception as e:
+        print(f'Caddy leftover cleanup skipped: {str(e)[:200]}', flush=True)
+    _invalidate_modules_cache()
+
+
+def _detect_modules_uncached():
+    """Probe every module's install/run state. Callers use detect_modules()."""
     _run = _probe_run
     modules = {}
     settings = load_settings()
@@ -2993,15 +3020,10 @@ def detect_modules():
         r = _run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         caddy_running = r.stdout.strip() == 'active'
         # Leftover from uninstall-all? (binary still there but service disabled and stopped)
+        # -> report not installed. Read-only: _cleanup_caddy_leftovers() removes it.
         if not caddy_running:
-            re = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
-            if (re.stdout or '').strip() == 'disabled':
-                for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
-                    if os.path.exists(path):
-                        _run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)  # v10.0.5 non-root: /usr root-owned
-                if os.path.exists('/etc/caddy'):
-                    _run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
-                _run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+            _en = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
+            if (_en.stdout or '').strip() == 'disabled':
                 caddy_installed = False
     modules['caddy'] = {'name': 'Caddy SSL', 'installed': caddy_installed, 'running': caddy_running,
         'description': "Domain setup, Let's Encrypt SSL & reverse proxy" if not has_fqdn else f"SSL & reverse proxy — {settings.get('fqdn', '')}",
@@ -3392,6 +3414,112 @@ def detect_modules():
     }
 
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
+
+
+# ---------------------------------------------------------------------------
+# v10.2.2 W2: module-status cache
+# ---------------------------------------------------------------------------
+# The sidebar context processor called detect_modules() on EVERY page and 21 module
+# pages called it again — ~24 probes each, no cache (test6 /help = 24 broker calls).
+# Stale-while-revalidate: fresh data is reused; stale data is served once while ONE
+# background refresh runs; no data computes synchronously. Nothing refreshes on a
+# timer, so an idle console does no probing.
+#
+# The cache is dropped (next caller computes synchronously) when module state can
+# have changed through the console:
+#   * any POST/PUT/PATCH/DELETE request — synchronous start/stop/restart/uninstall
+#     (_modules_cache_after_mutation);
+#   * a job starting or finishing — the set of running jobs is part of the cache key,
+#     found the way console_restart_safe() finds them (every `*_status` dict with
+#     running=True, plus registry jobs), so new deploy-status globals are covered
+#     without hand-instrumenting their completion paths.
+# Decision callers (Caddyfile generation, deploy gates, the Authentik orphan GC,
+# migrations) pass fresh=True: stale "Authentik not installed" once dropped
+# forward_auth from the console vhost, and the GC deletes Authentik apps.
+import copy as _copy
+
+_MODULES_CACHE_FRESH_S = 15
+_MODULES_CACHE_REFRESH_STUCK_S = 120   # a refresh this old is presumed hung; allow another
+_MODULES_CACHE = {'data': None, 'at': 0.0, 'jobs': None, 'gen': 0, 'refreshing': 0.0}
+_MODULES_CACHE_LOCK = threading.Lock()
+
+
+def _modules_running_jobs():
+    """frozenset of in-flight job names, or None when it cannot be determined."""
+    try:
+        names = {_n for _n, _v in list(globals().items())
+                 if _n.endswith('_status') and isinstance(_v, dict) and _v.get('running')}
+    except Exception:
+        return None
+    try:
+        names |= {f'module:{k}' for k in mod_registry.running_jobs()}
+    except Exception:
+        pass   # registry not loaded yet (boot)
+    return frozenset(names)
+
+
+def _invalidate_modules_cache():
+    """Drop cached module status. Bumps the generation so a refresh already in flight
+    (started before the change) cannot store what it saw."""
+    with _MODULES_CACHE_LOCK:
+        _MODULES_CACHE['gen'] += 1
+        _MODULES_CACHE['data'] = None
+
+
+def _modules_cache_compute(gen, jobs):
+    data = _detect_modules_uncached()
+    with _MODULES_CACHE_LOCK:
+        if _MODULES_CACHE['gen'] == gen:
+            _MODULES_CACHE.update({'data': data, 'at': time.monotonic(), 'jobs': jobs})
+    return data
+
+
+def _modules_cache_refresh_bg(gen, jobs):
+    try:
+        _modules_cache_compute(gen, jobs)
+    except Exception as e:
+        print(f'detect_modules: background refresh failed: {str(e)[:200]}', flush=True)
+    finally:
+        with _MODULES_CACHE_LOCK:
+            _MODULES_CACHE['refreshing'] = 0.0
+
+
+def detect_modules(fresh=False):
+    """Install/run state of every module, keyed by module, sorted by priority.
+
+    Cached (see above). fresh=True probes now, for callers that ACT on the answer.
+    Always returns a private copy — callers may mutate it."""
+    jobs = _modules_running_jobs()
+    start_bg = False
+    with _MODULES_CACHE_LOCK:
+        gen = _MODULES_CACHE['gen']
+        data = _MODULES_CACHE['data']
+        usable = (not fresh and data is not None and jobs is not None
+                  and _MODULES_CACHE['jobs'] == jobs)
+        if usable:
+            now = time.monotonic()
+            busy = _MODULES_CACHE['refreshing']
+            if (now - _MODULES_CACHE['at'] >= _MODULES_CACHE_FRESH_S
+                    and (not busy or now - busy > _MODULES_CACHE_REFRESH_STUCK_S)):
+                _MODULES_CACHE['refreshing'] = now
+                start_bg = True
+    if not usable:
+        return _copy.deepcopy(_modules_cache_compute(gen, jobs))
+    if start_bg:
+        try:
+            threading.Thread(target=_modules_cache_refresh_bg, args=(gen, jobs),
+                             daemon=True, name='detect-modules-refresh').start()
+        except Exception:
+            with _MODULES_CACHE_LOCK:
+                _MODULES_CACHE['refreshing'] = 0.0
+    return _copy.deepcopy(data)
+
+
+@app.after_request
+def _modules_cache_after_mutation(response):
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        _invalidate_modules_cache()
+    return response
 
 # Height of the fixed identification bar. Any OTHER fixed top bar must stack below
 # it and add this to its own offset — see _custom_banner_height().
@@ -24538,7 +24666,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         try:
             settings = load_settings()
             fqdn = (settings.get('fqdn') or '').strip()
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if fqdn and ak_installed:
                 plog('━━━ Enable Authentik OAuth (auto) ━━━')
                 reachable, ak_err = _check_authentik_api_reachable(settings)
@@ -26466,7 +26594,7 @@ def caddy_update_domain():
     settings['fqdn'] = domain
     save_settings(settings)
     generate_caddyfile(settings)
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     if modules.get('authentik', {}).get('installed'):
         def _sync_ak_after_domain():
             time.sleep(3)
@@ -30155,7 +30283,7 @@ def generate_caddyfile(settings=None):
     domain = settings.get('fqdn', '')
     if not domain:
         return
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)   # decides forward_auth per vhost
 
     # v10.1.41 — the operator's ACME issuer, if they set one, MUST come first: Caddy rejects
     # a global options block that is not the first block ("server block without any key is
@@ -35278,7 +35406,7 @@ def mediamtx_deploy_api():
     # marketplace greys the card, but this route is reachable by direct curl.
     # Fails OPEN: a transient detection error must never brick a deploy.
     try:
-        _tvr_installed = detect_modules().get('tak_video_restreamer', {}).get('installed')
+        _tvr_installed = detect_modules(fresh=True).get('tak_video_restreamer', {}).get('installed')
     except Exception:
         _tvr_installed = False
     if _tvr_installed:
@@ -36511,7 +36639,7 @@ WantedBy=multi-user.target
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', webeditor_dir]),
                        capture_output=True, timeout=10)
 
-        modules = detect_modules()
+        modules = detect_modules(fresh=True)
         ak = modules.get('authentik', {})
         ldap_available = bool(ak.get('installed'))
         if ldap_available:
@@ -56181,7 +56309,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
 
         # Install snapshot for orphan GC below (computed once, not per-service).
         try:
-            _installed_now = detect_modules()
+            _installed_now = detect_modules(fresh=True)   # the GC below DELETES apps
         except Exception:
             _installed_now = {}
 
@@ -67467,7 +67595,7 @@ def takserver_create_client_cert():
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
     """After Authentik reconfigure, regenerate Caddyfile and reload Caddy. Does NOT touch TAK Server or 8446 cert."""
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     if not modules.get('takserver', {}).get('installed'):
         return
     try:
@@ -67504,7 +67632,7 @@ def takserver_update_config():
     """Sync Caddy + 8446 cert to current TAK Server domain and restart TAK Server. Use after changing TAK Server domain in Caddy/Domains."""
     if takserver_update_config_status.get('running'):
         return jsonify({'error': 'Update already in progress'}), 409
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     tak = modules.get('takserver', {})
     if not tak.get('installed'):
         return jsonify({'error': 'TAK Server not installed'}), 400
@@ -74142,7 +74270,7 @@ def _deploy_takserver_container(config):
         # serves the self-signed PKI cert). Order mirrors the .deb deploy.
         # Auto-connect to LDAP if Authentik is already deployed
         try:
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if ak_installed and not _coreconfig_has_ldap():
                 log_step(""); log_step("━━━ Connecting TAK Server to LDAP (Authentik detected) ━━━")
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
@@ -74898,7 +75026,7 @@ def run_takserver_deploy(config):
 
         # Auto-connect to LDAP if Authentik is already deployed
         try:
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if ak_installed and not _coreconfig_has_ldap():
                 log_step("Authentik detected — connecting TAK Server to LDAP...")
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
@@ -76832,6 +76960,7 @@ def run_full_uninstall():
         save_settings(settings)
         caddy_deploy_log.clear()
         caddy_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        _cleanup_caddy_leftovers()   # v10.2.2 W2: no longer a side effect of detect_modules()
         plog("✓ Caddy removed")
 
         plog("")
@@ -81330,6 +81459,9 @@ def _startup_migrations():
                 print("Startup migration: ⚠ broker not mediating exec after 30s — broker-dependent "
                       "migrations may fail and will retry on the next console restart", flush=True)
 
+        # v10.2.2 W2: was a side effect of every detect_modules() call.
+        _cleanup_caddy_leftovers()
+
         s = load_settings()
         settings_dirty = False
 
@@ -81604,7 +81736,7 @@ def _startup_migrations():
         # fleet without a MediaMTX redeploy). Idempotent; flag-gated.
         if (s.get('fqdn') or '').strip() and not s.get('caddy_hls_encfix_v1'):
             try:
-                if detect_modules().get('mediamtx', {}).get('installed'):
+                if detect_modules(fresh=True).get('mediamtx', {}).get('installed'):
                     _hcf = generate_caddyfile(s)
                     _caddy_reload()
                     _hls_https = ('reverse_proxy https://' in (_hcf or '') and 'tls_server_name' in (_hcf or ''))
