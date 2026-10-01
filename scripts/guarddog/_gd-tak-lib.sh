@@ -295,7 +295,13 @@ gd_tak_running() {
 gd_tak_pgrep() {
   local pat="$1"
   if gd_is_container; then
-    docker exec "$GD_TAK_CONTAINER" pgrep -f "$pat" >/dev/null 2>&1
+    # v10.2.1: NOT `docker exec … pgrep` — the TAK image ships neither pgrep nor ps, so that
+    # failed (rc 127) on every check and tak-process-watch restarted a HEALTHY containerised
+    # TAK Server about hourly, up to its 3/day cap (aws-arm: "missing processes:
+    # messaging,api,config,plugins,retention (339 failures) - restarting"). `docker top` runs
+    # ps on the HOST against the container's processes; it needs the pid column or it errors
+    # ("Couldn't find PID field in ps output").
+    docker top "$GD_TAK_CONTAINER" -eo pid,args 2>/dev/null | grep -qF -- "$pat"
   else
     pgrep -f "$pat" >/dev/null 2>&1
   fi
