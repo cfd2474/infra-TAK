@@ -7632,6 +7632,40 @@ def _diag_worker():
             _DIAG_JOB['running'] = False
 
 
+def _diag_filename(generated_at):
+    """infratak-diagnostics-<fqdn>-<UTC>.txt — the same name for the download and the attachment."""
+    name = re.sub(r'[^A-Za-z0-9.-]', '_', load_settings().get('fqdn') or 'box')
+    return f"infratak-diagnostics-{name}-{re.sub(r'[^0-9T]', '', generated_at or '')}.txt"
+
+
+def _diag_build_email(to_addr, subject, report, filename):
+    """The report in the body (readable on a phone with nothing to open) AND as a .txt
+    attachment (easy to save and forward). `to_addr` must already be validated."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    relay = load_settings().get('email_relay') or {}
+    from_addr = relay.get('from_addr') or 'noreply@localhost'
+    msg = MIMEMultipart()
+    msg['From'] = f"{relay.get('from_name') or 'infra-TAK'} <{from_addr}>"
+    msg['To'] = to_addr
+    msg['Subject'] = re.sub(r'[\r\n]+', ' ', subject)
+    msg.attach(MIMEText(report, 'plain', 'utf-8'))
+    part = MIMEText(report, 'plain', 'utf-8')
+    part.add_header('Content-Disposition', 'attachment', filename=filename)
+    msg.attach(part)
+    return from_addr, msg
+
+
+def _diag_send_email(to_addr, subject, report, filename):
+    """Send through the Email Relay (localhost:25 → Postfix), the same path Guard Dog uses.
+    Its own sender because _guarddog_send_alert_email_via_relay sends a body only, and Guard
+    Dog's alert path is not changed by this feature (PLAN-v10.2.1 §2)."""
+    import smtplib
+    from_addr, msg = _diag_build_email(to_addr, subject, report, filename)
+    with smtplib.SMTP('localhost', 25, timeout=30) as smtp:
+        smtp.sendmail(from_addr, [to_addr], msg.as_string())
+
+
 @app.route('/api/support/diagnostics/run', methods=['POST'])
 @login_required
 def support_diagnostics_run():
@@ -7659,10 +7693,8 @@ def support_diagnostics_download():
         report, when = _DIAG_JOB['report'], _DIAG_JOB['generated_at']
     if not report:
         return jsonify({'success': False, 'error': 'Run diagnostics first'}), 404
-    name = re.sub(r'[^A-Za-z0-9.-]', '_', load_settings().get('fqdn') or 'box')
-    stamp = re.sub(r'[^0-9T]', '', when or '')
     return Response(report, mimetype='text/plain', headers={
-        'Content-Disposition': f'attachment; filename="infratak-diagnostics-{name}-{stamp}.txt"'})
+        'Content-Disposition': f'attachment; filename="{_diag_filename(when)}"'})
 
 
 @app.route('/api/support/diagnostics/email', methods=['POST'])
@@ -7679,12 +7711,12 @@ def support_diagnostics_email():
     if not (relay.get('relay_host') and relay.get('smtp_user')):
         return jsonify({'success': False, 'error': 'Email Relay is not configured on this box — use Download instead'}), 400
     with _DIAG_LOCK:
-        report = _DIAG_JOB['report']
+        report, when = _DIAG_JOB['report'], _DIAG_JOB['generated_at']
     if not report:
         return jsonify({'success': False, 'error': 'Run diagnostics first'}), 400
     subject = f"infra-TAK diagnostics — {settings.get('fqdn') or settings.get('server_ip') or 'box'} — v{VERSION}"
     try:
-        _guarddog_send_alert_email_via_relay(to, subject, report, force=True)
+        _diag_send_email(to, subject, report, _diag_filename(when))
     except Exception as e:
         return jsonify({'success': False, 'error': f'Send failed: {str(e)[:200]}'}), 500
     print(f'[diagnostics] report emailed to {to}', flush=True)
