@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.0-alpha)**
+**Current release: [v10.2.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.1-alpha — 2026-10-01 — Faster password-reset emails, a one-click diagnostics report, and Guard Dog stops restarting healthy containerised TAK Servers
+
+**Headline: password-reset emails and every other Authentik background task now start within a second instead of waiting up to thirty, and the Help page can produce a full diagnostics report you can read, download or email to support — no SSH needed.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.1-alpha))
+
+**Authentik tasks.** Authentik's background worker talked to its database through the connection pooler, which cannot pass on the database's "new task" notifications. So the worker only noticed new work on a 30-second fallback check — every password-reset email, every event and every scheduled job waited up to half a minute before it even started, and the worker's per-task locks were released on the wrong connection. The worker now connects to the database directly while the Authentik web server stays on the pooler. Applied automatically on the next console restart; nothing to configure.
+
+**Help → Diagnostics.** A new first card on the Help page runs a read-only report of the whole box — versions, connectivity and certificates, firewall and bans, every container, Authentik and LDAP (including the webadmin account, lock-out state and live bind tests), TAK Server clients and TLS/enrollment errors grouped by client, TAK Portal, Email Relay and Guard Dog. Read it on the page, download it, or email it through your Email Relay — the report is in the body and attached as a `.txt` file. It changes nothing on the server, and passwords, tokens and keys are removed before anyone sees it.
+
+**Guard Dog and containerised TAK Server.** On deployments that run TAK Server in a container (including every ARM64 install), Guard Dog's process check looked for TAK's processes with a tool the TAK image does not include, so it concluded TAK was down and restarted a healthy server up to three times a day. It now checks from the host and sees TAK correctly. The fix reaches existing installs on the next console restart.
+
+**ATLAS.** A fresh ATLAS install now installs the current release of the channel you selected — exactly as an update does — instead of a version fixed when the console was built, and checks that the release tag matches the channel before building (issue #81).
+
+> **Upgrade note.** Update the console as usual. The Authentik and Guard Dog changes apply on the console restart that follows; the Authentik worker restarts once (a few seconds of background-task pause, no login interruption). Find Diagnostics under **Help**.
 
 ### v10.2.0-alpha — 2026-09-27 — TAK Server 5.8 and PostgreSQL 18, upgraded from the browser
 
