@@ -82,3 +82,10 @@ def test_the_old_shipped_filter_is_upgraded_by_the_startup_self_heal():
     old = legacy[0]
     assert all(_banned(old, l) for l in RESETS)          # the bug the legacy entry records
     assert 'ignoreregex =\n' in old
+
+
+def test_every_legacy_upgrade_has_an_accurate_reason_for_the_log():
+    why = _table('_F2B_UPGRADE_WHY')
+    assert set(_table('_F2B_LEGACY_FILTERS')) <= set(why)
+    assert 'banning nobody' not in why['takserver']
+    assert 'resets' in why['takserver']

@@ -18190,6 +18190,15 @@ _F2B_LEGACY_FILTERS = {
 }
 
 
+# One line per legacy upgrade, for the self-heal's log (what was wrong with the old text).
+_F2B_UPGRADE_WHY = {
+    'authentik': 'authentik: the old pattern could never match a real log line, so the jail banned nobody',
+    'mediamtx-rtsp': 'mediamtx-rtsp: the old pattern counted successful stream opens, banning legitimate viewers',
+    'takserver': 'takserver: the old pattern counted dropped connections (resets) as attacks, banning phones '
+                 'behind shared carrier addresses; handshake and non-TLS errors still count',
+}
+
+
 def _f2b_enabled_jail_files():
     """[(jail_name, filter_name, path)] for every enabled infratak-*.conf jail."""
     out = []
@@ -18700,9 +18709,13 @@ def _f2b_selfheal_filters(plog=None):
              ' — those jails were enabled but skipped on every reload, so they were '
              'protecting nothing.')
     if upgraded:
+        # v10.2.2: say what changed per filter. The old one-size message ("could never match …
+        # banning nobody") was true of authentik/mediamtx and FALSE for takserver, which banned
+        # too much — an operator chasing a ban would have been sent the wrong way.
         _log('fail2ban: UPGRADED stale filter(s) ' + ', '.join(upgraded) +
-             ' — the shipped pattern could never match a real log line, so those jails '
-             'were loaded and healthy-looking while banning nobody.')
+             ' to the corrected pattern we now ship — ' +
+             '; '.join(_F2B_UPGRADE_WHY.get(u.split(' ')[0], 'see the comment in the new filter')
+                       for u in upgraded) + '.')
     try:
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
     except Exception:
