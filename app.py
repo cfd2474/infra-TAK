@@ -7362,6 +7362,38 @@ def _diag_tail(path, max_bytes=_DIAG_TAIL_BYTES):
     return lines[1:] if size > max_bytes else lines
 
 
+def _diag_unreadable(path):
+    """Why _diag_tail() returned None: the file is missing, or this console may not read it."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        pass
+    return 'not readable by the console on this box'
+
+
+def _diag_top(n=10):
+    """CPU summary + busiest processes over a 1 s sample (top's 2nd iteration — its 1st is
+    since-boot averages). Program names only: full command lines can carry secrets."""
+    raw = _diag_cmd(['top', '-b', '-n', '2', '-d', '1', '-o', '%CPU', '-w', '200'], priv=False)
+    lines = raw.splitlines()
+    starts = [i for i, l in enumerate(lines) if l.startswith('top - ')]
+    if len(starts) < 2:
+        return ['top: ' + (raw[:200] or 'no output')]
+    it = lines[starts[-1]:]
+    out = [l.strip() for l in it if l.startswith('%Cpu')][:1]
+    hdr = next((i for i, l in enumerate(it) if l.split()[:2] == ['PID', 'USER']), None)
+    if hdr is None:
+        return out
+    out.append('busiest processes (1 s sample): %CPU %MEM user command')
+    for l in it[hdr + 1:hdr + 1 + n]:
+        f = l.split()
+        if len(f) >= 12:
+            out.append(f"  {f[8]:>6} {f[9]:>5} {f[1][:12]:<12} {' '.join(f[11:])[:40]}")
+    return out
+
+
 def _diag_tak_log_window(lines, hours=3):
     """TAK log lines from the last `hours`, keeping stack-trace continuation lines with the
     entry they belong to (they carry no timestamp of their own)."""
@@ -7471,6 +7503,7 @@ def _diag_section_box(settings):
                f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
     out.append(f"uptime since: {datetime.fromtimestamp(psutil.boot_time()).strftime('%Y-%m-%d %H:%M')}  "
                f"load: {' '.join(f'{x:.2f}' for x in os.getloadavg())}")
+    out.extend(_diag_top())
     for mp in ('/', '/opt', '/var/lib/docker', os.path.expanduser('~')):
         try:
             du = psutil.disk_usage(mp)
@@ -7579,8 +7612,13 @@ def _diag_section_containers(settings):
     rows = [l.split('|') for l in ps.splitlines() if l.count('|') == 2]
     if not rows:
         return [ps or '(no containers)']
+    st = _diag_cmd(['docker', 'stats', '--no-stream', '--format', '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}'],
+                   timeout=30)
+    use = {f[0]: (f[1], f[2].split('/')[0].strip()) for f in (l.split('|') for l in st.splitlines())
+           if len(f) == 3}
     w = max(len(r[0]) for r in rows)
-    return [f"{r[0].ljust(w)}  {r[1][:45].ljust(45)}  {r[2]}" for r in sorted(rows)]
+    return [f"{r[0].ljust(w)}  {r[1][:45].ljust(45)}  cpu {use.get(r[0], ('-', ''))[0]:>7}  "
+            f"mem {use.get(r[0], ('', '-'))[1]:>10}  {r[2]}" for r in sorted(rows)]
 
 
 def _diag_section_authentik(settings):
@@ -7722,7 +7760,7 @@ def _diag_section_takserver(settings):
     for log in ('takserver-messaging.log', 'takserver-api.log'):
         lines = _diag_tail('/opt/tak/logs/' + log)
         if lines is None:
-            out.append(f"{log}: not readable by the console on this box")
+            out.append(f"{log}: {_diag_unreadable('/opt/tak/logs/' + log)}")
             continue
         hits = [l for l in _diag_tak_log_window(lines)
                 if not frame.search(l) and not noise.search(l)
@@ -7788,13 +7826,17 @@ def _diag_section_guarddog(settings):
     out = [f"deployed version: {settings.get('guarddog_deployed_version') or '?'}"]
     timers = _diag_cmd(['systemctl', 'list-timers', '--all', '--no-pager', '--plain', 'tak*'], priv=False)
     out.append(f"timers: {len([l for l in timers.splitlines() if '.timer' in l])}")
-    lines = _diag_tail('/var/log/takguard/watchdog.log', 512 * 1024)
+    # restarts.log is Guard Dog's event log — every watcher appends its restarts/alerts there.
+    # (10.2.1 read watchdog.log, which nothing writes: every box reported it "not readable".)
+    log = '/var/log/takguard/restarts.log'
+    lines = _diag_tail(log, 512 * 1024)
     if lines is None:
-        out.append('watchdog.log: not readable by the console on this box')
+        out.append(f"restarts.log: {_diag_unreadable(log)}")
     else:
-        alerts = [l for l in lines if 'ALERT' in l]
-        out.append(f"ALERT lines in the recent log: {len(alerts)}")
-        out.extend('  ' + l[:240] for l in alerts[-10:])
+        ev = [l for l in lines if re.search(r'restart|alert|fail|unhealthy|missing|down', l, re.I)
+              and 'fail2ban: Banned' not in l]
+        out.append(f"restarts.log: {len(ev)} restart/alert line(s) in the recent tail")
+        out.extend('  ' + l[:240] for l in ev[-15:])
     return out
 
 
