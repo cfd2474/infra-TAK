@@ -70055,7 +70055,11 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         # 2. Backup — verified, not assumed. Refuse to continue without one.
         _say('')
         _say('Backing up before anything is changed…')
-        bk = _tak_58_backup(plog=_tak58_log)
+        # v10.2.2: `_say`, not `_tak58_log`. Driven by the Update button, `_log` is the page's
+        # panel and tak58_log is a list nobody polls — every snapshot line, including the
+        # pg_dump error itself, went there (field: lutak.net 2026-10-01 saw only "captured NO
+        # database dump" with no reason).
+        bk = _tak_58_backup(plog=_say)
         if not bk.get('ok'):
             return fail('Backup failed — refusing to migrate without one. %s'
                         % (bk.get('error') or ''))
@@ -70075,7 +70079,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
                    + shlex.quote(pkg_path) + ' 2>&1')
         rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
-                                               tak58_log, timeout_sec=1800)
+                                               _log, timeout_sec=1800)
         # The package is EXPECTED to complain about pg15 and stop short — that is
         # the documented 5.8 behaviour, not an install failure. The database
         # script below is what finishes it, so a non-zero rc here is reported and
@@ -71161,16 +71165,26 @@ def _tak_snapshot(label, plog=None):
             except Exception as _pg_e:
                 plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:200]} — db_dump=False (config+certs captured)")
         else:
-            with open(pg_dump_path, 'wb') as _f:
-                r2 = subprocess.run(
-                    'sudo -u postgres pg_dump -Fc cot',
-                    shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
-                )
-            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+            # Root console. v10.2.2: the SAME command and window the broker uses for the
+            # non-root path (_do_pg_dump: runuser argv, 600 s) — this branch had a shell
+            # `sudo -u postgres` with a 300 s cap, and its TimeoutExpired surfaced only as a
+            # bare "pg_dump exception". No dev box runs as root, so T&E never exercised it.
+            r2 = None
+            try:
+                with open(pg_dump_path, 'wb') as _f:
+                    r2 = subprocess.run(['runuser', '-u', 'postgres', '--', 'pg_dump', '-Fc', 'cot'],
+                                        stdout=_f, stderr=subprocess.PIPE, cwd='/', timeout=600)
+            except subprocess.TimeoutExpired:
+                plog("  snapshot: pg_dump did not finish within 10 min — db_dump=False. A long "
+                     "VACUUM FULL / repack holding locks on the cot database is the usual cause; "
+                     "let it finish and retry.")
+            if r2 is not None and r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
                 meta['db_dump'] = True
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
             else:
-                plog(f"  snapshot: pg_dump FAILED: {(r2.stderr or b'').decode()[:200]}")
+                if r2 is not None:
+                    plog(f"  snapshot: pg_dump FAILED (exit {r2.returncode}): "
+                         f"{(r2.stderr or b'').decode(errors='replace').strip()[:300]}")
                 try: os.remove(pg_dump_path)
                 except Exception: pass
     except Exception as e:
