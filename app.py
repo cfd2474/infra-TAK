@@ -666,15 +666,39 @@ def _read_coreconfig(path=CORECONFIG_PATH):
     keep their existing FileNotFoundError / 'coreconfig_unreadable' semantics —
     an unreadable CoreConfig must surface as an error, never as "no LDAP".
     Writes already go through _write_priv(); this is the read half of that pair.
+
+    v10.2.2 W3: cached by the file's stat identity (inode, mtime, ctime, size) —
+    23 call sites and the background pollers re-read it through the broker
+    (test6: 134 broker reads per 2,000 audit lines). stat needs only traverse on
+    /opt/tak, not read on the 640 file (verified test6 + nuc as takwerx). Stat
+    BEFORE reading, so a write racing the read can only cause a key mismatch on
+    the next call, never a stale hit. stat fails -> no cache, read as before.
     """
     try:
+        st = os.stat(path)
+        key = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        hit = _CORECONFIG_CACHE.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+    try:
         with open(path, 'r', encoding='utf-8') as f:
-            return f.read()
+            text = f.read()
     except OSError as direct_err:
         try:
-            return _read_priv(path)
+            text = _read_priv(path)
         except Exception:
             raise direct_err
+    if key is not None:
+        if len(_CORECONFIG_CACHE) >= 8 and path not in _CORECONFIG_CACHE:
+            _CORECONFIG_CACHE.clear()
+        _CORECONFIG_CACHE[path] = (key, text)
+    return text
+
+
+_CORECONFIG_CACHE = {}   # path -> ((ino, mtime_ns, ctime_ns, size), text); see _read_coreconfig
 
 
 def _makedirs_priv(path, mode=None, exist_ok=True):
