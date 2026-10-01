@@ -7760,7 +7760,7 @@ def _diag_section_takserver(settings):
     except Exception:
         method = '?'
     if not os.path.exists('/opt/tak') and not _tak_is_container():
-        return ['TAK Server not installed on this box']
+        return ['TAK Server not installed on this box'] + _diag_tak_update_history()
     out = [f"install method: {method}"]
     ver = _diag_cmd(['dpkg-query', '-W', '-f=${Version}', 'takserver'], priv=False) if shutil.which('dpkg-query') \
         else _diag_cmd(['rpm', '-q', 'takserver'], priv=False)
@@ -7833,6 +7833,30 @@ def _diag_section_takserver(settings):
         if hits:
             out.append('  newest:')
             out.extend('    ' + l[:320] for l in hits[-6:])
+    out.extend(_diag_tak_update_history())
+    return out
+
+
+def _diag_tak_update_history(tail=150):
+    """v10.2.2 W9: recent TAK Server update runs + the log of the latest that did not
+    succeed (recorded by _tak_update_job; redacted with the rest of the report)."""
+    out = []
+    if upgrade_status.get('running') or tak58_status.get('running'):
+        out.append('TAK Server update: one is RUNNING right now — its log is recorded when it ends')
+    hist = _tak_update_history()
+    if not hist:
+        out.append('TAK Server updates recorded by this console: none (recording began in v10.2.2)')
+        return out
+    out.append('TAK Server updates recorded by this console (newest first):')
+    for h in hist:
+        out.append(f"  {h.get('finished', '?')}  {h.get('result', '?')}  {h.get('kind', '?')}  "
+                   f"{h.get('package') or '-'}  ({h.get('seconds', '?')} s)")
+    bad = next((h for h in hist if h.get('result') != 'ok'), None)
+    if bad:
+        lines = bad.get('lines') or []
+        out.append(f"log of the latest update that did not succeed ({bad.get('finished')}, "
+                   f"{bad.get('kind')}), last {min(len(lines), tail)} of {bad.get('total_lines', len(lines))} lines:")
+        out.extend('    ' + str(l)[:300] for l in lines[-tail:])
     return out
 
 
@@ -68460,6 +68484,74 @@ upgrade_status = {'running': False, 'complete': False, 'error': False}
 tak_migrate_log = []
 tak_migrate_status = {'running': False, 'complete': False, 'error': False}
 
+# ── v10.2.2 W9: every TAK Server update leaves a record Diagnostics can read ──────
+# A failed update used to leave its log only in this process's memory: visible in the
+# one browser tab that started it, gone at the next console restart, and nowhere in a
+# Diagnostics report. (Field 2026-10-01: a customer's 5.8 upgrade failed; all we had was
+# a screenshot of three lines.) Each update worker now ends by saving its result and the
+# tail of its log to .config/ — console-owned, mode 600 — and Help → Diagnostics lists the
+# recent runs and the log of the latest one that did not succeed, through the same
+# redaction as the rest of the report.
+TAK_UPDATE_HISTORY = os.path.join(CONFIG_DIR, 'takserver_update_history.json')
+_TAK_UPDATE_HISTORY_KEEP = 5
+_TAK_UPDATE_HISTORY_LINES = 400
+_TAK_UPDATE_HISTORY_LOCK = threading.Lock()
+
+
+def _tak_update_history():
+    """Recorded TAK Server update runs, newest first ([] when none or unreadable)."""
+    try:
+        with open(TAK_UPDATE_HISTORY) as f:
+            h = json.load(f)
+        return h if isinstance(h, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _tak_update_record(kind, pkg, log, status, started, exc=None):
+    lines = [str(l) for l in list(log)]
+    if exc is not None:
+        result = 'CRASHED (%s: %s)' % (type(exc).__name__, str(exc)[:160])
+    elif any('MID-UPGRADE' in l for l in lines):
+        result = 'FAILED (left mid-upgrade)'
+    elif status.get('error'):
+        result = 'FAILED'
+    elif status.get('complete'):
+        result = 'ok'
+    else:
+        result = 'unfinished'
+    entry = {'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
+             'finished': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+             'seconds': int(time.time() - started), 'kind': kind,
+             'package': os.path.basename(pkg or ''), 'result': result,
+             'total_lines': len(lines), 'lines': lines[-_TAK_UPDATE_HISTORY_LINES:]}
+    with _TAK_UPDATE_HISTORY_LOCK:
+        hist = [entry] + _tak_update_history()
+        tmp = TAK_UPDATE_HISTORY + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(hist[:_TAK_UPDATE_HISTORY_KEEP], f)
+        os.replace(tmp, TAK_UPDATE_HISTORY)
+
+
+def _tak_update_job(kind, target, log, status):
+    """Thread target for a TAK Server update worker: run it, then record how it ended —
+    success, failure, or an exception (recorded, then re-raised)."""
+    def run(*a, **kw):
+        started, exc = time.time(), None
+        try:
+            target(*a, **kw)
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            try:
+                _tak_update_record(kind, a[0] if a and isinstance(a[0], str) else '',
+                                   log, status, started, exc)
+            except Exception as _re:
+                print(f'TAK Server update: record not saved ({_re})', flush=True)
+    return run
+
 plugin_install_log = []
 plugin_install_status = {'running': False, 'complete': False, 'error': False}
 
@@ -70326,7 +70418,8 @@ def takserver_58_migrate():
         pkgs, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
     tak58_log.clear()
     tak58_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_takserver_58_migration, args=(pkg,), daemon=True).start()
+    threading.Thread(target=_tak_update_job('5.8 migration', run_takserver_58_migration, tak58_log, tak58_status),
+                     args=(pkg,), daemon=True).start()
     return jsonify({'success': True, 'package': os.path.basename(pkg)})
 
 
@@ -70451,7 +70544,8 @@ def takserver_update():
             _zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_58_container_migration,
+        threading.Thread(target=_tak_update_job('5.8 migration (container)', run_takserver_58_container_migration,
+                                                upgrade_log, upgrade_status),
                          args=(_zip,), kwargs={'log': upgrade_log, 'status': upgrade_status},
                          daemon=True).start()
         return jsonify({'success': True, 'migration': True, 'container': True,
@@ -70490,7 +70584,8 @@ def takserver_update():
                                          'both, then try again.'}), 400
             upgrade_log.clear()
             upgrade_status.update({'running': True, 'complete': False, 'error': False})
-            threading.Thread(target=run_takserver_58_two_server_migration,
+            threading.Thread(target=_tak_update_job('5.8 migration (two-server)', run_takserver_58_two_server_migration,
+                                                    upgrade_log, upgrade_status),
                              args=(os.path.join(UPLOAD_DIR, _core),
                                    os.path.join(UPLOAD_DIR, _dbp), _s1, _ts_cfg),
                              kwargs={'log': upgrade_log, 'status': upgrade_status},
@@ -70509,7 +70604,7 @@ def takserver_update():
             key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_58_migration,
+        threading.Thread(target=_tak_update_job('5.8 migration', run_takserver_58_migration, upgrade_log, upgrade_status),
                          args=(_pkg,), kwargs={'log': upgrade_log, 'status': upgrade_status},
                          daemon=True).start()
         return jsonify({'success': True, 'migration': True,
@@ -70531,7 +70626,8 @@ def takserver_update():
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
+        threading.Thread(target=_tak_update_job('upgrade (container)', run_takserver_upgrade_container, upgrade_log, upgrade_status),
+                         args=(_zip,), daemon=True).start()
         return jsonify({'success': True})
     # RHEL/Rocky native: upgrade from the new takserver-*.noarch.rpm via dnf.
     if _distro_family() == 'rhel' or settings.get('pkg_mgr') == 'dnf':
@@ -70556,7 +70652,8 @@ def takserver_update():
                 return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
             upgrade_log.clear()
             upgrade_status.update({'running': True, 'complete': False, 'error': False})
-            threading.Thread(target=run_takserver_upgrade_two_server_rhel, args=(
+            threading.Thread(target=_tak_update_job('upgrade (two-server, rpm)', run_takserver_upgrade_two_server_rhel,
+                                                    upgrade_log, upgrade_status), args=(
                 os.path.join(UPLOAD_DIR, _core_rpm), os.path.join(UPLOAD_DIR, _db_rpm), _s1, _tak_cfg,
             ), daemon=True).start()
             return jsonify({'success': True})
@@ -70572,7 +70669,8 @@ def takserver_update():
         _edb = _tak_cfg.get('external_db') if _tak_cfg.get('mode') == 'external_db' else None
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_rhel, args=(os.path.join(UPLOAD_DIR, _rpms[0]),),
+        threading.Thread(target=_tak_update_job('upgrade (rpm)', run_takserver_upgrade_rhel, upgrade_log, upgrade_status),
+                         args=(os.path.join(UPLOAD_DIR, _rpms[0]),),
                          kwargs={'external_db': _edb}, daemon=True).start()
         return jsonify({'success': True})
     if upgrade_status['running']:
@@ -70596,7 +70694,8 @@ def takserver_update():
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_two_server, args=(
+        threading.Thread(target=_tak_update_job('upgrade (two-server)', run_takserver_upgrade_two_server,
+                                                upgrade_log, upgrade_status), args=(
             os.path.join(UPLOAD_DIR, core_pkg),
             os.path.join(UPLOAD_DIR, db_pkg),
             s1, tak_cfg
@@ -70610,7 +70709,8 @@ def takserver_update():
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
+        threading.Thread(target=_tak_update_job('upgrade', run_takserver_upgrade, upgrade_log, upgrade_status),
+                         args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
     return jsonify({'success': True})
 
 @app.route('/api/takserver/update/log')
