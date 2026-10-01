@@ -2852,14 +2852,14 @@ def _takserver_running_local():
     container box (native systemctl is-active is meaningless there)."""
     if _tak_is_container():
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
-                               capture_output=True, text=True, timeout=10)
+            r = _probe_run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
+                           capture_output=True, text=True, timeout=10)
             return r.returncode == 0 and r.stdout.strip() == 'true'
         except Exception:
             return False
     try:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
-                           capture_output=True, text=True, timeout=5)
+        r = _probe_run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                       capture_output=True, text=True, timeout=5)
         return r.stdout.strip() == 'active'
     except Exception:
         return False
@@ -3001,8 +3001,10 @@ def _probe_run(*a, **kw):
     # Up). Route through the shims. No-op as root / when shims absent.
     kw["env"] = _broker_shim_env(kw.get("env"))
     try:
-        if a and len(a) == 1 and _broker_inprocess_eligible(a[0], kw):
-            return _broker_exec_inprocess(a[0], **kw)
+        if a and len(a) == 1:
+            argv = _probe_shim_equivalent(a[0])
+            if _broker_inprocess_eligible(argv, kw):
+                return _broker_exec_inprocess(argv, **kw)
         return subprocess.run(*a, **kw)
     except Exception:
         return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
@@ -3014,6 +3016,21 @@ def _probe_run(*a, **kw):
 # client sends, same exit-code contract (125 unreachable/garbled, 126 refused,
 # else the command's), same CompletedProcess shape subprocess.run would return.
 # Only plain capturing calls qualify; anything else runs as before.
+# W4b: binaries the PATH shims route through the broker UNCONDITIONALLY (install-shims.sh
+# ALWAYS list). A probe naming one bare would reach the broker client through its shim
+# anyway; send it in-process instead. `docker cp` is staged by its shim — never rewritten.
+_PROBE_SHIMMED = frozenset({'docker', 'systemctl', 'fail2ban-client'})
+
+
+def _probe_shim_equivalent(args):
+    if (isinstance(args, (list, tuple)) and args and args[0] in _PROBE_SHIMMED
+            and list(args[:2]) != ['docker', 'cp']
+            and _broker_should_route() and _broker_available()
+            and os.path.isfile(os.path.join(_BROKER_SHIM_DIR, args[0]))):
+        return _sudo_wrap(list(args))
+    return args
+
+
 _BROKER_INPROCESS_KW = frozenset({'capture_output', 'text', 'universal_newlines', 'encoding',
                                   'errors', 'timeout', 'env', 'cwd', 'check'})
 
@@ -3144,10 +3161,10 @@ def _detect_modules_uncached():
         # UI. The authentik-server CONTAINER is the authoritative, non-root-safe install signal
         # (docker routes through the broker shims); union it with the home-dir check.
         _ak_home = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
-        _akc = _run('docker ps -a --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        _akc = _run(['docker', 'ps', '-a', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
         ak_installed = _ak_home or bool((_akc.stdout or '').strip())
         if ak_installed:
-            r = _run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            r = _run(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
             ak_running = 'Up' in (r.stdout or '')
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
@@ -3222,10 +3239,10 @@ def _detect_modules_uncached():
         nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
         # v10.0.5 non-root: union the home-dir check with the nodered container (a root-era
         # ~/node-red at /root/node-red is invisible to the takwerx console).
-        _nrc = _run('docker ps -a --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        _nrc = _run(['docker', 'ps', '-a', '--filter', 'name=nodered', '--format', '{{.Status}}'], capture_output=True, text=True)
         if os.path.exists(nr_compose) or bool((_nrc.stdout or '').strip()):
             nodered_installed = True
-            r2 = _run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            r2 = _run(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}'], capture_output=True, text=True)
             nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
         if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
@@ -3250,7 +3267,7 @@ def _detect_modules_uncached():
             os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')) or
             os.path.exists(os.path.join(cloudtak_dir, 'compose.yaml'))
         )
-        r = _run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        r = _run(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}'], capture_output=True, text=True, timeout=5)
         if r.stdout and 'Up' in r.stdout:
             cloudtak_running = True
         if not cloudtak_installed and cloudtak_running:
@@ -3315,9 +3332,8 @@ def _detect_modules_uncached():
             wo_enabled = True
     else:
         try:
-            import subprocess as _sp
-            result = _sp.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp']),
-                             capture_output=True, text=True, timeout=3)
+            result = _run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp']),
+                          capture_output=True, text=True, timeout=3)
             wo_running = result.stdout.strip() == 'true'
             # Self-heal: containers are up but flag got cleared (e.g. interrupted uninstall/deploy)
             if wo_running and not wo_enabled:
@@ -3424,7 +3440,7 @@ def _detect_modules_uncached():
     netbird_running = False
     if netbird_enabled:
         try:
-            _nb_r = subprocess.run(
+            _nb_r = _run(
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             netbird_running = _nb_r.stdout.strip() == 'true'
@@ -3433,7 +3449,7 @@ def _detect_modules_uncached():
     else:
         # Self-heal: container is running but flag got cleared
         try:
-            _nb_r = subprocess.run(
+            _nb_r = _run(
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             if _nb_r.stdout.strip() == 'true':
@@ -3472,7 +3488,7 @@ def _detect_modules_uncached():
     ra_running = False
     if ra_enabled:
         try:
-            _ra_r = subprocess.run(
+            _ra_r = _run(
                 _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             ra_running = 'Up' in (_ra_r.stdout or '')
@@ -3480,7 +3496,7 @@ def _detect_modules_uncached():
             pass
     else:
         try:
-            _ra_r = subprocess.run(
+            _ra_r = _run(
                 _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             if 'Up' in (_ra_r.stdout or ''):
@@ -3529,7 +3545,9 @@ import copy as _copy
 
 _MODULES_CACHE_FRESH_S = 15
 _MODULES_CACHE_REFRESH_STUCK_S = 120   # a refresh this old is presumed hung; allow another
-_MODULES_CACHE = {'data': None, 'at': 0.0, 'jobs': None, 'gen': 0, 'refreshing': 0.0}
+_MODULES_CACHE = {'data': None, 'at': 0.0, 'jobs': None, 'gen': 0, 'refreshing': 0.0,
+                  'computing': None}   # (gen, Event, thread ident) of the in-flight synchronous compute
+_MODULES_CACHE_WAIT_S = 60
 _MODULES_CACHE_LOCK = threading.Lock()
 
 
@@ -3563,6 +3581,40 @@ def _modules_cache_compute(gen, jobs):
     return data
 
 
+def _modules_cache_compute_once(gen, jobs, fresh):
+    """Synchronous compute, single-flight per generation (W4b): after an invalidation the page
+    and any concurrent poller wait for ONE compute instead of each probing (test6 cold /help:
+    33-60 broker calls for one 24-probe compute). fresh=True always probes for itself."""
+    if fresh:
+        return _modules_cache_compute(gen, jobs)
+    me = threading.get_ident()
+    for _ in range(3):
+        with _MODULES_CACHE_LOCK:
+            cur = _MODULES_CACHE['computing']
+            owner = cur is None or cur[0] != gen or cur[2] == me   # cur[2] == me: reentrant, never wait on ourselves
+            if owner:
+                ev = threading.Event()
+                _MODULES_CACHE['computing'] = (gen, ev, me)
+            else:
+                ev = cur[1]
+        if owner:
+            try:
+                return _modules_cache_compute(gen, jobs)
+            finally:
+                with _MODULES_CACHE_LOCK:
+                    if _MODULES_CACHE['computing'] and _MODULES_CACHE['computing'][1] is ev:
+                        _MODULES_CACHE['computing'] = None
+                ev.set()
+        if not ev.wait(_MODULES_CACHE_WAIT_S):
+            break                                   # owner hung: probe for ourselves
+        with _MODULES_CACHE_LOCK:
+            data = _MODULES_CACHE['data']
+            if data is not None and _MODULES_CACHE['gen'] == gen and _MODULES_CACHE['jobs'] == jobs:
+                return data
+            gen = _MODULES_CACHE['gen']             # invalidated meanwhile, or the owner failed
+    return _modules_cache_compute(gen, jobs)
+
+
 def _modules_cache_refresh_bg(gen, jobs):
     try:
         _modules_cache_compute(gen, jobs)
@@ -3593,7 +3645,7 @@ def detect_modules(fresh=False):
                 _MODULES_CACHE['refreshing'] = now
                 start_bg = True
     if not usable:
-        return _copy.deepcopy(_modules_cache_compute(gen, jobs))
+        return _copy.deepcopy(_modules_cache_compute_once(gen, jobs, fresh))
     if start_bg:
         try:
             threading.Thread(target=_modules_cache_refresh_bg, args=(gen, jobs),
@@ -28985,7 +29037,7 @@ def _takportal_project_containers(all_states=True):
     try:
         cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
               ['--filter', f'label=com.docker.compose.project={_takportal_project_name()}', '--format', fmt]
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        r = _probe_run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
         for line in (r.stdout or '').splitlines():
             parts = line.strip().split('|||')
             if len(parts) < 2 or not parts[1]:
@@ -29001,7 +29053,7 @@ def _takportal_project_containers(all_states=True):
     try:
         cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
               ['--filter', 'name=^tak-portal$', '--format', fmt]
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        r = _probe_run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
         for line in (r.stdout or '').splitlines():
             parts = line.strip().split('|||')
             if len(parts) >= 2 and parts[1] == 'tak-portal':

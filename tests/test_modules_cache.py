@@ -281,3 +281,61 @@ def test_module_decision_callers_ask_for_fresh_data(path, fn):
 def test_sidebar_uses_the_cache():
     body = _func(APP, 'inject_cloudtak_icon')
     assert 'render_sidebar(detect_modules(),' in body
+
+
+# ---------------------------------------------------------------------------
+# W4b: cold computes are single-flight per generation
+# ---------------------------------------------------------------------------
+def test_concurrent_cold_callers_share_one_compute(h):
+    h.gate = threading.Event()
+    got = []
+    ts = [threading.Thread(target=lambda: got.append(h.detect_modules())) for _ in range(4)]
+    for t in ts:
+        t.start()
+    assert h.entered.wait(5)
+    time.sleep(0.2)                       # let the other three reach the wait
+    h.gate.set()
+    for t in ts:
+        t.join(10)
+    assert h.calls == 1 and len(got) == 4
+    assert all(g == h.result for g in got)
+
+
+def test_fresh_never_waits_on_another_compute(h):
+    h.gate = threading.Event()
+    t = threading.Thread(target=h.detect_modules)
+    t.start()
+    assert h.entered.wait(5)
+    done = []
+    h.gate.set()                          # fresh caller computes on its own
+    done.append(h.detect_modules(fresh=True))
+    t.join(10)
+    assert h.calls == 2 and done
+
+
+def test_owner_failure_does_not_strand_waiters(h):
+    h.gate = threading.Event()
+    h.fail = True
+    errs = []
+
+    def call():
+        try:
+            h.detect_modules()
+        except RuntimeError as e:
+            errs.append(e)
+    ts = [threading.Thread(target=call) for _ in range(3)]
+    for t in ts:
+        t.start()
+    assert h.entered.wait(5)
+    time.sleep(0.2)
+    h.gate.set()
+    for t in ts:
+        t.join(10)
+    assert not any(t.is_alive() for t in ts)
+    assert len(errs) == 3                 # every caller still gets the error, none hangs
+
+
+def test_detect_body_has_no_shell_strings_or_direct_subprocess():
+    body = _func(APP, '_detect_modules_uncached')
+    assert 'shell=True' not in body
+    assert 'subprocess.run(' not in body and '_sp.run(' not in body

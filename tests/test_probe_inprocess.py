@@ -51,6 +51,7 @@ def _cut(name, kind='def'):
 
 SRC = '\n'.join([
     _cut('BrokerError', 'class'), _cut('_broker_request'), _cut('_probe_run'),
+    _cut('_PROBE_SHIMMED', 'assign'), _cut('_probe_shim_equivalent'),
     _cut('_BROKER_INPROCESS_KW', 'assign'), _cut('_broker_client_prefix'),
     _cut('_broker_inprocess_eligible'), _cut('_broker_exec_inprocess'),
 ])
@@ -65,7 +66,10 @@ class Console:
             '_BROKER_CLIENT': CLIENT, '_BROKER_CLIENT_PYFLAGS': ['-I', '-S'],
             'BROKER_SOCKET': sock,
             '_broker_shim_env': lambda env: env,
+            '_broker_should_route': lambda: True, '_broker_available': lambda: True,
+            '_BROKER_SHIM_DIR': str(REPO / 'tests'),            # replaced per test when needed
         }
+        self.ns['_sudo_wrap'] = lambda cmd: [sys.executable, '-I', '-S', CLIENT, 'exec', '--'] + list(cmd)
         exec(compile(SRC, 'app.py:W4', 'exec'), self.ns)
         real = self.ns['_broker_inprocess_eligible']
         self.ns['_broker_inprocess_eligible'] = lambda a, kw: (not self.forced_subprocess) and real(a, kw)
@@ -227,3 +231,62 @@ def test_only_the_exact_client_prefix_qualifies():
     long_plain = ['docker', 'ps', '-a', '--filter', 'name=x', '--format', '{{.Names}}', '-q']
     assert c.ns['_broker_inprocess_eligible'](long_plain, kw) is False
     assert c.ns['_broker_inprocess_eligible'](c.wrap(['true']), dict(kw, shell=True)) is False
+
+
+# ---------------------------------------------------------------------------
+# W4b: a bare docker/systemctl/fail2ban-client probe goes where its PATH shim would
+# ---------------------------------------------------------------------------
+def _always_list():
+    sh = (REPO / 'broker' / 'install-shims.sh').read_text()
+    body = re.search(r'ALWAYS=\((.*?)\)', sh, re.S).group(1)
+    return set(body.split())
+
+
+def test_rewritten_binaries_are_ones_the_shims_always_route():
+    c = Console('/tmp/unused')
+    assert set(c.ns['_PROBE_SHIMMED']) <= _always_list()
+
+
+def _shimdir(tmp_path, *names):
+    for n in names:
+        (tmp_path / n).write_text('#!/bin/bash\n')
+    return str(tmp_path)
+
+
+def test_bare_docker_probe_runs_in_process_like_its_shim(make_broker, tmp_path):
+    b = make_broker(ok_reply(stdout=b'true\n'))
+    c = Console(b.path)
+    c.ns['_BROKER_SHIM_DIR'] = _shimdir(tmp_path, 'docker', 'systemctl')
+
+    class NoSpawn:
+        CompletedProcess = subprocess.CompletedProcess
+        TimeoutExpired = subprocess.TimeoutExpired
+        CalledProcessError = subprocess.CalledProcessError
+
+        @staticmethod
+        def run(*a, **kw):
+            raise AssertionError('spawned')
+    c.ns['subprocess'] = NoSpawn
+    r = c.ns['_probe_run'](['docker', 'inspect', '--format', '{{.State.Running}}', 'x'],
+                           capture_output=True, text=True, timeout=3)
+    assert (r.returncode, r.stdout) == (0, 'true\n')
+    assert b.requests[0]['argv'] == ['docker', 'inspect', '--format', '{{.State.Running}}', 'x']
+
+
+@pytest.mark.parametrize('argv,shims,routing,expect_rewrite', [
+    (['docker', 'ps'], ('docker',), True, True),
+    (['docker', 'cp', 'c:/a', '/tmp/b'], ('docker',), True, False),   # staged by its shim
+    (['docker', 'ps'], (), True, False),                               # no shim installed
+    (['docker', 'ps'], ('docker',), False, False),                     # root / no broker
+    (['/usr/bin/docker', 'ps'], ('docker',), True, False),             # absolute path skips PATH
+    (['which', 'caddy'], ('which',), True, False),                     # not an always-route binary
+    ('docker ps', ('docker',), True, False),                           # shell string
+])
+def test_shim_equivalence_rule(tmp_path, argv, shims, routing, expect_rewrite):
+    c = Console('/tmp/unused')
+    c.ns['_BROKER_SHIM_DIR'] = _shimdir(tmp_path, *shims)
+    c.ns['_broker_should_route'] = lambda: routing
+    out = c.ns['_probe_shim_equivalent'](argv)
+    assert (out != argv) is expect_rewrite
+    if expect_rewrite:
+        assert out == c.wrap(argv)
