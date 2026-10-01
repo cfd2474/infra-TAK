@@ -43,7 +43,7 @@ import modules.atlas as atlas  # noqa: E402
 #: The release `main` currently points at. ⚠️ **The one line a promotion
 #: changes**, and it is deliberately not derived from `ATLAS_TAG`: a test that
 #: computes its expectation from the value under test passes for every value.
-PROMOTED = 'v1.51.0'
+PROMOTED = 'v1.54.1'
 
 #: The **mirror's** commit for that tag, which is what a clone's HEAD will be.
 #: ⚠️ Not this repository's commit: every release has two, and recording
@@ -51,8 +51,8 @@ PROMOTED = 'v1.51.0'
 #: refuses itself with "refusing to install a tag that has moved", which reads
 #: as tampering rather than as bookkeeping. Take it from the mirror:
 #:
-#:     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.51.0
-PROMOTED_SHA = 'd2419ee63c37c48c85687b457127815312e51ff5'
+#:     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.54.1
+PROMOTED_SHA = 'e580fa6618fc9dbfe2b782f7ca9ff980fd813f2b'
 
 
 def _parts(tag):

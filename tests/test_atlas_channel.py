@@ -556,11 +556,15 @@ def test_the_card_warns_where_a_deployment_is_already_ahead():
     assert 'will not move' in PAGE
 
 
-def test_the_card_says_a_fresh_install_ignores_the_channel():
-    """⚠️ The one place the channel does not apply. A dev-channel operator
-    deploying a new agency gets the pinned release and an immediate update
-    prompt; unexplained, that reads as a bug."""
-    assert 'A new deployment always installs' in PAGE
+def test_the_card_says_what_a_fresh_install_gets():
+    """The channel's release, and the fallback said too (GH #81).
+
+    ⚠️ This used to assert the card said "always installs" the pin. Installs
+    follow the channel now; the fallback is the one case where a `dev` operator
+    still gets the stable release, and unexplained that reads as a bug."""
+    assert 'A new deployment always installs' not in PAGE
+    assert 'A new deployment installs this channel' in PAGE
+    assert 'install_fallback_tag' in PAGE
 
 
 class _Flask:
@@ -719,10 +723,25 @@ def test_the_card_payload_reports_both_channels_and_what_is_ahead(monkeypatch):
     assert by_key['dev']['ahead'] == []
 
 
-def test_the_payload_names_the_install_pin(monkeypatch):
-    """The one place the channel does not apply, said rather than discovered."""
+def test_the_payload_names_what_a_fresh_install_gets(monkeypatch):
+    """The selected channel's release, and the pin it falls back to (GH #81)."""
     monkeypatch.setattr(atlas, '_latest_version',
-                        lambda use_cache=True, channel=None: '1.49.0')
+                        lambda use_cache=True, channel=None:
+                        {'main': '1.54.1', 'dev': '1.54.9'}.get(channel))
+    monkeypatch.setattr(atlas, 'load_instances', lambda c: [])
+
+    ctx, _ = box({atlas.CHANNEL_KEY: 'dev'})
+    with _Flask() as flask:
+        _view(_register(ctx), '/channel', 'GET')()
+
+    assert flask.payload['install_tag'] == 'v1.54.9'
+    assert flask.payload['install_fallback_tag'] == atlas.ATLAS_TAG
+
+
+def test_the_payload_names_the_pin_when_the_channel_is_unknown(monkeypatch):
+    """GitHub unreachable: the card must say what the install will really do."""
+    monkeypatch.setattr(atlas, '_latest_version',
+                        lambda use_cache=True, channel=None: None)
     monkeypatch.setattr(atlas, 'load_instances', lambda c: [])
 
     ctx, _ = box()
@@ -747,15 +766,20 @@ def test_an_unknown_channel_is_refused_by_the_route():
 
 
 def test_the_install_pin_is_a_tag_and_a_commit():
-    """⚠️ Unchanged by this work, and it must stay that way: the channel is a
-    branch that moves, and `_verify_pin` exists to refuse a tag that has. A
-    fresh install resolving its tag from a branch would give that up."""
+    """The offline fallback is still a tag *and* the commit it must be.
+
+    ⚠️ **This docstring used to say a fresh install must never resolve its tag
+    from a branch.** GH #81 reversed that, deliberately: the pin went stale
+    between console releases and every reinstall reverted deployments to it.
+    Installs now resolve the channel like updates do, with a check updates do
+    not have (tag == branch tip, HEAD == that commit); the pin is what a box
+    that cannot reach GitHub installs, so it still has to be verifiable."""
     assert atlas.ATLAS_TAG.startswith('v')
     assert len(atlas.ATLAS_SHA) == 40
 
 
 def test_the_pin_names_the_stable_release():
-    """Fresh installs land on what has been promoted, whichever channel the box
+    """The fallback is what has been promoted, whichever channel the box
     follows afterwards.
 
     ⚠️ **This is the one guard a promotion is supposed to change**, and
@@ -771,3 +795,172 @@ def test_the_pin_names_the_stable_release():
         "the tag moved and the commit did not, or the other way round. "
         "⚠️ The SHA is the MIRROR's commit for that tag, never this "
         "repository's -- every release has two.")
+
+
+# --------------------------------------------------------------------------- #
+# A fresh install follows the channel (GH #81)
+# --------------------------------------------------------------------------- #
+
+MAIN_TIP = 'e580fa6618fc9dbfe2b782f7ca9ff980fd813f2b'
+DEV_TIP = '1682a38ebe3b818cfcd94dc55c801acbb4c91ee3'
+
+
+@pytest.fixture
+def mirror(monkeypatch):
+    """Answer `git ls-remote` from a stated ref table; record what was asked.
+
+    ⚠️ The mirror publishes lightweight tags, so a tag's SHA *is* its commit.
+    The table is what `ls-remote` would print, so an annotated tag is set up by
+    giving it a separate `^{}` line, exactly as the real command does.
+    """
+    asked = []
+
+    def _set(table):
+        def fake(refs):
+            asked.append(list(refs))
+            return {ref: sha for ref, sha in table.items() if ref in refs}
+        monkeypatch.setattr(atlas, '_ls_remote', fake)
+        return asked
+
+    return _set
+
+
+def _resolve(ctx):
+    lines = []
+    return atlas._resolve_install_target(ctx, lines.append), lines
+
+
+def test_a_dev_box_installs_the_dev_release(offers, mirror):
+    offers(main='1.54.1', dev='1.54.9')
+    mirror({'refs/heads/dev': DEV_TIP, 'refs/tags/v1.54.9': DEV_TIP})
+    ctx, _ = box({atlas.CHANNEL_KEY: 'dev'})
+
+    (tag, commit), _ = _resolve(ctx)
+
+    assert (tag, commit) == ('v1.54.9', DEV_TIP)
+
+
+def test_a_main_box_installs_the_main_release_not_the_pin(offers, mirror, monkeypatch):
+    """⚠️ The bug in one line: the pin was v1.51.0 while `main` offered newer."""
+    monkeypatch.setattr(atlas, 'ATLAS_TAG', 'v1.51.0')
+    offers(main='1.54.1', dev='1.54.9')
+    mirror({'refs/heads/main': MAIN_TIP, 'refs/tags/v1.54.1': MAIN_TIP})
+    ctx, _ = box()
+
+    (tag, commit), _ = _resolve(ctx)
+
+    assert (tag, commit) == ('v1.54.1', MAIN_TIP)
+
+
+def test_an_unrecognised_channel_installs_main(offers, mirror):
+    offers(main='1.54.1', dev='1.54.9')
+    asked = mirror({'refs/heads/main': MAIN_TIP, 'refs/tags/v1.54.1': MAIN_TIP})
+    ctx, _ = box({atlas.CHANNEL_KEY: 'nightly'})
+
+    (tag, _commit), _ = _resolve(ctx)
+
+    assert tag == 'v1.54.1'
+    assert 'refs/heads/main' in asked[0]
+
+
+def test_an_unreachable_channel_installs_the_pin_and_says_why(offers, mirror):
+    offers()  # every channel unknown
+    asked = mirror({})
+    ctx, _ = box({atlas.CHANNEL_KEY: 'dev'})
+
+    (tag, commit), lines = _resolve(ctx)
+
+    assert (tag, commit) == (atlas.ATLAS_TAG, atlas.ATLAS_SHA)
+    assert asked == []
+    assert any('Could not read the dev channel' in l for l in lines)
+
+
+def test_an_unlistable_mirror_installs_the_pin(offers, monkeypatch):
+    offers(main='1.54.1')
+
+    def broken(refs):
+        raise RuntimeError('git ls-remote failed: Could not resolve host')
+
+    monkeypatch.setattr(atlas, '_ls_remote', broken)
+    ctx, _ = box()
+
+    (tag, commit), lines = _resolve(ctx)
+
+    assert (tag, commit) == (atlas.ATLAS_TAG, atlas.ATLAS_SHA)
+    assert any('installing the pinned' in l for l in lines)
+
+
+def test_a_tag_that_is_not_the_branch_tip_is_refused(offers, mirror):
+    """A tag moved away from its channel, or a VERSION the branch does not hold."""
+    offers(main='1.54.1')
+    mirror({'refs/heads/main': MAIN_TIP, 'refs/tags/v1.54.1': DEV_TIP})
+    ctx, _ = box()
+
+    with pytest.raises(RuntimeError, match='refusing to install a tag that is not the main release'):
+        _resolve(ctx)
+
+
+def test_a_version_with_no_tag_is_refused(offers, mirror):
+    offers(main='1.54.1')
+    mirror({'refs/heads/main': MAIN_TIP})
+    ctx, _ = box()
+
+    with pytest.raises(RuntimeError, match='no such tag'):
+        _resolve(ctx)
+
+
+def test_an_annotated_tag_is_compared_by_its_commit(offers, mirror):
+    """⚠️ An annotated tag lists as the tag *object*; comparing that hash with
+    the branch tip would refuse every install, which reads as tampering."""
+    offers(main='1.54.1')
+    asked = mirror({'refs/heads/main': MAIN_TIP,
+                    'refs/tags/v1.54.1': 'd4ca2e3147b409459955613c152220f4db848ee1',
+                    'refs/tags/v1.54.1^{}': MAIN_TIP})
+    ctx, _ = box()
+
+    (tag, commit), _ = _resolve(ctx)
+
+    assert (tag, commit) == ('v1.54.1', MAIN_TIP)
+    assert 'refs/tags/v1.54.1^{}' in asked[0]
+
+
+def _git_head(sha):
+    class _R:
+        stdout = sha + '\n'
+    return {'_module_git': lambda *a, **k: _R()}
+
+
+def test_a_clone_that_is_not_the_resolved_commit_is_refused():
+    with pytest.raises(RuntimeError, match='refusing to install a tag that has moved'):
+        atlas._verify_checkout(_git_head(DEV_TIP), '/x', lambda m: None,
+                               'v1.54.1', MAIN_TIP)
+
+
+def test_a_clone_that_is_the_resolved_commit_is_accepted():
+    assert atlas._verify_checkout(_git_head(MAIN_TIP), '/x', lambda m: None,
+                                  'v1.54.1', MAIN_TIP) == MAIN_TIP
+
+
+def test_an_empty_head_is_refused():
+    """⚠️ The old check passed this: `sha.startswith('')` is always True, so a
+    `rev-parse` that printed nothing verified against any pin."""
+    with pytest.raises(RuntimeError, match='refusing'):
+        atlas._verify_checkout(_git_head(''), '/x', lambda m: None,
+                               'v1.54.1', MAIN_TIP)
+
+
+def test_deploy_fetches_what_was_resolved():
+    """Resolved before anything is fetched, and the fetch uses the result.
+
+    ⚠️ Read from the source because `deploy` needs Docker, a box and a
+    network; the two properties that matter are ordering and which name the
+    git commands carry, and both are visible here.
+    """
+    source = MODULE[MODULE.index('def deploy('):]
+    source = source[:source.index('# ── 3/7 Configuration')]
+
+    resolve_at = source.index('_resolve_install_target(ctx, plog)')
+    assert resolve_at < source.index("'git', 'clone'")
+    assert resolve_at < source.index("'fetch', '--tags'")
+    assert 'ATLAS_TAG' not in source
+    assert '_verify_checkout(ctx, dirpath, plog, tag, expected)' in source

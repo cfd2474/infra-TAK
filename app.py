@@ -987,7 +987,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.0-alpha"
+VERSION = "10.2.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -7091,7 +7091,637 @@ def help_page():
     """Help: backdoor URL, console password info, reset password, hardening."""
     settings = load_settings()
     current_ssh_port = _get_current_ssh_port()
-    return render_template('help.html', settings=settings, version=VERSION, current_ssh_port=current_ssh_port)
+    _relay = settings.get('email_relay') or {}
+    return render_template('help.html', settings=settings, version=VERSION, current_ssh_port=current_ssh_port,
+                           diag_support_email=DIAG_SUPPORT_EMAIL,
+                           diag_email_ready=bool(_relay.get('relay_host') and _relay.get('smtp_user')))
+
+
+# ── v10.2.1 (W3): Help → Diagnostics ──────────────────────────────────────────
+# PLAN-v10.2.1 §4. One read-only report support can read, built by the console so a
+# customer never needs SSH and a pasted script (operator, 2026-09-30: "that is too much
+# for him"). READS ONLY: nothing below installs, restarts, clears or repairs — not even
+# ldapsearch, which is used only when it is already present. Every section is wrapped
+# so one failure prints "(section failed: …)" and the rest still run, and the whole
+# report passes through _diag_redact() before anyone can see it.
+DIAG_SUPPORT_EMAIL = ''          # pre-fills the Help card's address field; '' = blank
+_DIAG_JOB = {'running': False, 'report': None, 'generated_at': None, 'error': None}
+_DIAG_LOCK = threading.Lock()
+_DIAG_TAIL_BYTES = 2 * 1024 * 1024
+_DIAG_SECRET_KEY_RE = re.compile(r'(pass|secret|token|key)', re.I)
+_DIAG_TAK_LOG_TS = re.compile(r'^(\d{4}-\d{2}-\d{2}-\d{2}:\d{2})')
+
+
+def _diag_cmd(argv, timeout=20, priv=True, stdin=None):
+    """Output of a read-only command, or a '(… failed: …)' line. Never raises.
+    `priv=False` for tools that work as any user (and are not on the broker allow-list)."""
+    try:
+        r = subprocess.run(_sudo_wrap(argv) if priv else argv, input=stdin,
+                           capture_output=True, text=True, timeout=timeout)
+        return ((r.stdout or '') + (r.stderr or '')).rstrip()
+    except Exception as e:
+        return f'({argv[0]} failed: {str(e)[:120]})'
+
+
+def _diag_tail(path, max_bytes=_DIAG_TAIL_BYTES):
+    """Last `max_bytes` of a log as lines, read directly; None when this console cannot read it.
+    ⚠ Never routed through the broker: a whole TAK log can exceed its 32 MiB message cap,
+    and `tail` is not on its allow-list."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    return lines[1:] if size > max_bytes else lines
+
+
+def _diag_tak_log_window(lines, hours=3):
+    """TAK log lines from the last `hours`, keeping stack-trace continuation lines with the
+    entry they belong to (they carry no timestamp of their own)."""
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d-%H:%M')
+    out, keep = [], False
+    for ln in lines:
+        m = _DIAG_TAK_LOG_TS.match(ln)
+        if m:
+            keep = m.group(1) >= cutoff
+        if keep:
+            out.append(ln)
+    return out
+
+
+def _diag_cert_enddate(pem):
+    """'notAfter=…' for a PEM certificate, via openssl (stdin, no shell)."""
+    if not pem or 'BEGIN CERTIFICATE' not in pem:
+        return '(no certificate)'
+    return _diag_cmd(['openssl', 'x509', '-noout', '-enddate', '-subject'], priv=False, stdin=pem).replace('\n', '  ')
+
+
+def _diag_ak(settings, path):
+    """GET an Authentik API path → parsed JSON. Raises on failure (the section wrapper reports it)."""
+    import urllib.request as _ur
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+        _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token:
+        raise RuntimeError('no Authentik API token in the Authentik .env')
+    req = _ur.Request(f'{_get_authentik_api_url(settings)}/api/v3/{path}',
+                      headers={'Authorization': f'Bearer {token}'})
+    return json.loads(_ur.urlopen(req, timeout=10).read().decode())
+
+
+def _diag_ldap_bind(dn, password):
+    """Result + memberOf lines of an LDAP bind+search as `dn`. Password never printed."""
+    if not password:
+        return '  (no password on record — skipped)'
+    if not shutil.which('ldapsearch'):
+        return '  (ldapsearch not installed — skipped; diagnostics never installs anything)'
+    cn = dn.split(',', 1)[0].split('=', 1)[-1]
+    out = _diag_cmd(['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389', '-D', dn, '-w', password,
+                     '-b', 'ou=users,dc=takldap', f'(cn={cn})', 'memberOf'], timeout=20, priv=False)
+    keep = [l for l in out.splitlines() if l.startswith(('result:', 'memberOf:', 'ldap_bind', 'ldap_sasl'))
+            or "Can't contact" in l]
+    return '\n'.join('  ' + l for l in keep) or '  (no output)'
+
+
+def _diag_secret_values(settings):
+    """Every secret value this box knows, for exact-string redaction."""
+    vals = set()
+
+    def walk(obj, key=''):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v, str(k))
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, key)
+        elif isinstance(obj, str) and _DIAG_SECRET_KEY_RE.search(key):
+            vals.add(obj)
+    walk(settings)
+    try:
+        for ln in (_get_authentik_env_content(settings) or '').splitlines():
+            k, _, v = ln.partition('=')
+            if v and _DIAG_SECRET_KEY_RE.search(k):
+                vals.add(v.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(CONFIG_DIR, 'auth.json')) as f:
+            vals.add(json.load(f).get('password_hash') or '')
+    except Exception:
+        pass
+    # Below 6 characters a "secret" is a port, a boolean or a placeholder; scrubbing those
+    # would shred the report without protecting anything.
+    return sorted((v for v in vals if v and len(v) >= 6), key=len, reverse=True)
+
+
+def _diag_redact(text, settings):
+    """Remove every known secret value, then anything that still looks like one."""
+    for v in _diag_secret_values(settings):
+        text = text.replace(v, '[REDACTED]')
+    text = re.sub(r'(?i)\b(password|passwd|secret|token|api[_-]?key)(["\']?\s*[=:]\s*["\']?)([^\s"\',;&]{4,})',
+                  r'\1\2[REDACTED]', text)
+    text = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer [REDACTED]', text)
+    return text
+
+
+def _diag_section_box(settings):
+    out = []
+    git = lambda *a: _diag_cmd(['git', '-C', BASE_DIR] + list(a), priv=False)
+    out.append(f"console: v{VERSION}  git={git('rev-parse', '--short', 'HEAD')}  "
+               f"branch={git('branch', '--show-current')}  update_channel={settings.get('update_channel') or 'main'}")
+    out.append(f"fqdn={settings.get('fqdn') or '-'}  server_ip={settings.get('server_ip') or '-'}  "
+               f"ssl_mode={settings.get('ssl_mode') or '-'}  os_type={settings.get('os_type') or '-'}")
+    import getpass
+    out.append(f"console runs as: {getpass.getuser()}  broker routing: {_broker_should_route()}")
+    try:
+        with open('/etc/os-release') as f:
+            osr = dict(l.strip().split('=', 1) for l in f if '=' in l)
+        osname = osr.get('PRETTY_NAME', '').strip('"')
+    except Exception:
+        osname = '?'
+    out.append(f"os: {osname}  kernel: {os.uname().release}  arch: {os.uname().machine}  cpus: {os.cpu_count()}")
+    vm, sw = psutil.virtual_memory(), psutil.swap_memory()
+    out.append(f"ram: {vm.total // 2**30} GiB total, {vm.available // 2**30} GiB available ({vm.percent}% used)  "
+               f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
+    out.append(f"uptime since: {datetime.fromtimestamp(psutil.boot_time()).strftime('%Y-%m-%d %H:%M')}  "
+               f"load: {' '.join(f'{x:.2f}' for x in os.getloadavg())}")
+    for mp in ('/', '/opt', '/var/lib/docker', os.path.expanduser('~')):
+        try:
+            du = psutil.disk_usage(mp)
+            out.append(f"disk {mp}: {du.free // 2**30} GiB free of {du.total // 2**30} GiB ({du.percent}% used)")
+        except Exception:
+            pass
+    td = _diag_cmd(['timedatectl', 'show', '-p', 'NTPSynchronized', '-p', 'Timezone'], priv=False)
+    out.append(f"clock: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC  {td.replace(chr(10), '  ')}")
+    kern = _diag_cmd(['journalctl', '-k', '--since', '24 hours ago', '--no-pager', '-q'], timeout=30)
+    oom = [l for l in kern.splitlines() if re.search(r'out of memory|oom-kill|killed process', l, re.I)]
+    out.append(f"kernel, last 24 h: {len(oom)} OOM-kill line(s)")
+    out.extend('  ' + l[:220] for l in oom[-5:])
+    sysj = _diag_cmd(['journalctl', '--since', '24 hours ago', '--no-pager', '-q', '-p', 'err'], timeout=30)
+    full = [l for l in sysj.splitlines() if 'No space left' in l]
+    out.append(f"'No space left on device' in the system journal, last 24 h: {len(full)}")
+    return out
+
+
+def _diag_section_console(settings):
+    out = [f"failed units: {_diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False) or 'none'}"]
+    j = _diag_cmd(['journalctl', '-u', 'takwerx-console', '--since', '2 hours ago', '--no-pager', '-q', '-n', '5000'], timeout=30)
+    bad = [l for l in j.splitlines() if re.search(r'Traceback|\bERROR\b|CRITICAL|failed:', l)]
+    out.append(f"console journal, last 2 h: {sum('Traceback' in l for l in bad)} traceback(s), {len(bad)} error-class line(s)")
+    out.extend('  ' + l[:240] for l in bad[-15:])
+    audit = _diag_tail('/var/log/takwerx-broker/audit.log', 512 * 1024)
+    if audit is not None:
+        recent = audit[-2000:]
+        out.append(f"broker audit (recent): {sum('DENIED' in l for l in recent)} DENIED, "
+                   f"{sum('WOULD-DENY' in l for l in recent)} WOULD-DENY")
+        out.extend('  ' + l[:220] for l in [l for l in recent if 'DENIED' in l or 'WOULD-DENY' in l][-5:])
+    return out
+
+
+def _diag_section_connectivity(settings):
+    out = []
+    fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
+    sip = str(settings.get('server_ip') or '').strip()
+    if fqdn:
+        for host in (fqdn, f'tak.{fqdn}', f'infratak.{fqdn}', f'takportal.{fqdn}', f'authentik.{fqdn}'):
+            try:
+                ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
+                out.append(f"dns {host}: {', '.join(ips)}{'' if (not sip or sip in ips) else '   <-- not server_ip ' + sip}")
+            except Exception as e:
+                out.append(f"dns {host}: does not resolve ({str(e)[:60]})"
+                           f"{'   (apex record — optional)' if host == fqdn else ''}")
+    ports = _diag_cmd(['ss', '-tlnH'], priv=False)
+    listening = sorted({l.split()[3] for l in ports.splitlines() if len(l.split()) > 3},
+                       key=lambda a: int(a.rsplit(':', 1)[-1]) if a.rsplit(':', 1)[-1].isdigit() else 0)
+    out.append(f"listening tcp: {' '.join(listening)}")
+    fw = _firewall_status_local()      # the Firewall page's own reader — both backends
+    out.append(f"firewall backend: {_fw_backend()}  enabled: {fw.get('enabled')}"
+               f"{'  (' + str(fw.get('error')) + ')' if fw.get('error') else ''}")
+    rules = fw.get('rules_numbered') or fw.get('rules') or []
+    ip_blocks = [l for l in rules if re.search(r'\b(REJECT|DENY)\b', l) and re.search(r'\]\s+Anywhere\s', l)]
+    rest = [l for l in rules if l not in ip_blocks and '(v6)' not in l]
+    out.append(f"  {len(rules)} rules: {len(ip_blocks)} per-IP blocks (fail2ban/recidive), "
+               f"{sum('(v6)' in l for l in rules)} IPv6 copies, the rest:")
+    out.extend('  ' + l.strip()[:160] for l in rest[:80])
+    if shutil.which('fail2ban-client'):
+        st = _diag_cmd(['fail2ban-client', 'status'])
+        jails = re.findall(r'Jail list:\s*(.*)', st)
+        jl = [j.strip() for j in (jails[0].split(',') if jails else []) if j.strip()]
+        out.append(f"fail2ban jails: {', '.join(jl) or '(none)'}")
+        for jail in jl:
+            js = _diag_cmd(['fail2ban-client', 'status', jail])
+            banned = (re.findall(r'Banned IP list:\s*(.*)', js) or [''])[0].split()
+            if banned:
+                out.append(f"  {jail}: {len(banned)} banned — {' '.join(banned[:10])}{' …' if len(banned) > 10 else ''}")
+    if shutil.which('wg'):
+        wg = _diag_cmd(['wg', 'show', 'all', 'latest-handshakes'])
+        for l in wg.splitlines():
+            parts = l.split()
+            if len(parts) >= 3 and parts[-1].isdigit():
+                age = int(time.time()) - int(parts[-1]) if int(parts[-1]) else None
+                out.append(f"wireguard {parts[0]} peer …{parts[1][-8:]}: "
+                           f"{'never' if age is None else str(age) + ' s since last handshake'}")
+    relay = settings.get('email_relay') or {}
+    targets = [('github.com', 443), ('ghcr.io', 443), ('registry-1.docker.io', 443)]
+    if relay.get('relay_host'):
+        try:
+            targets.append((relay['relay_host'], int(relay.get('relay_port') or 587)))
+        except Exception:
+            pass
+    for host, port in targets:
+        t0 = time.time()
+        try:
+            socket.create_connection((host, port), timeout=3).close()
+            out.append(f"outbound {host}:{port}: ok ({int((time.time() - t0) * 1000)} ms)")
+        except Exception as e:
+            out.append(f"outbound {host}:{port}: FAILED ({str(e)[:80]})")
+    # Certificate expiry of what the box actually presents. openssl s_client is an inspection
+    # tool: it shows the certificate whether or not it would verify — which is the point, since an
+    # expired or self-signed certificate is what this line exists to catch. Nothing is sent.
+    for label, port, sni in ((f'infratak.{fqdn}:443', 443, f'infratak.{fqdn}'), ('8446 (TAK web)', 8446, None)):
+        if label.startswith('infratak.:'):
+            continue
+        argv = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}'] + (['-servername', sni] if sni else [])
+        raw = _diag_cmd(argv, timeout=8, priv=False, stdin='')
+        m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', raw, re.S)
+        out.append(f"tls {label}: {_diag_cert_enddate(m.group(0)) if m else 'no certificate presented'}")
+    return out
+
+
+def _diag_section_containers(settings):
+    ps = _diag_cmd(['docker', 'ps', '-a', '--format', '{{.Names}}|{{.Status}}|{{.Image}}'], timeout=30)
+    rows = [l.split('|') for l in ps.splitlines() if l.count('|') == 2]
+    if not rows:
+        return [ps or '(no containers)']
+    w = max(len(r[0]) for r in rows)
+    return [f"{r[0].ljust(w)}  {r[1][:45].ljust(45)}  {r[2]}" for r in sorted(rows)]
+
+
+def _diag_section_authentik(settings):
+    if not _get_authentik_env_content(settings):
+        return ['Authentik not installed on this box']
+    out = []
+    img = _diag_cmd(['docker', 'inspect', 'authentik-server-1', '--format', '{{.Config.Image}}'])
+    out.append(f"image: {img}")
+    for c in ('server', 'worker'):
+        out.append(f"{c} AUTHENTIK_POSTGRESQL__HOST: "
+                   f"{_diag_cmd(['docker', 'exec', f'authentik-{c}-1', 'printenv', 'AUTHENTIK_POSTGRESQL__HOST'])}")
+    env = _diag_cmd(['docker', 'inspect', 'authentik-ldap-1', '--format', '{{range .Config.Env}}{{println .}}{{end}}'])
+    host = next((l for l in env.splitlines() if l.startswith('AUTHENTIK_HOST=')), 'AUTHENTIK_HOST=(not found)')
+    out.append(f"ldap outpost {host}   (internal http://authentik-server… = routing-spiral risk; https://<fqdn> = normal)")
+    # One statement: psql -c prints only the LAST result of a multi-statement string.
+    sql = ("SELECT 'idle_in_tx='||count(*) FROM pg_stat_activity WHERE state='idle in transaction' "
+           "UNION ALL SELECT 'tasks_'||state||'='||count(*) FROM authentik_tasks_task GROUP BY state")
+    out.append('postgres: ' + _diag_cmd(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                                         '-d', 'authentik', '-tAc', sql]).replace('\n', '  '))
+    def guarded(label, fn):
+        try:
+            fn()
+        except Exception as e:
+            out.append(f"({label} failed: {type(e).__name__}: {str(e)[:160]})")
+
+    def users():
+        for u in _diag_ak(settings, 'core/users/?search=webadmin&page_size=20').get('results', []):
+            out.append(f"user {u.get('username')}: pk={u.get('pk')} active={u.get('is_active')} type={u.get('type')} "
+                       f"path={u.get('path')} superuser={u.get('is_superuser')} last_login={u.get('last_login')}")
+            out.append(f"  groups: {[g.get('name') for g in (u.get('groups_obj') or [])]}")
+
+    def reputation():
+        for p in _diag_ak(settings, 'policies/reputation/?page_size=20').get('results', []):
+            out.append(f"reputation policy {p.get('name')}: threshold={p.get('threshold')} "
+                       f"check_username={p.get('check_username')} check_ip={p.get('check_ip')}")
+        scores = _diag_ak(settings, 'policies/reputation/scores/?page_size=100&ordering=score').get('results', [])
+        out.append(f"reputation scores: {len(scores)}  (at or below the threshold = that username is LOCKED OUT)")
+        out.extend(f"  {s.get('identifier')} ip={s.get('ip')} score={s.get('score')} updated={s.get('updated')}"
+                   for s in scores[:30])
+
+    def bindings():
+        flows = _diag_ak(settings, 'flows/instances/?slug=ldap-authentication-flow').get('results', [])
+        apps = [a for a in _diag_ak(settings, 'core/applications/?superuser_full_list=true&page_size=100').get('results', [])
+                if 'ldap' in (a.get('slug', '') + a.get('name', '')).lower()]
+        # A flow's binding target is its policybindingmodel_ptr_id — its pk is rejected
+        # (HTTP 400 "not one of the available choices"). An application's pk works as-is.
+        for label, pk in [('flow ldap-authentication-flow', f.get('policybindingmodel_ptr_id') or f['pk']) for f in flows] + \
+                         [(f"app {a['slug']}", a['pk']) for a in apps]:
+            bs = _diag_ak(settings, f'policies/bindings/?target={pk}&page_size=100').get('results', [])
+            out.append(f"policy bindings on {label}: {len(bs)}")
+            for b in bs:
+                out.append(f"  order={b.get('order')} enabled={b.get('enabled')} negate={b.get('negate')} "
+                           f"failure_result={b.get('failure_result')} policy={(b.get('policy_obj') or {}).get('name')} "
+                           f"group={(b.get('group_obj') or {}).get('name')} user={(b.get('user_obj') or {}).get('username')}")
+
+    guarded('webadmin user lookup', users)
+    guarded('reputation lookup', reputation)
+    guarded('policy binding lookup', bindings)
+    out.append('ldap bind as webadmin:')
+    out.append(_diag_ldap_bind('cn=webadmin,ou=users,dc=takldap', (settings.get('webadmin_password') or '').strip()))
+    out.append('ldap bind as adm_ldapservice:')
+    out.append(_diag_ldap_bind('cn=adm_ldapservice,ou=users,dc=takldap',
+                               _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')))
+    lg = _diag_cmd(['docker', 'logs', 'authentik-ldap-1', '--since', '3h', '--tail', '5000'], timeout=30)
+    hits = [l for l in lg.splitlines() if '"Search request"' not in l and
+            re.search(r'webadmin|does not apply|invalid cred|denied|"level":"error"|recursion', l, re.I)]
+    out.append(f"ldap outpost log, last 3 h (webadmin / denials / errors): {len(hits)} line(s)")
+    out.extend('  ' + l[:300] for l in hits[-25:])
+    sl = _diag_cmd(['docker', 'logs', 'authentik-server-1', '--since', '12h', '--tail', '20000'], timeout=40)
+    dels = [l for l in sl.splitlines() if '"DELETE"' in l and 'core/users' in l]
+    out.append(f"server log, last 12 h: user DELETE requests: {len(dels)}")
+    out.extend('  ' + l[:300] for l in dels[-10:])
+    def events():
+        ev = _diag_ak(settings, 'events/events/?search=webadmin&ordering=-created&page_size=20').get('results', [])
+        out.append('events for webadmin (newest first):')
+        for e in ev:
+            c = e.get('context') or {}
+            out.append(f"  {str(e.get('created', ''))[:19]} {e.get('action')} "
+                       f"{str(c.get('message') or c.get('reason') or '')[:160]}")
+    guarded('event lookup', events)
+    return out
+
+
+def _diag_section_takserver(settings):
+    try:
+        method = _tak_install_method()
+    except Exception:
+        method = '?'
+    if not os.path.exists('/opt/tak') and not _tak_is_container():
+        return ['TAK Server not installed on this box']
+    out = [f"install method: {method}"]
+    ver = _diag_cmd(['dpkg-query', '-W', '-f=${Version}', 'takserver'], priv=False) if shutil.which('dpkg-query') \
+        else _diag_cmd(['rpm', '-q', 'takserver'], priv=False)
+    out.append(f"package: {ver}   service: {_diag_cmd(['systemctl', 'is-active', 'takserver'], priv=False)}")
+    for prof in ('api', 'messaging'):
+        pid = _diag_cmd(['pgrep', '-f', f'java.*spring.profiles.active={prof}'], priv=False).split('\n')[0].strip()
+        if pid.isdigit():
+            try:
+                jvm = os.readlink(f'/proc/{pid}/exe')
+            except OSError:
+                jvm = '(not readable as the console user)'
+            out.append(f"running JVM ({prof}): {jvm}   (TAK 5.7 on Java 21 = every new QR enrollment fails)")
+    out.append(f"default java: {os.path.realpath(shutil.which('java') or '') or '(none)'}")
+    try:
+        out.append(f"installed JVMs: {', '.join(sorted(d for d in os.listdir('/usr/lib/jvm') if not d.startswith('.'))) or '(none)'}")
+    except OSError:
+        pass
+    try:
+        cc = _read_own_or_priv('/opt/tak/CoreConfig.xml') or ''
+    except Exception as e:
+        cc = ''
+        out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
+    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
+                       ('auth', ('default', 'x509groups', 'x509useGroupCache')),
+                       ('connector', ('port', 'clientAuth', '_name'))):
+        for el in re.findall(rf'<{tag}\b[^>]*>', cc):
+            out.append(f"<{tag}> " + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el) if a in attrs))
+    for el in re.findall(r'<input\b[^>]*>', cc):
+        out.append('<input> ' + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el)
+                                         if a in ('_name', 'protocol', 'port', 'auth')))
+    try:
+        uaf = _read_own_or_priv('/opt/tak/UserAuthenticationFile.xml') or ''
+        in_flat = 'yes' if 'identifier="webadmin"' in uaf else 'no'
+        out.append(f"flat-file users: {uaf.count('<User ')}  webadmin in flat file: {in_flat}")
+    except Exception:
+        pass
+    for name in ('takserver.pem', 'ca.pem'):
+        try:
+            out.append(f"cert {name}: {_diag_cert_enddate(_read_own_or_priv('/opt/tak/certs/files/' + name))}")
+        except Exception:
+            pass
+    est = _diag_cmd(['ss', '-tnH', 'state', 'established', '( sport = :8089 )'], priv=False)
+    peers = [l.split()[-1] for l in est.splitlines() if l.split()]
+    out.append(f"clients connected on 8089: {len(peers)}")
+    out.extend(f"  peer {p}" for p in peers[:25])
+    noise = re.compile(r'DEBUG|FedReconnectPool|grpc-federation|PeriodicUpdateCancellation|federation|TakFig|'
+                       r'no certificate revocation lists|mission subscription for client')
+    frame = re.compile(r'^\s+at |^\s*\.\.\. \d+ more')
+    for log in ('takserver-messaging.log', 'takserver-api.log'):
+        lines = _diag_tail('/opt/tak/logs/' + log)
+        if lines is None:
+            out.append(f"{log}: not readable by the console on this box")
+            continue
+        hits = [l for l in _diag_tak_log_window(lines)
+                if not frame.search(l) and not noise.search(l)
+                and re.search(r'ssl|tls|handshake|certificate|signClient|enroll|ldap|Exception|\bERROR\b', l, re.I)]
+        out.append(f"{log}, last 3 h: {len(hits)} TLS/enrollment/LDAP/error line(s)")
+        # Grouped by cause and client host: one device retrying a failed handshake every
+        # second buries everything else, and the client's address — the thing support
+        # needs — sits at the very end of the line where a plain truncation drops it.
+        groups = {}
+        for l in hits:
+            m = re.search(r'Cause: (.*?)(?:\. Additional info|$)', l)
+            cause = (m.group(1) if m else re.sub(r'^\S+ \[[^\]]*\] \w+ \S+ - ', '', l))[:110]
+            r = re.search(r'Remote address: /?([^\s,;]+)', l)
+            remote = r.group(1).rsplit(':', 1)[0] if r else '-'
+            groups[(cause, remote)] = groups.get((cause, remote), 0) + 1
+        for (cause, remote), n in sorted(groups.items(), key=lambda kv: -kv[1])[:12]:
+            out.append(f"  {n:>6} x {cause}   from {remote}")
+        if hits:
+            out.append('  newest:')
+            out.extend('    ' + l[:320] for l in hits[-6:])
+    return out
+
+
+def _diag_section_takportal(settings):
+    names = [n for n in _diag_cmd(['docker', 'ps', '-a', '--format', '{{.Names}}']).splitlines()
+             if 'portal' in n.lower()]
+    if not names:
+        return ['TAK Portal not installed on this box']
+    web = next((n for n in names if not re.search(r'worker|db|postgres|redis', n, re.I)), names[0])
+    out = [f"containers: {', '.join(names)}"]
+    lg = _diag_cmd(['docker', 'logs', web, '--since', '3h', '--tail', '5000'], timeout=30)
+    hits = [l for l in lg.splitlines() if re.search(r'enroll|qr|itak|error|fail', l, re.I)]
+    out.append(f"{web} log, last 3 h (enrollment / errors): {len(hits)} line(s)")
+    out.extend('  ' + l[:260] for l in hits[-20:])
+    return out
+
+
+def _diag_section_emailrelay(settings):
+    relay = settings.get('email_relay') or {}
+    configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
+    out = [f"configured: {configured}  relay: {relay.get('relay_host') or '-'}:{relay.get('relay_port') or '-'}  "
+           f"from: {relay.get('from_addr') or '-'}  postfix: {_diag_cmd(['systemctl', 'is-active', 'postfix'], priv=False)}"]
+    if not configured:
+        return out
+    q = _diag_cmd(['postqueue', '-p'], priv=False)
+    queued = [l for l in q.splitlines() if re.match(r'^[0-9A-F]{6,}', l)]
+    out.append(f"mail queue: {len(queued)} message(s)")
+    reasons = [l.strip() for l in q.splitlines() if l.strip().startswith('(')]
+    out.extend('  ' + r[:220] for r in sorted(set(reasons))[:8])
+    for path in ('/var/log/mail.log', '/var/log/maillog'):
+        lines = _diag_tail(path, 512 * 1024)
+        if lines is not None:
+            errs = [l for l in lines if re.search(r'status=(deferred|bounced)|reject|warning|error', l, re.I)]
+            out.append(f"{path}: {len(errs)} deferred/bounced/error line(s) in the recent tail")
+            out.extend('  ' + l[:240] for l in errs[-10:])
+            break
+    return out
+
+
+def _diag_section_guarddog(settings):
+    if not os.path.exists('/opt/tak-guarddog'):
+        return ['Guard Dog not deployed on this box']
+    out = [f"deployed version: {settings.get('guarddog_deployed_version') or '?'}"]
+    timers = _diag_cmd(['systemctl', 'list-timers', '--all', '--no-pager', '--plain', 'tak*'], priv=False)
+    out.append(f"timers: {len([l for l in timers.splitlines() if '.timer' in l])}")
+    lines = _diag_tail('/var/log/takguard/watchdog.log', 512 * 1024)
+    if lines is None:
+        out.append('watchdog.log: not readable by the console on this box')
+    else:
+        alerts = [l for l in lines if 'ALERT' in l]
+        out.append(f"ALERT lines in the recent log: {len(alerts)}")
+        out.extend('  ' + l[:240] for l in alerts[-10:])
+    return out
+
+
+def _diag_section_modules(settings):
+    flags = sorted(k for k, v in settings.items()
+                   if re.search(r'_(enabled|deployed|installed)$', k) and v and not isinstance(v, dict))
+    vers = sorted(f'{k}={v}' for k, v in settings.items()
+                  if re.search(r'(_version|_tag|_release)$', k) and isinstance(v, (str, int)) and v)
+    return [f"enabled/deployed flags: {', '.join(flags) or '(none)'}",
+            f"recorded versions: {', '.join(vers) or '(none)'}",
+            'container states: see "Containers" above']
+
+
+_DIAG_SECTIONS = (
+    ('Box', _diag_section_box),
+    ('Console', _diag_section_console),
+    ('Connectivity', _diag_section_connectivity),
+    ('Containers', _diag_section_containers),
+    ('Authentik / LDAP / webadmin', _diag_section_authentik),
+    ('TAK Server', _diag_section_takserver),
+    ('TAK Portal', _diag_section_takportal),
+    ('Email Relay', _diag_section_emailrelay),
+    ('Guard Dog', _diag_section_guarddog),
+    ('Other modules', _diag_section_modules),
+)
+
+
+def _diag_collect():
+    """The full report text, redacted. Never raises."""
+    settings = load_settings()
+    t0 = time.time()
+    parts = [f"infra-TAK diagnostics — {settings.get('fqdn') or settings.get('server_ip') or 'unknown box'} — "
+             f"v{VERSION} — {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+             'This report contains hostnames, IP addresses, usernames and log lines. '
+             'Passwords, tokens and keys are redacted. Nothing was changed on this box to produce it.']
+    for n, (title, fn) in enumerate(_DIAG_SECTIONS, 1):
+        s0 = time.time()
+        try:
+            body = fn(settings)
+        except Exception as e:
+            body = [f'(section failed: {type(e).__name__}: {str(e)[:200]})']
+        parts.append(f"\n===== {n}. {title}  ({time.time() - s0:.1f} s) =====")
+        parts.extend(str(x) for x in body)
+    parts.append(f"\n===== end — {time.time() - t0:.0f} s =====")
+    return _diag_redact('\n'.join(parts), settings)
+
+
+def _diag_worker():
+    try:
+        report = _diag_collect()
+        with _DIAG_LOCK:
+            _DIAG_JOB.update(report=report, error=None,
+                             generated_at=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+    except Exception as e:
+        with _DIAG_LOCK:
+            _DIAG_JOB['error'] = str(e)[:300]
+    finally:
+        with _DIAG_LOCK:
+            _DIAG_JOB['running'] = False
+
+
+def _diag_filename(generated_at):
+    """infratak-diagnostics-<fqdn>-<UTC>.txt — the same name for the download and the attachment."""
+    name = re.sub(r'[^A-Za-z0-9.-]', '_', load_settings().get('fqdn') or 'box')
+    return f"infratak-diagnostics-{name}-{re.sub(r'[^0-9T]', '', generated_at or '')}.txt"
+
+
+def _diag_build_email(to_addr, subject, report, filename):
+    """The report in the body (readable on a phone with nothing to open) AND as a .txt
+    attachment (easy to save and forward). `to_addr` must already be validated."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    relay = load_settings().get('email_relay') or {}
+    from_addr = relay.get('from_addr') or 'noreply@localhost'
+    msg = MIMEMultipart()
+    msg['From'] = f"{relay.get('from_name') or 'infra-TAK'} <{from_addr}>"
+    msg['To'] = to_addr
+    msg['Subject'] = re.sub(r'[\r\n]+', ' ', subject)
+    msg.attach(MIMEText(report, 'plain', 'utf-8'))
+    part = MIMEText(report, 'plain', 'utf-8')
+    part.add_header('Content-Disposition', 'attachment', filename=filename)
+    msg.attach(part)
+    return from_addr, msg
+
+
+def _diag_send_email(to_addr, subject, report, filename):
+    """Send through the Email Relay (localhost:25 → Postfix), the same path Guard Dog uses.
+    Its own sender because _guarddog_send_alert_email_via_relay sends a body only, and Guard
+    Dog's alert path is not changed by this feature (PLAN-v10.2.1 §2)."""
+    import smtplib
+    from_addr, msg = _diag_build_email(to_addr, subject, report, filename)
+    with smtplib.SMTP('localhost', 25, timeout=30) as smtp:
+        smtp.sendmail(from_addr, [to_addr], msg.as_string())
+
+
+@app.route('/api/support/diagnostics/run', methods=['POST'])
+@login_required
+def support_diagnostics_run():
+    with _DIAG_LOCK:
+        if _DIAG_JOB['running']:
+            return jsonify({'success': False, 'error': 'Diagnostics are already running'}), 409
+        _DIAG_JOB.update(running=True, error=None)
+    print('[diagnostics] report requested', flush=True)
+    threading.Thread(target=_diag_worker, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/support/diagnostics/status')
+@login_required
+def support_diagnostics_status():
+    with _DIAG_LOCK:
+        return jsonify(dict(_DIAG_JOB))
+
+
+@app.route('/api/support/diagnostics/download')
+@login_required
+def support_diagnostics_download():
+    from flask import Response
+    with _DIAG_LOCK:
+        report, when = _DIAG_JOB['report'], _DIAG_JOB['generated_at']
+    if not report:
+        return jsonify({'success': False, 'error': 'Run diagnostics first'}), 404
+    return Response(report, mimetype='text/plain', headers={
+        'Content-Disposition': f'attachment; filename="{_diag_filename(when)}"'})
+
+
+@app.route('/api/support/diagnostics/email', methods=['POST'])
+@login_required
+def support_diagnostics_email():
+    raw = ((request.get_json(silent=True) or {}).get('to') or '').strip()
+    # Exactly ONE address. _safe_alert_emails() splits on whitespace and commas, so
+    # "a@b.com\r\nBcc: x@y.com" would quietly become two recipients; refuse instead.
+    to = _safe_alert_email(raw)
+    if not to or to != raw:
+        return jsonify({'success': False, 'error': 'Enter one valid email address'}), 400
+    settings = load_settings()
+    relay = settings.get('email_relay') or {}
+    if not (relay.get('relay_host') and relay.get('smtp_user')):
+        return jsonify({'success': False, 'error': 'Email Relay is not configured on this box — use Download instead'}), 400
+    with _DIAG_LOCK:
+        report, when = _DIAG_JOB['report'], _DIAG_JOB['generated_at']
+    if not report:
+        return jsonify({'success': False, 'error': 'Run diagnostics first'}), 400
+    subject = f"infra-TAK diagnostics — {settings.get('fqdn') or settings.get('server_ip') or 'box'} — v{VERSION}"
+    try:
+        _diag_send_email(to, subject, report, _diag_filename(when))
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Send failed: {str(e)[:200]}'}), 500
+    print(f'[diagnostics] report emailed to {to}', flush=True)
+    return jsonify({'success': True, 'message': f'Sent to {to}'})
+
 
 def _update_check_response(data):
     """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
@@ -53282,17 +53912,24 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
     bypassing pgbouncer) as "direct". Unix-socket / null client_addr is the
     psql probe itself and is ignored.
 
+    v10.2.1: the worker connects to Postgres directly BY DESIGN
+    (_ensure_authentik_worker_direct_pg). Its connections are counted in
+    `worker_direct`, not `direct`, so `direct` keeps meaning "something is
+    bypassing PgBouncer that should not be".
+
     Returns: dict with keys:
       pgbouncer_ip      — str or None (resolution failed)
       via_pgbouncer     — int (count of idle+active conns from pgbouncer IP)
+      worker_direct     — int (count from the authentik-worker-1 container's IPs)
       direct            — int (count from any other non-null client_addr)
       by_addr           — list of (client_addr, count) tuples, all rows
-      total             — int (sum of via_pgbouncer + direct)
+      total             — int (sum of via_pgbouncer + worker_direct + direct)
       error             — str or None
     """
     out = {
         'pgbouncer_ip': None,
         'via_pgbouncer': 0,
+        'worker_direct': 0,
         'direct': 0,
         'by_addr': [],
         'total': 0,
@@ -53306,6 +53943,14 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
         out['pgbouncer_ip'] = ips[0] if ips else None
     except Exception as _ie:
         out['error'] = f'docker inspect failed: {_ie}'
+    worker_ips = set()
+    try:
+        wip_r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}', 'authentik-worker-1']), capture_output=True, text=True, timeout=5
+        )
+        worker_ips = {ln.strip() for ln in (wip_r.stdout or '').splitlines() if ln.strip()}
+    except Exception:
+        pass
 
     try:
         r = subprocess.run(
@@ -53327,9 +53972,11 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
             out['by_addr'].append((addr, cnt))
             if out['pgbouncer_ip'] and addr == out['pgbouncer_ip']:
                 out['via_pgbouncer'] += cnt
+            elif addr in worker_ips:
+                out['worker_direct'] += cnt
             else:
                 out['direct'] += cnt
-        out['total'] = out['via_pgbouncer'] + out['direct']
+        out['total'] = out['via_pgbouncer'] + out['worker_direct'] + out['direct']
     except Exception as _e:
         out['error'] = (out['error'] or '') + f' | probe error: {_e}'
     return out
@@ -54293,7 +54940,11 @@ def _ensure_authentik_pgbouncer(plog):
 
     server_compose_host = _read_svc_pg_host(services.get('server'))
     worker_compose_host = _read_svc_pg_host(services.get('worker'))
-    compose_env_wired = (server_compose_host == 'pgbouncer' and worker_compose_host == 'pgbouncer')
+    # v10.2.1: only the SERVER belongs on PgBouncer. The worker goes to Postgres
+    # directly (LISTEN + session advisory locks do not survive transaction pooling —
+    # see _ensure_authentik_worker_direct_pg). Requiring the worker on pgbouncer here
+    # would flip it back on every console boot.
+    compose_env_wired = (server_compose_host == 'pgbouncer')
 
     # v2.2 (2026-05-15 PM): the v1 install was silently incomplete. The Authentik
     # compose template hardcodes `AUTHENTIK_POSTGRESQL__HOST: postgresql` in
@@ -54306,15 +54957,15 @@ def _ensure_authentik_pgbouncer(plog):
     # PgBouncer. The fix: also patch services.{server,worker}.environment.
     if pgbouncer_in_compose and pgbouncer_in_env and compose_env_wired:
         plog("  pgbouncer install: already installed (compose + .env + "
-             "server/worker compose env all wired to pgbouncer) — idempotent no-op")
+             "server compose env wired to pgbouncer) — idempotent no-op")
         return False
     if pgbouncer_in_compose and pgbouncer_in_env and not compose_env_wired:
         plog(f"  pgbouncer install: PARTIAL INSTALL DETECTED (v0.9.23-alpha v1 bug). "
              f"pgbouncer container is present and .env is wired, but "
              f"services.server.environment.AUTHENTIK_POSTGRESQL__HOST={server_compose_host!r} "
-             f"and services.worker.environment.AUTHENTIK_POSTGRESQL__HOST={worker_compose_host!r} "
-             f"(both should be 'pgbouncer'). Compose `environment:` overrides `env_file:` per "
-             f"Docker Compose semantics — Authentik is bypassing PgBouncer. Applying v2.2 "
+             f"(should be 'pgbouncer'; the worker is direct by design, currently "
+             f"{worker_compose_host!r}). Compose `environment:` overrides `env_file:` per "
+             f"Docker Compose semantics — the server is bypassing PgBouncer. Applying v2.2 "
              f"compose env fixup + force-recreate now.")
 
     if current_host is not None and current_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
@@ -54390,11 +55041,16 @@ def _ensure_authentik_pgbouncer(plog):
             svc['depends_on'] = {'pgbouncer': {'condition': 'service_healthy'}}
             plog(f"  pgbouncer install: created {svc_name}.depends_on with pgbouncer")
 
-        # v2.2 fix: also rewrite services.{server,worker}.environment.AUTHENTIK_POSTGRESQL__HOST
+        # v2.2 fix: also rewrite services.server.environment.AUTHENTIK_POSTGRESQL__HOST
         # from 'postgresql' → 'pgbouncer'. The compose template hardcodes this in
         # `environment:` which takes PRECEDENCE over `env_file:` — so rewriting .env
         # alone is silently ignored. See idempotency gate comment above for the full
         # forensic trace. This change is what makes the install actually take effect.
+        # v10.2.1: SERVER only. The worker keeps the template's direct `postgresql`
+        # (_ensure_authentik_worker_direct_pg) — its dramatiq broker needs LISTEN and
+        # session advisory locks, which transaction pooling cannot carry.
+        if svc_name != 'server':
+            continue
         env = svc.setdefault('environment', {})
         if isinstance(env, dict):
             prev = env.get('AUTHENTIK_POSTGRESQL__HOST')
@@ -54606,7 +55262,8 @@ def _ensure_authentik_pgbouncer(plog):
         plog(f"  pgbouncer install: post-install probe partial: {_probe['error']}")
 
     plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer} "
-         f"(from {pgb_ip or 'unknown-ip'}), direct={direct}")
+         f"(from {pgb_ip or 'unknown-ip'}), worker_direct={_probe['worker_direct']} "
+         f"(by design), direct={direct}")
     if _probe.get('by_addr'):
         for _addr, _cnt in _probe['by_addr']:
             _tag = '←pgbouncer' if pgb_ip and _addr == pgb_ip else ''
@@ -54691,6 +55348,181 @@ def _ensure_authentik_pgbouncer(plog):
     else:
         plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
              "(transaction pool, ≤90 real PG conns)")
+    return True
+
+
+def _ensure_authentik_worker_direct_pg(plog):
+    """v10.2.1: connect the Authentik WORKER straight to Postgres; the server stays on PgBouncer.
+
+    Authentik 2026.x's task broker (django-dramatiq-postgres) needs two things a
+    transaction-pooling PgBouncer cannot carry — both are "Never" in the transaction
+    column of https://www.pgbouncer.org/features.html:
+
+      * LISTEN authentik.tasks.default.enqueue — how the worker hears about a new task.
+        Through PgBouncer the notification never arrives, so every task waits for the
+        AUTHENTIK_WORKER__CONSUMER_LISTEN_TIMEOUT fallback poll (30s). Measured on
+        test6/test8/test12 2026-09-30, empty queue: p50 17-30s from "Task has been
+        queued" to "Task is being processed", for every actor. A password-reset email
+        is one of those tasks — Justin Davis (TN TAK) reported reset emails delayed.
+      * pg_advisory_lock / pg_advisory_unlock per message — the unlock lands on a
+        different pooled backend than the lock, so the lock leaks until that backend
+        recycles: 647-1123 "you don't own a lock" Postgres warnings per box per day.
+        A retried message keeps its message_id, so its leaked lock can block it.
+
+    Worker on direct Postgres (test12, 2026-09-30): queued→processing 0.08-0.23s, and
+    0 lock warnings where the hour before had 33.
+
+    Only the worker moves. PgBouncer exists to cap upstream #20714's connection leak,
+    which lives in the server's gunicorn workers; the worker's own footprint is small
+    and fixed (processes × threads, plus one listen and one lock connection).
+
+    Upstream fixed this in 2026.8.0 (goauthentik/authentik#23013): an optional
+    `postgresql.direct.*` block that routes only LISTEN and the advisory locks direct.
+    When a 2026.8.x release is vetted, move to that and retire this.
+
+    Acts only on the bundled topology — compose has `postgresql` and `pgbouncer`, the
+    server is on pgbouncer, the worker is on pgbouncer. A worker already on
+    `postgresql` is a no-op; any other host (external PG) is left alone. Recreates the
+    worker only — never the server or the LDAP outpost.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, compose
+    rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  worker direct-pg: PyYAML unavailable — skipped (the pgbouncer step bootstraps it; next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+    except Exception as e:
+        plog(f"  worker direct-pg: compose unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    if not isinstance(services, dict) or 'postgresql' not in services or 'pgbouncer' not in services:
+        return False
+    worker = services.get('worker')
+    if not isinstance(worker, dict):
+        return False
+
+    def _svc_pg_host(svc):
+        env = svc.get('environment') if isinstance(svc, dict) else None
+        if isinstance(env, dict):
+            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            return None if v is None else str(v).strip().strip('"').strip("'")
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    return item.split('=', 1)[1].strip().strip('"').strip("'")
+        return None
+
+    worker_host = _svc_pg_host(worker)
+    if worker_host == 'postgresql':
+        return False
+    if worker_host != 'pgbouncer' or _svc_pg_host(services.get('server')) != 'pgbouncer':
+        plog(f"  worker direct-pg: worker host {worker_host!r} is not the bundled PgBouncer — left alone")
+        return False
+
+    env = worker.get('environment')
+    if isinstance(env, dict):
+        env['AUTHENTIK_POSTGRESQL__HOST'] = 'postgresql'
+    elif isinstance(env, list):
+        worker['environment'] = [
+            'AUTHENTIK_POSTGRESQL__HOST=postgresql'
+            if isinstance(i, str) and i.startswith('AUTHENTIK_POSTGRESQL__HOST=') else i
+            for i in env]
+    else:
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-worker-direct-pg.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            s['authentik_worker_direct_pg'] = {
+                'last_outcome': outcome,
+                'last_attempt_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'version': VERSION,
+                'compose_backup': compose_bak,
+            }
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_worker():
+        return subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'worker']),
+            cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    plog("  worker direct-pg: moving the Authentik worker off PgBouncer onto Postgres "
+         "(task pickup waits on the 30s fallback poll behind a transaction pooler)")
+    with _authentik_compose_lock('worker-direct-pg', plog=plog) as _locked:
+        if not _locked:
+            plog("  worker direct-pg: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(compose_bak, 'w') as f:
+                f.write(raw_compose)
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+        except Exception as e:
+            plog(f"  ✗ worker direct-pg: compose write failed ({e}) — restoring")
+            try:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_worker()
+        if r.returncode != 0:
+            plog(f"  ✗ worker direct-pg: worker recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            _compose_up_worker()
+            _record('recreate-failed')
+            return None
+
+    # Verify the RUNTIME, not the file: the live container must be running with the new
+    # host. This runs inside the synchronous boot path, so the wait is short. Health
+    # `starting` at the deadline is not a failure — the compose healthcheck's 600s
+    # start_period means Docker cannot report `unhealthy` inside this window anyway;
+    # a worker that cannot reach Postgres shows up as exited/restarting instead.
+    status = ''
+    for _ in range(12):
+        time.sleep(5)
+        h = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-worker-1']), capture_output=True, text=True, timeout=10)
+        status = (h.stdout or '').strip()
+        if status.endswith('healthy') or status.split(' ')[0] in ('exited', 'dead', 'restarting'):
+            break
+    e = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'printenv',
+                                   'AUTHENTIK_POSTGRESQL__HOST']), capture_output=True, text=True, timeout=10)
+    live_host = (e.stdout or '').strip()
+    if not status.startswith('running') or status.endswith('unhealthy') or live_host != 'postgresql':
+        plog(f"  ✗ worker direct-pg: worker {status or 'state unknown'}, live host {live_host!r} — "
+             f"rolling back to PgBouncer")
+        with _authentik_compose_lock('worker-direct-pg-rollback', plog=plog) as _locked:
+            if _locked:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+                _compose_up_worker()
+            else:
+                plog(f"  ✗ worker direct-pg: compose lock busy — rollback NOT applied; "
+                     f"restore {compose_bak} by hand")
+        _record('rolled-back')
+        return None
+    plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
+         f"server unchanged on PgBouncer")
+    _record('applied')
     return True
 
 
@@ -60342,6 +61174,7 @@ entries:
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             _ensure_authentik_pgbouncer(plog)
+            _ensure_authentik_worker_direct_pg(plog)
             plog("  ✓ redis + pgbouncer up inline — no restart needed")
         except Exception as _opt_e:
             plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
@@ -63097,6 +63930,7 @@ def authentik_pgbouncer_api():
     _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6)
     via_bouncer = _probe['via_pgbouncer'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
     direct = _probe['direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
+    worker_direct = _probe['worker_direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
 
     return jsonify({
         'installed': bool(cfg.get('installed')),
@@ -63114,6 +63948,7 @@ def authentik_pgbouncer_api():
         'pgbouncer_container_ip': _probe.get('pgbouncer_ip'),
         'pg_stat_activity_via_pgbouncer': via_bouncer,
         'pg_stat_activity_direct': direct,
+        'pg_stat_activity_worker_direct': worker_direct,
         'pg_stat_activity_by_addr': [{'addr': a, 'count': c} for (a, c) in (_probe.get('by_addr') or [])],
         'pg_stat_activity_probe_error': _probe.get('error'),
         'live_pools_raw': pools_raw,
@@ -81475,6 +82310,15 @@ def _startup_migrations():
                 _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
+
+        # v10.2.1: the worker's task broker needs LISTEN/NOTIFY and session advisory
+        # locks, which PgBouncer's transaction pooling cannot carry — every Authentik
+        # task (password-reset email included) waited up to 30s for pickup. Existing
+        # boxes have the worker on pgbouncer; move it (worker only) to Postgres.
+        try:
+            _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_wd_err:
+            print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
 
         # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
         # report): set `vm.overcommit_memory = 1` on the host kernel so Redis

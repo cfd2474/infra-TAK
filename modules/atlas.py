@@ -103,16 +103,21 @@ CHANNEL_BLURB = {
     'dev': 'The newest release, before it has been promoted. Expect to find '
            'the problems here.',
 }
-#: ⚠️ **The pin follows the `main` channel, not the newest release.** It
-#: governs *fresh installs*, and a fresh install must not land on something
-#: that has not been promoted: `main` is "tested releases", so pinning a
-#: dev-only tag here would quietly make every new box a dev box. Updates
-#: resolve the newest tag on the box's own channel themselves and are not
-#: affected by this value.
+#: ⚠️ **The pin is the fallback, not what a fresh install normally gets
+#: (GH #81).** A fresh install resolves the selected channel's release exactly
+#: as an update does, and checks it — see `_resolve_install_target`. The pin is
+#: used only when GitHub cannot be asked (offline, rate-limited), so it means
+#: "the known-good `main` release, scanned with this console release".
 #:
-#: So this moves when a release is **promoted**, not when it is published.
-#: v1.51.0 was published to `dev` and promoted to `main` on 2026-09-19.
-ATLAS_TAG = 'v1.51.0'
+#: Why it stopped being the install target: it went stale between console
+#: releases. On 2026-09-29 it said v1.51.0 while `main` offered v1.52.5, so
+#: every uninstall-and-reinstall silently reverted a deployment to a release
+#: missing the provisioning-timeout and reboot-restart fixes — and a `dev`
+#: operator got a `main`-era release whatever the card said.
+#:
+#: It still follows `main`, never `dev`, and still moves on **promotion**.
+#: v1.54.1 was on `main` on 2026-09-30.
+ATLAS_TAG = 'v1.54.1'
 # ⚠️ The **commit**, not the tag object. `v0.1.0` is an annotated tag, so
 # `git rev-parse v0.1.0` returns the tag object's own SHA while a clone's HEAD
 # is the commit it points at — two different hashes, and comparing them made
@@ -128,8 +133,8 @@ ATLAS_TAG = 'v1.51.0'
 # that has moved" — a message pointing at tampering rather than at bookkeeping.
 # Take it from the mirror, never from the working copy you are standing in:
 #
-#     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.47.3
-ATLAS_SHA = 'd2419ee63c37c48c85687b457127815312e51ff5'
+#     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.54.1
+ATLAS_SHA = 'e580fa6618fc9dbfe2b782f7ca9ff980fd813f2b'
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -3034,14 +3039,88 @@ def _write_build_file(dirpath, plog=None):
         return None
 
 
-def _verify_pin(ctx, dirpath, plog):
+def _ls_remote(refs):
+    """`git ls-remote` against the mirror, as ``{ref: sha}``. Raises on failure.
+
+    ⚠️ An annotated tag lists as the tag *object*; its commit only appears on
+    a separate ``<ref>^{}`` line, and only when that pattern is asked for
+    explicitly. Callers that want the commit ask for both.
+    """
+    r = subprocess.run(['git', 'ls-remote', ATLAS_REPO_HTTPS] + list(refs),
+                       capture_output=True, text=True, timeout=60, env=None)
+    if r.returncode != 0:
+        raise RuntimeError('git ls-remote failed: ' + (r.stderr or '')[-300:])
+    found = {}
+    for line in (r.stdout or '').splitlines():
+        sha, _, ref = line.partition('\t')
+        if sha.strip() and ref.strip():
+            found[ref.strip()] = sha.strip()
+    return found
+
+
+def _resolve_install_target(ctx, plog):
+    """The release a fresh install fetches, and the commit it must turn out to be.
+
+    Returns ``(tag, commit)``. The same resolution `_run_update` uses — the
+    selected channel's `VERSION` — so install and update agree on what a
+    channel means (GH #81).
+
+    ⚠️ **Checked, where the update path is not.** The channel's tag must
+    dereference to the *same commit* as the channel's branch tip. The mirror
+    guarantees that by construction (one orphan commit per release, and the
+    branch is moved onto it), so a disagreement means a tag moved away from its
+    channel, or a `VERSION` naming a tag the branch does not hold — refused
+    either way. `_verify_checkout` then requires the clone's HEAD to be that
+    commit.
+
+    ⚠️ **Weaker than an out-of-band pin, and said so.** A repository owner who
+    moves the tag and the branch together passes this check; only a hash
+    recorded in this file would catch that. It is the same trust the update
+    path already has (accepted 2026-09-19), which every deployment runs after
+    install — so the pin was protecting the first install and nothing after.
+
+    ⚠️ **GitHub unreachable falls back to the pin, not to a refusal.** The pin
+    is a scanned `main` release, which is the right thing for a box that
+    cannot ask. It is logged, so a `dev` operator is not surprised.
+    """
+    channel = _channel_of(ctx)
+    version = _latest_version(use_cache=False, channel=channel)
+    if not version:
+        plog(f'  ⚠ Could not read the {channel} channel (GitHub unreachable '
+             f'or rate-limited) — installing the pinned {ATLAS_TAG}')
+        return ATLAS_TAG, ATLAS_SHA
+    tag = 'v' + version
+    branch_ref, tag_ref = 'refs/heads/' + channel, 'refs/tags/' + tag
+    try:
+        refs = _ls_remote([branch_ref, tag_ref, tag_ref + '^{}'])
+    except Exception as e:
+        plog(f'  ⚠ Could not list the mirror ({str(e)[:120]}) — installing '
+             f'the pinned {ATLAS_TAG}')
+        return ATLAS_TAG, ATLAS_SHA
+    tip = refs.get(branch_ref)
+    commit = refs.get(tag_ref + '^{}') or refs.get(tag_ref)
+    if not commit:
+        raise RuntimeError(
+            f'The {channel} channel names {tag}, but the mirror has no such '
+            'tag — refusing to install')
+    if commit != tip:
+        raise RuntimeError(
+            f'{tag} is {commit[:12]} but the {channel} branch is at '
+            f'{(tip or "nothing")[:12]} — refusing to install a tag that is '
+            f'not the {channel} release')
+    plog(f'  {channel} channel offers {tag} = {commit[:12]} (tag and branch agree)')
+    return tag, commit
+
+
+def _verify_checkout(ctx, dirpath, plog, tag, expected):
     """Check the checkout is the commit we meant to install.
 
     ⚠️ A tag is a pointer and whoever owns the repository can move it. Rule 8
     wants the SHA checked *after* the fetch, which is the only moment the
-    difference is observable.
+    difference is observable — between `_resolve_install_target` asking and
+    the clone landing, the tag could have moved.
 
-    ⚠️ `ATLAS_SHA` must be the **commit** the tag dereferences to. An annotated
+    ⚠️ `expected` must be the **commit** the tag dereferences to. An annotated
     tag is itself an object with its own hash, so `git rev-parse <tag>` and the
     HEAD of a clone made from it are different strings — and comparing them
     fails every time, which reads exactly like a tag that has been tampered
@@ -3049,15 +3128,15 @@ def _verify_pin(ctx, dirpath, plog):
     """
     r = ctx['_module_git'](dirpath, 'rev-parse', 'HEAD', timeout=10)
     head = (r.stdout or '').strip()
-    if not ATLAS_SHA:
-        plog(f'  ⚠ No pinned SHA recorded — installed {head[:12]} from {ATLAS_TAG}')
+    if not expected:
+        plog(f'  ⚠ No commit recorded for {tag} — installed {head[:12]}')
         return head
-    if not head.startswith(ATLAS_SHA) and not ATLAS_SHA.startswith(head):
+    if not head or (not head.startswith(expected) and not expected.startswith(head)):
         raise RuntimeError(
-            f'{ATLAS_TAG} resolved to {head[:12]}, expected {ATLAS_SHA[:12]} — '
+            f'{tag} resolved to {head[:12] or "nothing"}, expected {expected[:12]} — '
             'refusing to install a tag that has moved'
         )
-    plog(f'  ✓ Pin verified: {ATLAS_TAG} = {head[:12]}')
+    plog(f'  ✓ Commit verified: {tag} = {head[:12]}')
     return head
 
 
@@ -3140,22 +3219,26 @@ def deploy(ctx, job, params):
             except OSError:
                 pass
         repo = ATLAS_REPO_HTTPS
+        # ⚠️ The selected channel's release, not a constant (GH #81) — and
+        # resolved before anything is fetched, so a refusal leaves the box as
+        # it was.
+        tag, expected = _resolve_install_target(ctx, plog)
 
         if os.path.isdir(os.path.join(dirpath, '.git')):
-            plog(f'  Already cloned at {dirpath} — fetching {ATLAS_TAG}')
+            plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
             r = subprocess.run(
-                ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', ATLAS_TAG],
+                ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
                 capture_output=True, text=True, timeout=300, env=None,
             )
             if r.returncode != 0:
                 raise RuntimeError(f'git fetch failed: {r.stderr[-300:]}')
-            ctx['_module_git'](dirpath, 'checkout', '-f', ATLAS_TAG, timeout=60)
+            ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
         else:
             os.makedirs(dirpath, exist_ok=True)
-            plog(f'  Cloning {repo} @ {ATLAS_TAG}')
+            plog(f'  Cloning {repo} @ {tag}')
             r = subprocess.run(
-                ['git', 'clone', '--depth=1', '--branch', ATLAS_TAG, repo, dirpath],
+                ['git', 'clone', '--depth=1', '--branch', tag, repo, dirpath],
                 capture_output=True, text=True, timeout=600, env=None,
             )
             if r.returncode != 0:
@@ -3163,7 +3246,7 @@ def deploy(ctx, job, params):
                 if 'Permission denied' in r.stderr or 'not read from remote' in r.stderr:
                     hint = ' — the repository is private; supply a read-only deploy key'
                 raise RuntimeError(f'git clone failed{hint}: {r.stderr[-300:]}')
-        commit = _verify_pin(ctx, dirpath, plog)
+        commit = _verify_checkout(ctx, dirpath, plog, tag, expected)
         _write_build_file(dirpath, plog)
         plog('✓ Source in place')
 
@@ -5531,12 +5614,12 @@ def register(ctx):
         return {
             'success': True,
             'channel': current,
-            # ⚠️ Fresh installs land here whichever channel is selected — the
-            # pin is a verified commit and the channel is a branch that moves.
-            # Said on the card, so a dev-channel operator is not surprised when
-            # a new agency deploys at the stable release and is immediately
-            # offered an update.
-            'install_tag': ATLAS_TAG,
+            # ⚠️ What a fresh install fetches right now: the selected
+            # channel's release (GH #81), or the pin when GitHub cannot be
+            # asked. Both said on the card, because the fallback is the one
+            # case where a `dev` operator gets a `main` release.
+            'install_tag': ('v' + offers[current]) if offers.get(current) else ATLAS_TAG,
+            'install_fallback_tag': ATLAS_TAG,
             'channels': [
                 {'key': c,
                  'label': c.capitalize(),
