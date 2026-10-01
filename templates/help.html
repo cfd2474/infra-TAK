@@ -66,6 +66,24 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<main class="main">
+<div class="help-card" id="diag-card">
+<div class="help-card-header" onclick="helpToggle(this)"><h2>Diagnostics — send us a report</h2><span class="help-card-toggle" style="transform:rotate(180deg)">&#9662;</span></div>
+<div class="help-card-body" style="display:block">
+<p>Something not working? Run diagnostics and send the report to support. It looks at this server — versions, connectivity, containers, Authentik and LDAP, TAK Server clients and logs, Email Relay — and <strong>changes nothing</strong>. Passwords, tokens and keys are removed from the report; it does contain hostnames, IP addresses, usernames and log lines.</p>
+<button type="button" class="btn btn-primary" id="diag-run">Run diagnostics</button>
+<span id="diag-status" style="margin-left:12px;font-size:12px;color:var(--text-dim)"></span>
+<pre id="diag-report" hidden style="margin-top:14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word"></pre>
+<div id="diag-actions" hidden style="margin-top:14px">
+<p><button type="button" class="btn btn-ghost" id="diag-download">Download report</button></p>
+{% if diag_email_ready %}
+<div class="form-field"><label>Email the report to</label><input type="text" id="diag-to" value="{{ diag_support_email }}" placeholder="support email address" autocomplete="off"></div>
+<button type="button" class="btn btn-primary" id="diag-send">Email report</button>
+<div id="diag-email-msg" style="margin-top:10px;font-size:13px;min-height:18px"></div>
+{% else %}
+<p style="font-size:12px;color:var(--text-dim)">Email Relay isn't set up on this server, so the report can't be emailed from here. Use <strong>Download report</strong> and attach the file to an email instead.</p>
+{% endif %}
+</div>
+</div></div>
 <div class="help-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Deployment order</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
@@ -201,4 +219,62 @@ async function doConsoleRollback(){
         }
     }catch(e){if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}alert('Network error: '+e.message);}
 }
+</script>
+<script>
+// v10.2.1 (W3): Diagnostics card. Every button is wired here, not via inline onclick.
+(function(){
+  var runBtn=document.getElementById('diag-run');
+  var statusEl=document.getElementById('diag-status');
+  var reportEl=document.getElementById('diag-report');
+  var actionsEl=document.getElementById('diag-actions');
+  if(!runBtn)return;
+  function showReport(d){
+    if(!d||!d.report)return;
+    reportEl.textContent=d.report;
+    reportEl.hidden=false;
+    actionsEl.hidden=false;
+    statusEl.textContent='Report generated '+(d.generated_at||'')+' (UTC).';
+  }
+  function poll(){
+    fetch('/api/support/diagnostics/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(d.running){statusEl.textContent='Collecting… this can take up to a minute.';setTimeout(poll,2000);return;}
+      runBtn.disabled=false;
+      if(d.error){statusEl.textContent='Diagnostics failed: '+d.error;return;}
+      showReport(d);
+    }).catch(function(){runBtn.disabled=false;statusEl.textContent='Could not reach the console.';});
+  }
+  runBtn.addEventListener('click',function(){
+    runBtn.disabled=true;
+    statusEl.textContent='Starting…';
+    fetch('/api/support/diagnostics/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+      .then(function(r){return r.json().then(function(d){return {status:r.status,d:d};});})
+      .then(function(x){
+        if(x.status!==200&&x.status!==409){runBtn.disabled=false;statusEl.textContent=x.d.error||'Could not start diagnostics.';return;}
+        poll();
+      }).catch(function(){runBtn.disabled=false;statusEl.textContent='Could not reach the console.';});
+  });
+  document.getElementById('diag-download').addEventListener('click',function(){
+    window.location.href='/api/support/diagnostics/download';
+  });
+  var sendBtn=document.getElementById('diag-send');
+  if(sendBtn){
+    sendBtn.addEventListener('click',function(){
+      var to=(document.getElementById('diag-to').value||'').trim();
+      var msg=document.getElementById('diag-email-msg');
+      if(!to){msg.style.color='var(--red)';msg.textContent='Enter an email address.';return;}
+      sendBtn.disabled=true;
+      msg.style.color='var(--cyan)';msg.textContent='Sending…';
+      fetch('/api/support/diagnostics/email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:to}),credentials:'same-origin'})
+        .then(function(r){return r.json();}).then(function(d){
+          sendBtn.disabled=false;
+          if(d.success){msg.style.color='var(--green)';msg.textContent=d.message||'Sent.';}
+          else{msg.style.color='var(--red)';msg.textContent=d.error||'Send failed.';}
+        }).catch(function(){sendBtn.disabled=false;msg.style.color='var(--red)';msg.textContent='Could not reach the console.';});
+    });
+  }
+  // A report generated (or still running) before a page reload is picked up again.
+  fetch('/api/support/diagnostics/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d.running){runBtn.disabled=true;poll();}else{showReport(d);}
+  }).catch(function(){});
+})();
 </script>{% endblock %}
