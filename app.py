@@ -185,6 +185,13 @@ import stat as _stat
 
 BROKER_SOCKET = os.environ.get('TAKWERX_BROKER_SOCKET', '/run/takwerx-broker.sock')
 _BROKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
+# v10.2.2 W1: the light client every privileged exec goes through — same `exec --`
+# contract as `takwerx_broker.py exec`, without re-compiling the 3,300-line daemon
+# script on every call (test6: p50 213-230 ms -> 88 ms per call).
+_BROKER_CLIENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_brokerctl.py')
+# -I -S: no site/.pth processing, no script dir or PYTHON* env on the import path.
+# The client is stdlib-only. Measured on test6: bare startup 32 -> 22 ms (venv).
+_BROKER_CLIENT_PYFLAGS = ['-I', '-S']
 
 
 class BrokerError(RuntimeError):
@@ -232,15 +239,15 @@ def _sudo_wrap(cmd):
 
     - Console as root, broker not routing: returns cmd unchanged (run directly).
     - Broker routing active + socket present: returns a brokerctl proxy
-      invocation. The caller still runs the list via subprocess.run(...);
-      brokerctl forwards argv (and the caller's cwd) to the root broker, which
-      enforces the allowlist + audit log.
+      invocation (broker/takwerx_brokerctl.py). The caller still runs the list
+      via subprocess.run(...); brokerctl forwards argv (and the caller's cwd) to
+      the root broker, which enforces the allowlist + audit log.
     - Legacy fallback (non-root, no broker): 'sudo -n' (pre-broker behavior)."""
     cmd = list(cmd)
     if cmd and cmd[0] == 'sudo':
         return cmd
     if _broker_should_route() and _broker_available():
-        return [_sys.executable, _BROKER_SCRIPT, 'exec', '--'] + cmd
+        return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--'] + cmd
     if os.getuid() != 0 and cmd and cmd[0] != 'sudo':
         return ['sudo', '-n'] + cmd
     return cmd
@@ -78081,7 +78088,7 @@ def _startup_ensure_broker():
         _shim_installer = os.path.join(os.path.dirname(_BROKER_SCRIPT), 'install-shims.sh')
         if os.path.isfile(_shim_installer):
             _senv = dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin')
-            _sr = subprocess.run(['bash', _shim_installer, _BROKER_SHIM_DIR, _BROKER_SCRIPT],
+            _sr = subprocess.run(['bash', _shim_installer, _BROKER_SHIM_DIR, _BROKER_CLIENT],
                                  capture_output=True, text=True, timeout=30, env=_senv)
             if _sr.returncode != 0:
                 print(f'Startup migration: shim regen failed (non-fatal): '

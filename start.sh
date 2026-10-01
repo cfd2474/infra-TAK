@@ -947,7 +947,7 @@ finalize_nonroot_ownership() {
     # the root broker without giving takwerx real privilege. Idempotent.
     if [ -f "$INSTALL_DIR/broker/install-shims.sh" ]; then
         bash "$INSTALL_DIR/broker/install-shims.sh" "$INSTALL_DIR/.shims" \
-            "$INSTALL_DIR/broker/takwerx_broker.py" >/dev/null 2>&1 \
+            "$INSTALL_DIR/broker/takwerx_brokerctl.py" >/dev/null 2>&1 \
             && echo -e "  ${GREEN}✓ Broker PATH-shims installed${NC}"
     fi
     chown -R "$NONROOT_USER:$NONROOT_GROUP" "$INSTALL_DIR"
