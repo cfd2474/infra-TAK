@@ -7833,6 +7833,13 @@ def _diag_section_takserver(settings):
         if hits:
             out.append('  newest:')
             out.extend('    ' + l[:320] for l in hits[-6:])
+    # v10.2.3: a backup that stalls on a lock can be explained from a report alone —
+    # without running the update again to watch it fail.
+    _mode = _get_tak_deployment_config(settings).get('mode')
+    if _mode in ('two_server', 'external_db'):
+        out.append(f"cot database sessions: not shown — the database is not on this box ({_mode})")
+    else:
+        out.extend(_cot_stall_report())
     out.extend(_diag_tak_update_history())
     return out
 
@@ -71065,6 +71072,96 @@ def _validate_snapshot_label(label):
     return True, label
 
 
+# v10.2.3: how long a snapshot's pg_dump may wait for its table locks before it gives
+# up and says so. pg_dump waits FOREVER by default, so one session holding an exclusive
+# lock on a cot table turned the 5.8 pre-migration backup into a silent 10-minute stall
+# (lutak.net, 2026-10-01 and -02: 495 MB, root console, timed out both days). Ordinary
+# holders — autovacuum's truncate, a pg_repack swap — let go within seconds. The broker's
+# _do_pg_dump uses the same value.
+_COT_DUMP_LOCK_WAIT = '120s'
+
+# The cot sessions that can stall a dump: every pg_dump, everything waiting on a lock and
+# whatever it is waiting behind, anything holding an exclusive table lock, transactions
+# left idle for over 30 s, and statements running for over a minute. One text column per
+# row (chr(31)-separated) so a stray character in a query can't shift the fields.
+_COT_STALL_SQL = (
+    "SELECT concat_ws(chr(31), a.pid,"
+    " coalesce(nullif(a.application_name, ''), a.backend_type, '-'),"
+    " coalesce(host(a.client_addr), 'local'),"
+    " coalesce(a.state, '-'),"
+    " coalesce(a.wait_event_type || ':' || a.wait_event, ''),"
+    " coalesce(extract(epoch FROM now() - a.xact_start)::bigint::text, ''),"
+    " array_to_string(pg_blocking_pids(a.pid), ','),"
+    " coalesce((SELECT string_agg(DISTINCT l.mode || ' on ' || coalesce(l.relation::regclass::text, l.locktype), ', ')"
+    "           FROM pg_locks l WHERE l.pid = a.pid AND NOT l.granted), ''),"
+    " coalesce((SELECT string_agg(DISTINCT l.relation::regclass::text, ', ') FROM pg_locks l"
+    "           WHERE l.pid = a.pid AND l.granted AND l.locktype = 'relation'"
+    "           AND l.mode = 'AccessExclusiveLock'), ''),"
+    " left(regexp_replace(coalesce(a.query, ''), '\\s+', ' ', 'g'), 100))"
+    " FROM pg_stat_activity a"
+    " WHERE a.datname = 'cot' AND a.pid <> pg_backend_pid() AND ("
+    "  a.application_name = 'pg_dump' OR a.wait_event_type = 'Lock'"
+    "  OR (a.state LIKE 'idle in transaction%' AND a.state_change < now() - interval '30 seconds')"
+    "  OR (a.state = 'active' AND a.query_start < now() - interval '60 seconds')"
+    "  OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.granted"
+    "             AND l.locktype = 'relation' AND l.mode = 'AccessExclusiveLock')"
+    "  OR a.pid IN (SELECT unnest(pg_blocking_pids(b.pid)) FROM pg_stat_activity b"
+    "               WHERE b.datname = 'cot' AND b.wait_event_type = 'Lock'))"
+    " ORDER BY a.xact_start NULLS LAST LIMIT 12;"
+)
+
+
+def _cot_stall_report():
+    """What the LOCAL cot database is doing that could stall a pg_dump: who is waiting,
+    on which table, and who holds it. Read-only (catalog views only — it takes no table
+    lock itself), never raises. Printed when a snapshot dump fails and in Help →
+    Diagnostics, so a stuck backup names its blocker instead of guessing one."""
+    def _age(s):
+        s = int(s)
+        return f'{s} s' if s < 120 else (f'{s // 60} min' if s < 7200 else f'{s // 3600} h')
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'cot', '-c', _COT_STALL_SQL], timeout=20)
+    except Exception as e:
+        return [f'(could not ask the cot database what it is doing: {str(e)[:160]})']
+    if r.returncode != 0:
+        return ['(could not ask the cot database what it is doing: %s)'
+                % ((r.stderr or '').strip()[:160] or 'exit %s' % r.returncode)]
+    rows = [l.split('\x1f') for l in (r.stdout or '').splitlines() if l.count('\x1f') == 9]
+    if not rows:
+        return ['cot database: nothing is waiting on a lock, holding an exclusive lock, '
+                'or sitting in a long transaction']
+    out = ['cot database — sessions that can stall a dump (oldest transaction first):']
+    apps, blockers = {}, []
+    for pid, app, client, state, wait, xs, blk, wants, excl, query in rows:
+        apps[pid] = app
+        if app == 'pg_dump':
+            blockers += [b for b in blk.split(',') if b and b not in blockers]
+        bits = [f'pid {pid} {app} ({client}) {state}']
+        if xs.isdigit():
+            bits.append('transaction open ' + _age(xs))
+        if wants:
+            bits.append('WAITING for ' + wants)
+        elif wait:
+            bits.append('wait ' + wait)
+        if blk:
+            bits.append('blocked by pid ' + blk)
+        if excl:
+            bits.append('HOLDS an exclusive lock on ' + excl)
+        # String literals masked: a session's SQL can carry a password or CoT content, and
+        # this text lands in the panel, the update record and Diagnostics. The statement
+        # and its table names are what identify the holder.
+        query = re.sub(r"'(?:[^']|'')*(?:'|$)", "'…'", query)
+        out.append('  ' + ', '.join(bits) + (f' — {query}' if query else ''))
+    if blockers:
+        names = ', '.join(f"{b} ({apps.get(b, '?')})" for b in blockers)
+        out.append(f'  → pg_dump is blocked by pid {names}. That session has to finish or be '
+                   f'ended before a backup can run.')
+        if any('JDBC' in apps.get(b, '') for b in blockers):
+            out.append("  → that is TAK Server's own database connection — restart TAK Server "
+                       "from its page, then run the update again.")
+    return out
+
+
 def _tak_snapshot(label, plog=None):
     """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
 
@@ -71291,21 +71388,39 @@ def _tak_snapshot(label, plog=None):
                 else:
                     plog("  snapshot: broker pg_dump produced an EMPTY dump — db_dump=False (config+certs captured)")
             except Exception as _pg_e:
-                plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:200]} — db_dump=False (config+certs captured)")
+                plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:300]} — db_dump=False (config+certs captured)")
+                for _l in _cot_stall_report():
+                    plog('  ' + _l)
         else:
             # Root console. v10.2.2: the SAME command and window the broker uses for the
             # non-root path (_do_pg_dump: runuser argv, 600 s) — this branch had a shell
             # `sudo -u postgres` with a 300 s cap, and its TimeoutExpired surfaced only as a
             # bare "pg_dump exception". No dev box runs as root, so T&E never exercised it.
+            # v10.2.3: the dump waits at most _COT_DUMP_LOCK_WAIT for its table locks, and
+            # it runs in its own session so a timeout kills pg_dump itself — killing only
+            # runuser left pg_dump orphaned, still holding its locks and snapshot, until
+            # the console restarted. A stuck or failed dump reports what the cot database
+            # was doing (_cot_stall_report) instead of guessing.
+            import signal as _signal
             r2 = None
-            try:
-                with open(pg_dump_path, 'wb') as _f:
-                    r2 = subprocess.run(['runuser', '-u', 'postgres', '--', 'pg_dump', '-Fc', 'cot'],
-                                        stdout=_f, stderr=subprocess.PIPE, cwd='/', timeout=600)
-            except subprocess.TimeoutExpired:
-                plog("  snapshot: pg_dump did not finish within 10 min — db_dump=False. A long "
-                     "VACUUM FULL / repack holding locks on the cot database is the usual cause; "
-                     "let it finish and retry.")
+            with open(pg_dump_path, 'wb') as _f:
+                _p = subprocess.Popen(['runuser', '-u', 'postgres', '--', 'pg_dump',
+                                       '--lock-wait-timeout=' + _COT_DUMP_LOCK_WAIT, '-Fc', 'cot'],
+                                      stdout=_f, stderr=subprocess.PIPE, cwd='/',
+                                      start_new_session=True)
+                try:
+                    _err = _p.communicate(timeout=600)[1]
+                    r2 = subprocess.CompletedProcess(_p.args, _p.returncode, None, _err)
+                except subprocess.TimeoutExpired:
+                    try: _wrote = os.path.getsize(pg_dump_path)
+                    except OSError: _wrote = 0
+                    plog(f"  snapshot: pg_dump did not finish within 10 min — it had written "
+                         f"{_wrote // 1024} KB. db_dump=False.")
+                    for _l in _cot_stall_report():   # before the kill: shows what pg_dump was doing
+                        plog('  ' + _l)
+                    try: os.killpg(_p.pid, _signal.SIGKILL)
+                    except OSError: pass
+                    _p.communicate()
             if r2 is not None and r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
                 meta['db_dump'] = True
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
@@ -71313,6 +71428,8 @@ def _tak_snapshot(label, plog=None):
                 if r2 is not None:
                     plog(f"  snapshot: pg_dump FAILED (exit {r2.returncode}): "
                          f"{(r2.stderr or b'').decode(errors='replace').strip()[:300]}")
+                    for _l in _cot_stall_report():
+                        plog('  ' + _l)
                 try: os.remove(pg_dump_path)
                 except Exception: pass
     except Exception as e:

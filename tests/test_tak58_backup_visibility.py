@@ -55,7 +55,7 @@ def test_root_snapshot_dump_matches_the_broker_path():
     body = _code(_func('_tak_snapshot'))
     # the two-server branch runs sudo on the REMOTE box over SSH; the local shell form is gone
     assert not re.search(r"'sudo -u postgres pg_dump -Fc cot',\s*shell=True", body)
-    root = body[body.index("['runuser', '-u', 'postgres', '--', 'pg_dump', '-Fc', 'cot']"):]
+    root = body[body.index("['runuser', '-u', 'postgres', '--', 'pg_dump',"):]
     root = root[:root.index('# 5. Certificates') if '# 5. Certificates' in root else 600]
     assert "cwd='/'" in root and 'timeout=600' in root and 'shell=True' not in root
     assert 'TimeoutExpired' in body                  # a timeout is reported, not swallowed
