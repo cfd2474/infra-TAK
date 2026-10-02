@@ -54609,6 +54609,14 @@ _AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S = 900  # 15 min between in-place res
 # 130+ that causes server health-check timeouts.
 # Configurable: channels_pool_watchdog_idle_in_tx_threshold in settings.json.
 _AUTHENTIK_IDLE_IN_TX_WATCHDOG_THRESHOLD = 60
+# v10.2.2 W10: the idle-in-tx watchdog counts only connections idle in a transaction for
+# longer than this — the ABANDONED ones its restart exists to clear (they sit until
+# idle_in_transaction_session_timeout=300s kills them). Measured on test6 2026-10-02
+# 03:44-03:48Z: 1 -> 117 idle-in-tx in 3 min, every one idle 0-3 s, transactions up to
+# 2 min old — workers mid-flow on a CPU pinned at 762% by uncached LDAP binds, not
+# abandonment. Restarting there emptied the LDAP outpost's bind cache and re-armed the
+# storm three times in 15 minutes (each restart = TAK logins failing).
+_AUTHENTIK_IDLE_IN_TX_STALE_S = 30
 
 
 def _authentik_pgbouncer_cl_waiting():
@@ -57104,7 +57112,11 @@ _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT = 2000
 # leak rate doubled what Tom's box measured. Pattern preferred everywhere:
 # escalate-fast-deescalate-slow.
 _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S = 120   # 2 min — fast convergence under fire
-_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 1800    # 30 min — avoid oscillation on quiet → noisy transitions
+# v10.2.2 W10: was 1800 (30 min). Every UP step force-recreates server+worker — a full
+# Authentik outage that breaks TAK logins and empties the LDAP outpost's bind cache — so
+# walking 100 -> 1000 took ~10 recreates in ~5 h. test6 2026-10-01/02: 12 recreates in
+# 14 h; the 03:19 UP step set off the 03:24 storm. 6 h between UP steps caps it at 4/day.
+_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 21600   # 6 h
 _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S = 1800  # 30 min: "recent fire" window
 _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S = 21600  # 6h: "no fire for a long time"
 _AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX = 50
@@ -57219,7 +57231,8 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
         30 min", which is not the same thing — see the comment on the down
         path for the single-fire runaway that produced.
       - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
-        clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
+        clamped). Cooldown: 6 h between up-tunes (v10.2.2; was 30 min) — each
+        step is a full Authentik recreate.
       - otherwise                                        → no change
 
     The cooldown asymmetry matters: tak-10 (May 2026) showed the original
@@ -57536,8 +57549,9 @@ def _authentik_channels_pool_watchdog_loop():
                  '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
                  "SELECT "
                  "  COUNT(*) FILTER (WHERE state='idle'), "
-                 "  COUNT(*) FILTER (WHERE state='idle in transaction') "
-                 "FROM pg_stat_activity WHERE datname='authentik'"]),
+                 "  COUNT(*) FILTER (WHERE state='idle in transaction' "
+                 "                   AND now() - state_change > interval '%d seconds') "
+                 "FROM pg_stat_activity WHERE datname='authentik'" % _AUTHENTIK_IDLE_IN_TX_STALE_S]),
                 capture_output=True, text=True, timeout=10
             )
             if _r.returncode != 0:
@@ -57910,7 +57924,8 @@ def _authentik_channels_pool_watchdog_loop():
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str_tx = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
                 print(
-                    f"[ak-pg-watchdog] ALERT: {_idle_in_tx_count} idle-in-transaction PG connections "
+                    f"[ak-pg-watchdog] ALERT: {_idle_in_tx_count} PG connections idle in a transaction "
+                    f"for >{_AUTHENTIK_IDLE_IN_TX_STALE_S}s "
                     f"(threshold={_idle_in_tx_threshold}, idle={_count}, {_mr_str_tx}) — "
                     f"CancelledError/mid-tx abandonment storm detected. "
                     f"Restarting authentik-server-1. SAFETY NET firing.",
