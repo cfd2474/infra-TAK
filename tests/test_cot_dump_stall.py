@@ -200,6 +200,34 @@ def test_report_says_restart_tak_when_the_holder_is_tak_itself():
     assert lines[-1].startswith("  → that is TAK Server's own database connection — restart TAK Server")
 
 
+def test_after_pg_dump_gave_up_the_holder_is_still_named():
+    # test6, 2026-10-02 15:38: the panel's report, run once pg_dump had already exited on its
+    # lock wait — only the holder is left to show, so it gets named on its own.
+    out = _row(590875, 'psql', 'local', 'active', 'Timeout:PgSleep', 120, '', '', 'signal_identity',
+               'BEGIN; LOCK TABLE public.signal_identity IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(200); COMMIT;')
+    lines, _ = _report(_R(0, out))
+    assert lines[-1] == ('  → pid 590875 (psql) holds an exclusive table lock. A backup cannot run '
+                         'until that session finishes or is ended.')
+    jdbc = _row(77, 'PostgreSQL JDBC Driver', '127.0.0.1', 'idle in transaction', '', 400, '', '',
+                'public.mission', 'ALTER TABLE mission ADD COLUMN x int')
+    assert _report(_R(0, jdbc))[0][-1].startswith("  → that is TAK Server's own database connection")
+
+
+def test_lock_wait_give_up_is_told_apart_from_other_lock_table_errors():
+    ns = {}
+    exec(compile(_cut('_cot_dump_lock_gave_up'), 'app.py', 'exec'), ns)
+    gave_up = ns['_cot_dump_lock_gave_up']
+    # verbatim pg_dump 18 stderr from the live test6 run
+    assert gave_up('pg_dump: error: query failed: ERROR:  canceling statement due to statement timeout\n'
+                   'pg_dump: detail: Query was: LOCK TABLE public.schema_version, public.cot_router IN '
+                   'ACCESS SHARE MODE')
+    assert not gave_up('pg_dump: error: query failed: ERROR:  permission denied for table x\n'
+                       'pg_dump: detail: Query was: LOCK TABLE public.x IN ACCESS SHARE MODE')
+    assert not gave_up('') and not gave_up(None)
+    body = _code(_cut('_tak_snapshot'))
+    assert body.count('_cot_dump_lock_gave_up(') == 2          # root AND broker branches
+
+
 def test_report_masks_string_literals_but_keeps_the_statement():
     out = _row(9, 'psql', 'local', 'idle in transaction', '', 60, '', '', 'public.cot_router',
                "ALTER ROLE martiuser PASSWORD 's3cr''et'; UPDATE cot_router SET detail='<x callsign=\"A")

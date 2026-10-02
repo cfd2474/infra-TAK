@@ -71111,6 +71111,13 @@ _COT_STALL_SQL = (
 )
 
 
+def _cot_dump_lock_gave_up(err):
+    """True when pg_dump's error is its own --lock-wait-timeout firing. pg_dump applies the
+    wait as a statement timeout around its LOCK TABLE, so that is how the error reads
+    ('canceling statement due to statement timeout … Query was: LOCK TABLE …')."""
+    return 'LOCK TABLE' in (err or '') and 'timeout' in (err or '')
+
+
 def _cot_stall_report():
     """What the LOCAL cot database is doing that could stall a pg_dump: who is waiting,
     on which table, and who holds it. Read-only (catalog views only — it takes no table
@@ -71131,11 +71138,13 @@ def _cot_stall_report():
         return ['cot database: nothing is waiting on a lock, holding an exclusive lock, '
                 'or sitting in a long transaction']
     out = ['cot database — sessions that can stall a dump (oldest transaction first):']
-    apps, blockers = {}, []
+    apps, blockers, holders = {}, [], []
     for pid, app, client, state, wait, xs, blk, wants, excl, query in rows:
         apps[pid] = app
         if app == 'pg_dump':
             blockers += [b for b in blk.split(',') if b and b not in blockers]
+        if excl:
+            holders.append(pid)
         bits = [f'pid {pid} {app} ({client}) {state}']
         if xs.isdigit():
             bits.append('transaction open ' + _age(xs))
@@ -71152,13 +71161,18 @@ def _cot_stall_report():
         # and its table names are what identify the holder.
         query = re.sub(r"'(?:[^']|'')*(?:'|$)", "'…'", query)
         out.append('  ' + ', '.join(bits) + (f' — {query}' if query else ''))
+    named = lambda pids: ', '.join(f"{p} ({apps.get(p, '?')})" for p in pids)
     if blockers:
-        names = ', '.join(f"{b} ({apps.get(b, '?')})" for b in blockers)
-        out.append(f'  → pg_dump is blocked by pid {names}. That session has to finish or be '
-                   f'ended before a backup can run.')
-        if any('JDBC' in apps.get(b, '') for b in blockers):
-            out.append("  → that is TAK Server's own database connection — restart TAK Server "
-                       "from its page, then run the update again.")
+        out.append(f'  → pg_dump is blocked by pid {named(blockers)}. That session has to finish '
+                   f'or be ended before a backup can run.')
+    elif holders:
+        # A dump that already gave up on its lock wait has no row left to link to its
+        # blocker (and Diagnostics runs with no dump at all), so name the holder itself.
+        out.append(f'  → pid {named(holders)} holds an exclusive table lock. A backup cannot run '
+                   f'until that session finishes or is ended.')
+    if any('JDBC' in apps.get(p, '') for p in (blockers or holders)):
+        out.append("  → that is TAK Server's own database connection — restart TAK Server "
+                   "from its page, then run the update again.")
     return out
 
 
@@ -71389,6 +71403,9 @@ def _tak_snapshot(label, plog=None):
                     plog("  snapshot: broker pg_dump produced an EMPTY dump — db_dump=False (config+certs captured)")
             except Exception as _pg_e:
                 plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:300]} — db_dump=False (config+certs captured)")
+                if _cot_dump_lock_gave_up(str(_pg_e)):
+                    plog(f"  snapshot: pg_dump waited {_COT_DUMP_LOCK_WAIT} for its table locks and gave "
+                         f"up — another session is holding one.")
                 for _l in _cot_stall_report():
                     plog('  ' + _l)
         else:
@@ -71426,8 +71443,11 @@ def _tak_snapshot(label, plog=None):
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
             else:
                 if r2 is not None:
-                    plog(f"  snapshot: pg_dump FAILED (exit {r2.returncode}): "
-                         f"{(r2.stderr or b'').decode(errors='replace').strip()[:300]}")
+                    _stderr = (r2.stderr or b'').decode(errors='replace').strip()
+                    plog(f"  snapshot: pg_dump FAILED (exit {r2.returncode}): {_stderr[:300]}")
+                    if _cot_dump_lock_gave_up(_stderr):
+                        plog(f"  snapshot: pg_dump waited {_COT_DUMP_LOCK_WAIT} for its table locks and "
+                             f"gave up — another session is holding one.")
                     for _l in _cot_stall_report():
                         plog('  ' + _l)
                 try: os.remove(pg_dump_path)
