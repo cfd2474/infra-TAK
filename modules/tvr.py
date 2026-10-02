@@ -297,7 +297,7 @@ def deploy(ctx, job, params):
     try:
         settings = ctx['load_settings']()
         # Guard: refuse if standalone mediamtx is installed (same stream ports)
-        modules = ctx['detect_modules']()
+        modules = ctx['detect_modules'](fresh=True)
         if modules.get('mediamtx', {}).get('installed'):
             plog('✗ Cannot deploy: standalone MediaMTX is installed and uses the same ports (8554/8555/8888/8890).')
             plog('  Uninstall MediaMTX first, then deploy TAK Video Restreamer.')

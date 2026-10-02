@@ -185,6 +185,13 @@ import stat as _stat
 
 BROKER_SOCKET = os.environ.get('TAKWERX_BROKER_SOCKET', '/run/takwerx-broker.sock')
 _BROKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
+# v10.2.2 W1: the light client every privileged exec goes through — same `exec --`
+# contract as `takwerx_broker.py exec`, without re-compiling the 3,300-line daemon
+# script on every call (test6: p50 213-230 ms -> 88 ms per call).
+_BROKER_CLIENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_brokerctl.py')
+# -I -S: no site/.pth processing, no script dir or PYTHON* env on the import path.
+# The client is stdlib-only. Measured on test6: bare startup 32 -> 22 ms (venv).
+_BROKER_CLIENT_PYFLAGS = ['-I', '-S']
 
 
 class BrokerError(RuntimeError):
@@ -232,15 +239,15 @@ def _sudo_wrap(cmd):
 
     - Console as root, broker not routing: returns cmd unchanged (run directly).
     - Broker routing active + socket present: returns a brokerctl proxy
-      invocation. The caller still runs the list via subprocess.run(...);
-      brokerctl forwards argv (and the caller's cwd) to the root broker, which
-      enforces the allowlist + audit log.
+      invocation (broker/takwerx_brokerctl.py). The caller still runs the list
+      via subprocess.run(...); brokerctl forwards argv (and the caller's cwd) to
+      the root broker, which enforces the allowlist + audit log.
     - Legacy fallback (non-root, no broker): 'sudo -n' (pre-broker behavior)."""
     cmd = list(cmd)
     if cmd and cmd[0] == 'sudo':
         return cmd
     if _broker_should_route() and _broker_available():
-        return [_sys.executable, _BROKER_SCRIPT, 'exec', '--'] + cmd
+        return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--'] + cmd
     if os.getuid() != 0 and cmd and cmd[0] != 'sudo':
         return ['sudo', '-n'] + cmd
     return cmd
@@ -659,15 +666,39 @@ def _read_coreconfig(path=CORECONFIG_PATH):
     keep their existing FileNotFoundError / 'coreconfig_unreadable' semantics —
     an unreadable CoreConfig must surface as an error, never as "no LDAP".
     Writes already go through _write_priv(); this is the read half of that pair.
+
+    v10.2.2 W3: cached by the file's stat identity (inode, mtime, ctime, size) —
+    23 call sites and the background pollers re-read it through the broker
+    (test6: 134 broker reads per 2,000 audit lines). stat needs only traverse on
+    /opt/tak, not read on the 640 file (verified test6 + nuc as takwerx). Stat
+    BEFORE reading, so a write racing the read can only cause a key mismatch on
+    the next call, never a stale hit. stat fails -> no cache, read as before.
     """
     try:
+        st = os.stat(path)
+        key = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        hit = _CORECONFIG_CACHE.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+    try:
         with open(path, 'r', encoding='utf-8') as f:
-            return f.read()
+            text = f.read()
     except OSError as direct_err:
         try:
-            return _read_priv(path)
+            text = _read_priv(path)
         except Exception:
             raise direct_err
+    if key is not None:
+        if len(_CORECONFIG_CACHE) >= 8 and path not in _CORECONFIG_CACHE:
+            _CORECONFIG_CACHE.clear()
+        _CORECONFIG_CACHE[path] = (key, text)
+    return text
+
+
+_CORECONFIG_CACHE = {}   # path -> ((ino, mtime_ns, ctime_ns, size), text); see _read_coreconfig
 
 
 def _makedirs_priv(path, mode=None, exist_ok=True):
@@ -987,7 +1018,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.1-alpha"
+VERSION = "10.2.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -2821,14 +2852,14 @@ def _takserver_running_local():
     container box (native systemctl is-active is meaningless there)."""
     if _tak_is_container():
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
-                               capture_output=True, text=True, timeout=10)
+            r = _probe_run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
+                           capture_output=True, text=True, timeout=10)
             return r.returncode == 0 and r.stdout.strip() == 'true'
         except Exception:
             return False
     try:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
-                           capture_output=True, text=True, timeout=5)
+        r = _probe_run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                       capture_output=True, text=True, timeout=5)
         return r.stdout.strip() == 'active'
     except Exception:
         return False
@@ -2970,11 +3001,120 @@ def _probe_run(*a, **kw):
     # Up). Route through the shims. No-op as root / when shims absent.
     kw["env"] = _broker_shim_env(kw.get("env"))
     try:
+        if a and len(a) == 1:
+            argv = _probe_shim_equivalent(a[0])
+            if _broker_inprocess_eligible(argv, kw):
+                return _broker_exec_inprocess(argv, **kw)
         return subprocess.run(*a, **kw)
     except Exception:
         return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
 
-def detect_modules():
+
+# v10.2.2 W4: a probe _sudo_wrap() routed to the broker client is sent over the
+# broker socket from THIS process instead of starting python for the client
+# (test6 p50: 17 ms in-process vs 88 ms through the client). Same request the
+# client sends, same exit-code contract (125 unreachable/garbled, 126 refused,
+# else the command's), same CompletedProcess shape subprocess.run would return.
+# Only plain capturing calls qualify; anything else runs as before.
+# W4b: binaries the PATH shims route through the broker UNCONDITIONALLY (install-shims.sh
+# ALWAYS list). A probe naming one bare would reach the broker client through its shim
+# anyway; send it in-process instead. `docker cp` is staged by its shim — never rewritten.
+_PROBE_SHIMMED = frozenset({'docker', 'systemctl', 'fail2ban-client'})
+
+
+def _probe_shim_equivalent(args):
+    if (isinstance(args, (list, tuple)) and args and args[0] in _PROBE_SHIMMED
+            and list(args[:2]) != ['docker', 'cp']
+            and _broker_should_route() and _broker_available()
+            and os.path.isfile(os.path.join(_BROKER_SHIM_DIR, args[0]))):
+        return _sudo_wrap(list(args))
+    return args
+
+
+_BROKER_INPROCESS_KW = frozenset({'capture_output', 'text', 'universal_newlines', 'encoding',
+                                  'errors', 'timeout', 'env', 'cwd', 'check'})
+
+
+def _broker_client_prefix():
+    return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--']
+
+
+def _broker_inprocess_eligible(args, kw):
+    if not isinstance(args, (list, tuple)) or not kw.get('capture_output'):
+        return False
+    if not set(kw) <= _BROKER_INPROCESS_KW:     # shell, input, stdin, stdout, … -> subprocess
+        return False
+    pre = _broker_client_prefix()
+    return len(args) > len(pre) and list(args[:len(pre)]) == pre
+
+
+def _broker_exec_inprocess(args, capture_output=True, text=False, universal_newlines=None,
+                           encoding=None, errors=None, timeout=None, env=None, cwd=None,
+                           check=False):
+    argv = [os.fsdecode(x) for x in args[len(_broker_client_prefix()):]]
+    req = {'op': 'exec', 'argv': argv,
+           'cwd': os.path.realpath(cwd) if cwd else os.getcwd(), 'input_b64': None}
+    try:
+        _env_t = int((env if env is not None else os.environ).get('TAKWERX_BROKER_TIMEOUT') or 0)
+    except ValueError:
+        _env_t = 0
+    if _env_t > 0:
+        req['timeout'] = min(_env_t, 7200)
+    sock_timeout = timeout if timeout is not None else (req.get('timeout') or 600) + 60
+    try:
+        resp = _broker_request(req, timeout=sock_timeout)
+        if not isinstance(resp, dict):
+            raise ValueError('response is not a JSON object')
+    except _socket.timeout:
+        raise subprocess.TimeoutExpired(args, timeout)
+    except (BrokerError, OSError, ValueError) as e:
+        rc, out, err = 125, b'', f'takwerx_broker: cannot reach broker: {e}\n'.encode()
+    else:
+        if not resp.get('ok'):
+            rc, out = 126, b''
+            err = f"takwerx_broker: {resp.get('code')}: {resp.get('error')}\n".encode()
+        else:
+            rc = int(resp.get('returncode', 0))
+            out = _b64.b64decode(resp.get('stdout_b64') or '')
+            err = _b64.b64decode(resp.get('stderr_b64') or '')
+    if text or universal_newlines or encoding or errors:
+        def _dec(b):
+            s = b.decode(encoding or 'utf-8', errors or 'strict')
+            return s.replace('\r\n', '\n').replace('\r', '\n')
+        out, err = _dec(out), _dec(err)
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, args, out, err)
+    return subprocess.CompletedProcess(args, rc, out, err)
+
+
+def _cleanup_caddy_leftovers():
+    """Remove a Caddy that Uninstall All left behind (binary still there, unit disabled
+    and stopped). v10.2.2 W2: moved out of detect_modules() — a cached or background
+    status read must never delete anything. Runs at startup and after Uninstall All."""
+    _run = _probe_run
+    try:
+        if _run(['which', 'caddy'], capture_output=True).returncode != 0:
+            return
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
+        if (r.stdout or '').strip() == 'active':
+            return
+        r = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
+        if (r.stdout or '').strip() != 'disabled':
+            return
+        for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
+            if os.path.exists(path):
+                _run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)  # v10.0.5 non-root: /usr root-owned
+        if os.path.exists('/etc/caddy'):
+            _run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
+        _run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+        print('Caddy: removed leftovers of an uninstall (binary present, unit disabled + stopped)', flush=True)
+    except Exception as e:
+        print(f'Caddy leftover cleanup skipped: {str(e)[:200]}', flush=True)
+    _invalidate_modules_cache()
+
+
+def _detect_modules_uncached():
+    """Probe every module's install/run state. Callers use detect_modules()."""
     _run = _probe_run
     modules = {}
     settings = load_settings()
@@ -2986,15 +3126,10 @@ def detect_modules():
         r = _run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         caddy_running = r.stdout.strip() == 'active'
         # Leftover from uninstall-all? (binary still there but service disabled and stopped)
+        # -> report not installed. Read-only: _cleanup_caddy_leftovers() removes it.
         if not caddy_running:
-            re = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
-            if (re.stdout or '').strip() == 'disabled':
-                for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
-                    if os.path.exists(path):
-                        _run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)  # v10.0.5 non-root: /usr root-owned
-                if os.path.exists('/etc/caddy'):
-                    _run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
-                _run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+            _en = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
+            if (_en.stdout or '').strip() == 'disabled':
                 caddy_installed = False
     modules['caddy'] = {'name': 'Caddy SSL', 'installed': caddy_installed, 'running': caddy_running,
         'description': "Domain setup, Let's Encrypt SSL & reverse proxy" if not has_fqdn else f"SSL & reverse proxy — {settings.get('fqdn', '')}",
@@ -3026,10 +3161,10 @@ def detect_modules():
         # UI. The authentik-server CONTAINER is the authoritative, non-root-safe install signal
         # (docker routes through the broker shims); union it with the home-dir check.
         _ak_home = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
-        _akc = _run('docker ps -a --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        _akc = _run(['docker', 'ps', '-a', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
         ak_installed = _ak_home or bool((_akc.stdout or '').strip())
         if ak_installed:
-            r = _run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            r = _run(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
             ak_running = 'Up' in (r.stdout or '')
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
@@ -3104,10 +3239,10 @@ def detect_modules():
         nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
         # v10.0.5 non-root: union the home-dir check with the nodered container (a root-era
         # ~/node-red at /root/node-red is invisible to the takwerx console).
-        _nrc = _run('docker ps -a --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        _nrc = _run(['docker', 'ps', '-a', '--filter', 'name=nodered', '--format', '{{.Status}}'], capture_output=True, text=True)
         if os.path.exists(nr_compose) or bool((_nrc.stdout or '').strip()):
             nodered_installed = True
-            r2 = _run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            r2 = _run(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}'], capture_output=True, text=True)
             nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
         if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
@@ -3132,7 +3267,7 @@ def detect_modules():
             os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')) or
             os.path.exists(os.path.join(cloudtak_dir, 'compose.yaml'))
         )
-        r = _run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        r = _run(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}'], capture_output=True, text=True, timeout=5)
         if r.stdout and 'Up' in r.stdout:
             cloudtak_running = True
         if not cloudtak_installed and cloudtak_running:
@@ -3197,9 +3332,8 @@ def detect_modules():
             wo_enabled = True
     else:
         try:
-            import subprocess as _sp
-            result = _sp.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp']),
-                             capture_output=True, text=True, timeout=3)
+            result = _run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp']),
+                          capture_output=True, text=True, timeout=3)
             wo_running = result.stdout.strip() == 'true'
             # Self-heal: containers are up but flag got cleared (e.g. interrupted uninstall/deploy)
             if wo_running and not wo_enabled:
@@ -3306,7 +3440,7 @@ def detect_modules():
     netbird_running = False
     if netbird_enabled:
         try:
-            _nb_r = subprocess.run(
+            _nb_r = _run(
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             netbird_running = _nb_r.stdout.strip() == 'true'
@@ -3315,7 +3449,7 @@ def detect_modules():
     else:
         # Self-heal: container is running but flag got cleared
         try:
-            _nb_r = subprocess.run(
+            _nb_r = _run(
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             if _nb_r.stdout.strip() == 'true':
@@ -3354,7 +3488,7 @@ def detect_modules():
     ra_running = False
     if ra_enabled:
         try:
-            _ra_r = subprocess.run(
+            _ra_r = _run(
                 _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             ra_running = 'Up' in (_ra_r.stdout or '')
@@ -3362,7 +3496,7 @@ def detect_modules():
             pass
     else:
         try:
-            _ra_r = subprocess.run(
+            _ra_r = _run(
                 _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             if 'Up' in (_ra_r.stdout or ''):
@@ -3385,6 +3519,148 @@ def detect_modules():
     }
 
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
+
+
+# ---------------------------------------------------------------------------
+# v10.2.2 W2: module-status cache
+# ---------------------------------------------------------------------------
+# The sidebar context processor called detect_modules() on EVERY page and 21 module
+# pages called it again — ~24 probes each, no cache (test6 /help = 24 broker calls).
+# Stale-while-revalidate: fresh data is reused; stale data is served once while ONE
+# background refresh runs; no data computes synchronously. Nothing refreshes on a
+# timer, so an idle console does no probing.
+#
+# The cache is dropped (next caller computes synchronously) when module state can
+# have changed through the console:
+#   * any POST/PUT/PATCH/DELETE request — synchronous start/stop/restart/uninstall
+#     (_modules_cache_after_mutation);
+#   * a job starting or finishing — the set of running jobs is part of the cache key,
+#     found the way console_restart_safe() finds them (every `*_status` dict with
+#     running=True, plus registry jobs), so new deploy-status globals are covered
+#     without hand-instrumenting their completion paths.
+# Decision callers (Caddyfile generation, deploy gates, the Authentik orphan GC,
+# migrations) pass fresh=True: stale "Authentik not installed" once dropped
+# forward_auth from the console vhost, and the GC deletes Authentik apps.
+import copy as _copy
+
+_MODULES_CACHE_FRESH_S = 15
+_MODULES_CACHE_REFRESH_STUCK_S = 120   # a refresh this old is presumed hung; allow another
+_MODULES_CACHE = {'data': None, 'at': 0.0, 'jobs': None, 'gen': 0, 'refreshing': 0.0,
+                  'computing': None}   # (gen, Event, thread ident) of the in-flight synchronous compute
+_MODULES_CACHE_WAIT_S = 60
+_MODULES_CACHE_LOCK = threading.Lock()
+
+
+def _modules_running_jobs():
+    """frozenset of in-flight job names, or None when it cannot be determined."""
+    try:
+        names = {_n for _n, _v in list(globals().items())
+                 if _n.endswith('_status') and isinstance(_v, dict) and _v.get('running')}
+    except Exception:
+        return None
+    try:
+        names |= {f'module:{k}' for k in mod_registry.running_jobs()}
+    except Exception:
+        pass   # registry not loaded yet (boot)
+    return frozenset(names)
+
+
+def _invalidate_modules_cache():
+    """Drop cached module status. Bumps the generation so a refresh already in flight
+    (started before the change) cannot store what it saw."""
+    with _MODULES_CACHE_LOCK:
+        _MODULES_CACHE['gen'] += 1
+        _MODULES_CACHE['data'] = None
+
+
+def _modules_cache_compute(gen, jobs):
+    data = _detect_modules_uncached()
+    with _MODULES_CACHE_LOCK:
+        if _MODULES_CACHE['gen'] == gen:
+            _MODULES_CACHE.update({'data': data, 'at': time.monotonic(), 'jobs': jobs})
+    return data
+
+
+def _modules_cache_compute_once(gen, jobs, fresh):
+    """Synchronous compute, single-flight per generation (W4b): after an invalidation the page
+    and any concurrent poller wait for ONE compute instead of each probing (test6 cold /help:
+    33-60 broker calls for one 24-probe compute). fresh=True always probes for itself."""
+    if fresh:
+        return _modules_cache_compute(gen, jobs)
+    me = threading.get_ident()
+    for _ in range(3):
+        with _MODULES_CACHE_LOCK:
+            cur = _MODULES_CACHE['computing']
+            owner = cur is None or cur[0] != gen or cur[2] == me   # cur[2] == me: reentrant, never wait on ourselves
+            if owner:
+                ev = threading.Event()
+                _MODULES_CACHE['computing'] = (gen, ev, me)
+            else:
+                ev = cur[1]
+        if owner:
+            try:
+                return _modules_cache_compute(gen, jobs)
+            finally:
+                with _MODULES_CACHE_LOCK:
+                    if _MODULES_CACHE['computing'] and _MODULES_CACHE['computing'][1] is ev:
+                        _MODULES_CACHE['computing'] = None
+                ev.set()
+        if not ev.wait(_MODULES_CACHE_WAIT_S):
+            break                                   # owner hung: probe for ourselves
+        with _MODULES_CACHE_LOCK:
+            data = _MODULES_CACHE['data']
+            if data is not None and _MODULES_CACHE['gen'] == gen and _MODULES_CACHE['jobs'] == jobs:
+                return data
+            gen = _MODULES_CACHE['gen']             # invalidated meanwhile, or the owner failed
+    return _modules_cache_compute(gen, jobs)
+
+
+def _modules_cache_refresh_bg(gen, jobs):
+    try:
+        _modules_cache_compute(gen, jobs)
+    except Exception as e:
+        print(f'detect_modules: background refresh failed: {str(e)[:200]}', flush=True)
+    finally:
+        with _MODULES_CACHE_LOCK:
+            _MODULES_CACHE['refreshing'] = 0.0
+
+
+def detect_modules(fresh=False):
+    """Install/run state of every module, keyed by module, sorted by priority.
+
+    Cached (see above). fresh=True probes now, for callers that ACT on the answer.
+    Always returns a private copy — callers may mutate it."""
+    jobs = _modules_running_jobs()
+    start_bg = False
+    with _MODULES_CACHE_LOCK:
+        gen = _MODULES_CACHE['gen']
+        data = _MODULES_CACHE['data']
+        usable = (not fresh and data is not None and jobs is not None
+                  and _MODULES_CACHE['jobs'] == jobs)
+        if usable:
+            now = time.monotonic()
+            busy = _MODULES_CACHE['refreshing']
+            if (now - _MODULES_CACHE['at'] >= _MODULES_CACHE_FRESH_S
+                    and (not busy or now - busy > _MODULES_CACHE_REFRESH_STUCK_S)):
+                _MODULES_CACHE['refreshing'] = now
+                start_bg = True
+    if not usable:
+        return _copy.deepcopy(_modules_cache_compute_once(gen, jobs, fresh))
+    if start_bg:
+        try:
+            threading.Thread(target=_modules_cache_refresh_bg, args=(gen, jobs),
+                             daemon=True, name='detect-modules-refresh').start()
+        except Exception:
+            with _MODULES_CACHE_LOCK:
+                _MODULES_CACHE['refreshing'] = 0.0
+    return _copy.deepcopy(data)
+
+
+@app.after_request
+def _modules_cache_after_mutation(response):
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        _invalidate_modules_cache()
+    return response
 
 # Height of the fixed identification bar. Any OTHER fixed top bar must stack below
 # it and add this to its own offset — see _custom_banner_height().
@@ -7138,6 +7414,38 @@ def _diag_tail(path, max_bytes=_DIAG_TAIL_BYTES):
     return lines[1:] if size > max_bytes else lines
 
 
+def _diag_unreadable(path):
+    """Why _diag_tail() returned None: the file is missing, or this console may not read it."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        pass
+    return 'not readable by the console on this box'
+
+
+def _diag_top(n=10):
+    """CPU summary + busiest processes over a 1 s sample (top's 2nd iteration — its 1st is
+    since-boot averages). Program names only: full command lines can carry secrets."""
+    raw = _diag_cmd(['top', '-b', '-n', '2', '-d', '1', '-o', '%CPU', '-w', '200'], priv=False)
+    lines = raw.splitlines()
+    starts = [i for i, l in enumerate(lines) if l.startswith('top - ')]
+    if len(starts) < 2:
+        return ['top: ' + (raw[:200] or 'no output')]
+    it = lines[starts[-1]:]
+    out = [l.strip() for l in it if l.startswith('%Cpu')][:1]
+    hdr = next((i for i, l in enumerate(it) if l.split()[:2] == ['PID', 'USER']), None)
+    if hdr is None:
+        return out
+    out.append('busiest processes (1 s sample): %CPU %MEM user command')
+    for l in it[hdr + 1:hdr + 1 + n]:
+        f = l.split()
+        if len(f) >= 12:
+            out.append(f"  {f[8]:>6} {f[9]:>5} {f[1][:12]:<12} {' '.join(f[11:])[:40]}")
+    return out
+
+
 def _diag_tak_log_window(lines, hours=3):
     """TAK log lines from the last `hours`, keeping stack-trace continuation lines with the
     entry they belong to (they carry no timestamp of their own)."""
@@ -7247,6 +7555,7 @@ def _diag_section_box(settings):
                f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
     out.append(f"uptime since: {datetime.fromtimestamp(psutil.boot_time()).strftime('%Y-%m-%d %H:%M')}  "
                f"load: {' '.join(f'{x:.2f}' for x in os.getloadavg())}")
+    out.extend(_diag_top())
     for mp in ('/', '/opt', '/var/lib/docker', os.path.expanduser('~')):
         try:
             du = psutil.disk_usage(mp)
@@ -7355,8 +7664,13 @@ def _diag_section_containers(settings):
     rows = [l.split('|') for l in ps.splitlines() if l.count('|') == 2]
     if not rows:
         return [ps or '(no containers)']
+    st = _diag_cmd(['docker', 'stats', '--no-stream', '--format', '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}'],
+                   timeout=30)
+    use = {f[0]: (f[1], f[2].split('/')[0].strip()) for f in (l.split('|') for l in st.splitlines())
+           if len(f) == 3}
     w = max(len(r[0]) for r in rows)
-    return [f"{r[0].ljust(w)}  {r[1][:45].ljust(45)}  {r[2]}" for r in sorted(rows)]
+    return [f"{r[0].ljust(w)}  {r[1][:45].ljust(45)}  cpu {use.get(r[0], ('-', ''))[0]:>7}  "
+            f"mem {use.get(r[0], ('', '-'))[1]:>10}  {r[2]}" for r in sorted(rows)]
 
 
 def _diag_section_authentik(settings):
@@ -7446,7 +7760,7 @@ def _diag_section_takserver(settings):
     except Exception:
         method = '?'
     if not os.path.exists('/opt/tak') and not _tak_is_container():
-        return ['TAK Server not installed on this box']
+        return ['TAK Server not installed on this box'] + _diag_tak_update_history()
     out = [f"install method: {method}"]
     ver = _diag_cmd(['dpkg-query', '-W', '-f=${Version}', 'takserver'], priv=False) if shutil.which('dpkg-query') \
         else _diag_cmd(['rpm', '-q', 'takserver'], priv=False)
@@ -7498,7 +7812,7 @@ def _diag_section_takserver(settings):
     for log in ('takserver-messaging.log', 'takserver-api.log'):
         lines = _diag_tail('/opt/tak/logs/' + log)
         if lines is None:
-            out.append(f"{log}: not readable by the console on this box")
+            out.append(f"{log}: {_diag_unreadable('/opt/tak/logs/' + log)}")
             continue
         hits = [l for l in _diag_tak_log_window(lines)
                 if not frame.search(l) and not noise.search(l)
@@ -7519,6 +7833,30 @@ def _diag_section_takserver(settings):
         if hits:
             out.append('  newest:')
             out.extend('    ' + l[:320] for l in hits[-6:])
+    out.extend(_diag_tak_update_history())
+    return out
+
+
+def _diag_tak_update_history(tail=150):
+    """v10.2.2 W9: recent TAK Server update runs + the log of the latest that did not
+    succeed (recorded by _tak_update_job; redacted with the rest of the report)."""
+    out = []
+    if upgrade_status.get('running') or tak58_status.get('running'):
+        out.append('TAK Server update: one is RUNNING right now — its log is recorded when it ends')
+    hist = _tak_update_history()
+    if not hist:
+        out.append('TAK Server updates recorded by this console: none (recording began in v10.2.2)')
+        return out
+    out.append('TAK Server updates recorded by this console (newest first):')
+    for h in hist:
+        out.append(f"  {h.get('finished', '?')}  {h.get('result', '?')}  {h.get('kind', '?')}  "
+                   f"{h.get('package') or '-'}  ({h.get('seconds', '?')} s)")
+    bad = next((h for h in hist if h.get('result') != 'ok'), None)
+    if bad:
+        lines = bad.get('lines') or []
+        out.append(f"log of the latest update that did not succeed ({bad.get('finished')}, "
+                   f"{bad.get('kind')}), last {min(len(lines), tail)} of {bad.get('total_lines', len(lines))} lines:")
+        out.extend('    ' + str(l)[:300] for l in lines[-tail:])
     return out
 
 
@@ -7564,13 +7902,17 @@ def _diag_section_guarddog(settings):
     out = [f"deployed version: {settings.get('guarddog_deployed_version') or '?'}"]
     timers = _diag_cmd(['systemctl', 'list-timers', '--all', '--no-pager', '--plain', 'tak*'], priv=False)
     out.append(f"timers: {len([l for l in timers.splitlines() if '.timer' in l])}")
-    lines = _diag_tail('/var/log/takguard/watchdog.log', 512 * 1024)
+    # restarts.log is Guard Dog's event log — every watcher appends its restarts/alerts there.
+    # (10.2.1 read watchdog.log, which nothing writes: every box reported it "not readable".)
+    log = '/var/log/takguard/restarts.log'
+    lines = _diag_tail(log, 512 * 1024)
     if lines is None:
-        out.append('watchdog.log: not readable by the console on this box')
+        out.append(f"restarts.log: {_diag_unreadable(log)}")
     else:
-        alerts = [l for l in lines if 'ALERT' in l]
-        out.append(f"ALERT lines in the recent log: {len(alerts)}")
-        out.extend('  ' + l[:240] for l in alerts[-10:])
+        ev = [l for l in lines if re.search(r'restart|alert|fail|unhealthy|missing|down', l, re.I)
+              and 'fail2ban: Banned' not in l]
+        out.append(f"restarts.log: {len(ev)} restart/alert line(s) in the recent tail")
+        out.extend('  ' + l[:240] for l in ev[-15:])
     return out
 
 
@@ -17757,9 +18099,15 @@ _F2B_OWNED_FILTERS = {
         "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
         "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
         "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# v10.2.2: network-level read errors are IGNORED. `recvAddress(..) failed with\n"
+        "# error(-104): Connection reset by peer` (and -103 abort, -110 timeout) is a client\n"
+        "# dropping its TCP connection, which phones do on every tower/network change or app\n"
+        "# suspend. Counting them banned every phone behind one carrier NAT address (field\n"
+        "# report 2026-10-01). Every other error on these lines, including kinds not seen\n"
+        "# yet, still counts.\n"
         "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
         "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
-        "ignoreregex =\n"
+        "ignoreregex = Cause: recvAddress\\(\\.\\.\\) failed with error\\(-\\d+\\)\n"
         "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
         "              {^LN-BEG}\n"
     ),
@@ -17822,6 +18170,20 @@ _F2B_OWNED_FILTERS = {
 # fed, and logging invalid_login, and still matched 0 lines because the on-disk filter
 # was the old login_failed one.
 _F2B_LEGACY_FILTERS = {
+    'takserver': [
+        # v0.9.x–v10.2.1: counted EVERY NioNettyServerHandler error, connection resets
+        # included, so phones behind one carrier NAT address were banned for ordinary
+        # network drops (field report 2026-10-01). Byte-identical on every dev box.
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex =\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n",
+    ],
     'authentik': [
         # v0.9.0–v10.1.11: matched "action": "login_failed", a string Authentik never
         # logs. login_failed is a Django signal name, not a log field. Never matched once.
@@ -17849,6 +18211,15 @@ _F2B_LEGACY_FILTERS = {
         "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
         "ignoreregex =\n",
     ],
+}
+
+
+# One line per legacy upgrade, for the self-heal's log (what was wrong with the old text).
+_F2B_UPGRADE_WHY = {
+    'authentik': 'authentik: the old pattern could never match a real log line, so the jail banned nobody',
+    'mediamtx-rtsp': 'mediamtx-rtsp: the old pattern counted successful stream opens, banning legitimate viewers',
+    'takserver': 'takserver: the old pattern counted dropped connections (resets) as attacks, banning phones '
+                 'behind shared carrier addresses; handshake and non-TLS errors still count',
 }
 
 
@@ -18362,9 +18733,13 @@ def _f2b_selfheal_filters(plog=None):
              ' — those jails were enabled but skipped on every reload, so they were '
              'protecting nothing.')
     if upgraded:
+        # v10.2.2: say what changed per filter. The old one-size message ("could never match …
+        # banning nobody") was true of authentik/mediamtx and FALSE for takserver, which banned
+        # too much — an operator chasing a ban would have been sent the wrong way.
         _log('fail2ban: UPGRADED stale filter(s) ' + ', '.join(upgraded) +
-             ' — the shipped pattern could never match a real log line, so those jails '
-             'were loaded and healthy-looking while banning nobody.')
+             ' to the corrected pattern we now ship — ' +
+             '; '.join(_F2B_UPGRADE_WHY.get(u.split(' ')[0], 'see the comment in the new filter')
+                       for u in upgraded) + '.')
     try:
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
     except Exception:
@@ -24531,7 +24906,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         try:
             settings = load_settings()
             fqdn = (settings.get('fqdn') or '').strip()
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if fqdn and ak_installed:
                 plog('━━━ Enable Authentik OAuth (auto) ━━━')
                 reachable, ak_err = _check_authentik_api_reachable(settings)
@@ -26459,7 +26834,7 @@ def caddy_update_domain():
     settings['fqdn'] = domain
     save_settings(settings)
     generate_caddyfile(settings)
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     if modules.get('authentik', {}).get('installed'):
         def _sync_ak_after_domain():
             time.sleep(3)
@@ -28719,7 +29094,7 @@ def _takportal_project_containers(all_states=True):
     try:
         cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
               ['--filter', f'label=com.docker.compose.project={_takportal_project_name()}', '--format', fmt]
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        r = _probe_run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
         for line in (r.stdout or '').splitlines():
             parts = line.strip().split('|||')
             if len(parts) < 2 or not parts[1]:
@@ -28735,7 +29110,7 @@ def _takportal_project_containers(all_states=True):
     try:
         cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
               ['--filter', 'name=^tak-portal$', '--format', fmt]
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        r = _probe_run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
         for line in (r.stdout or '').splitlines():
             parts = line.strip().split('|||')
             if len(parts) >= 2 and parts[1] == 'tak-portal':
@@ -30148,7 +30523,7 @@ def generate_caddyfile(settings=None):
     domain = settings.get('fqdn', '')
     if not domain:
         return
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)   # decides forward_auth per vhost
 
     # v10.1.41 — the operator's ACME issuer, if they set one, MUST come first: Caddy rejects
     # a global options block that is not the first block ("server block without any key is
@@ -35271,7 +35646,7 @@ def mediamtx_deploy_api():
     # marketplace greys the card, but this route is reachable by direct curl.
     # Fails OPEN: a transient detection error must never brick a deploy.
     try:
-        _tvr_installed = detect_modules().get('tak_video_restreamer', {}).get('installed')
+        _tvr_installed = detect_modules(fresh=True).get('tak_video_restreamer', {}).get('installed')
     except Exception:
         _tvr_installed = False
     if _tvr_installed:
@@ -36504,7 +36879,7 @@ WantedBy=multi-user.target
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', webeditor_dir]),
                        capture_output=True, timeout=10)
 
-        modules = detect_modules()
+        modules = detect_modules(fresh=True)
         ak = modules.get('authentik', {})
         ldap_available = bool(ak.get('installed'))
         if ldap_available:
@@ -48229,48 +48604,10 @@ def authentik_page():
             if line.strip():
                 parts = line.split('|||')
                 containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
-        # Fetch per-container CPU/RAM for the service cards (non-blocking; ignore errors)
-        _stats_cmd = 'docker stats --no-stream --format "{{.Name}}|||{{.CPUPerc}}|||{{.MemUsage}}" 2>/dev/null'
-        _stats_by_name = {}
-        try:
-            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
-                _ok_s, _stats_raw = _ssh_probe(ak_deploy['remote'], _stats_cmd, timeout=20)
-                _stats_raw = (_stats_raw or '') if _ok_s else ''
-            else:
-                _sr = subprocess.run(_stats_cmd, shell=True, capture_output=True, text=True, timeout=15)
-                _stats_raw = _sr.stdout or ''
-            for _sl in _stats_raw.strip().split('\n'):
-                if not _sl.strip():
-                    continue
-                _sp = _sl.split('|||')
-                if len(_sp) >= 3:
-                    _cn = _sp[0].strip().lstrip('/')
-                    _cpu_s = _sp[1].strip().rstrip('%')
-                    _mem_s = _sp[2].strip().split('/')[0].strip()
-                    try:
-                        _stats_by_name[_cn] = {'cpu_raw': round(float(_cpu_s), 1), 'mem': _mem_s}
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
-        _vcpu = None
-        try:
-            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
-                _vcpu = _get_vcpu_count_remote(ak_deploy.get('remote', {}))
-            else:
-                _vcpu = _get_vcpu_count_local()
-        except Exception:
-            pass
-        for _c in containers:
-            _s = _stats_by_name.get(_c['name'], {})
-            if _s:
-                _raw = _s['cpu_raw']
-                _sys = round(_raw / _vcpu, 1) if (_vcpu and _vcpu > 1) else _raw
-                _c['cpu_raw'] = _raw
-                _c['cpu_sys'] = _sys
-                _c['mem'] = _s['mem']
+        # v10.2.2 W5: per-container CPU/RAM is NOT fetched here any more. `docker stats
+        # --no-stream` costs ~2 s locally (up to 20 s over SSH) on every render; the cards
+        # render "…" and the page fills them from /api/authentik/container-stats.
         container_info['containers'] = containers
-        container_info['vcpu_count'] = _vcpu
     modules = detect_modules()
     portal_installed = modules.get('takportal', {}).get('installed', False)
     portal_running = modules.get('takportal', {}).get('running', False)
@@ -48294,8 +48631,7 @@ def authentik_page():
         portal_installed=portal_installed,
         portal_running=portal_running,
         authentik_deploy_cfg=authentik_deploy_cfg,
-        remote_host=remote_host,
-        vcpu_count=container_info.get('vcpu_count'))
+        remote_host=remote_host)
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
@@ -54273,6 +54609,14 @@ _AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S = 900  # 15 min between in-place res
 # 130+ that causes server health-check timeouts.
 # Configurable: channels_pool_watchdog_idle_in_tx_threshold in settings.json.
 _AUTHENTIK_IDLE_IN_TX_WATCHDOG_THRESHOLD = 60
+# v10.2.2 W10: the idle-in-tx watchdog counts only connections idle in a transaction for
+# longer than this — the ABANDONED ones its restart exists to clear (they sit until
+# idle_in_transaction_session_timeout=300s kills them). Measured on test6 2026-10-02
+# 03:44-03:48Z: 1 -> 117 idle-in-tx in 3 min, every one idle 0-3 s, transactions up to
+# 2 min old — workers mid-flow on a CPU pinned at 762% by uncached LDAP binds, not
+# abandonment. Restarting there emptied the LDAP outpost's bind cache and re-armed the
+# storm three times in 15 minutes (each restart = TAK logins failing).
+_AUTHENTIK_IDLE_IN_TX_STALE_S = 30
 
 
 def _authentik_pgbouncer_cl_waiting():
@@ -56174,7 +56518,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
 
         # Install snapshot for orphan GC below (computed once, not per-service).
         try:
-            _installed_now = detect_modules()
+            _installed_now = detect_modules(fresh=True)   # the GC below DELETES apps
         except Exception:
             _installed_now = {}
 
@@ -56768,7 +57112,11 @@ _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT = 2000
 # leak rate doubled what Tom's box measured. Pattern preferred everywhere:
 # escalate-fast-deescalate-slow.
 _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S = 120   # 2 min — fast convergence under fire
-_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 1800    # 30 min — avoid oscillation on quiet → noisy transitions
+# v10.2.2 W10: was 1800 (30 min). Every UP step force-recreates server+worker — a full
+# Authentik outage that breaks TAK logins and empties the LDAP outpost's bind cache — so
+# walking 100 -> 1000 took ~10 recreates in ~5 h. test6 2026-10-01/02: 12 recreates in
+# 14 h; the 03:19 UP step set off the 03:24 storm. 6 h between UP steps caps it at 4/day.
+_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 21600   # 6 h
 _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S = 1800  # 30 min: "recent fire" window
 _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S = 21600  # 6h: "no fire for a long time"
 _AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX = 50
@@ -56883,7 +57231,8 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
         30 min", which is not the same thing — see the comment on the down
         path for the single-fire runaway that produced.
       - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
-        clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
+        clamped). Cooldown: 6 h between up-tunes (v10.2.2; was 30 min) — each
+        step is a full Authentik recreate.
       - otherwise                                        → no change
 
     The cooldown asymmetry matters: tak-10 (May 2026) showed the original
@@ -57200,8 +57549,9 @@ def _authentik_channels_pool_watchdog_loop():
                  '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
                  "SELECT "
                  "  COUNT(*) FILTER (WHERE state='idle'), "
-                 "  COUNT(*) FILTER (WHERE state='idle in transaction') "
-                 "FROM pg_stat_activity WHERE datname='authentik'"]),
+                 "  COUNT(*) FILTER (WHERE state='idle in transaction' "
+                 "                   AND now() - state_change > interval '%d seconds') "
+                 "FROM pg_stat_activity WHERE datname='authentik'" % _AUTHENTIK_IDLE_IN_TX_STALE_S]),
                 capture_output=True, text=True, timeout=10
             )
             if _r.returncode != 0:
@@ -57574,7 +57924,8 @@ def _authentik_channels_pool_watchdog_loop():
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str_tx = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
                 print(
-                    f"[ak-pg-watchdog] ALERT: {_idle_in_tx_count} idle-in-transaction PG connections "
+                    f"[ak-pg-watchdog] ALERT: {_idle_in_tx_count} PG connections idle in a transaction "
+                    f"for >{_AUTHENTIK_IDLE_IN_TX_STALE_S}s "
                     f"(threshold={_idle_in_tx_threshold}, idle={_count}, {_mr_str_tx}) — "
                     f"CancelledError/mid-tx abandonment storm detected. "
                     f"Restarting authentik-server-1. SAFETY NET firing.",
@@ -67460,7 +67811,7 @@ def takserver_create_client_cert():
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
     """After Authentik reconfigure, regenerate Caddyfile and reload Caddy. Does NOT touch TAK Server or 8446 cert."""
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     if not modules.get('takserver', {}).get('installed'):
         return
     try:
@@ -67497,7 +67848,7 @@ def takserver_update_config():
     """Sync Caddy + 8446 cert to current TAK Server domain and restart TAK Server. Use after changing TAK Server domain in Caddy/Domains."""
     if takserver_update_config_status.get('running'):
         return jsonify({'error': 'Update already in progress'}), 409
-    modules = detect_modules()
+    modules = detect_modules(fresh=True)
     tak = modules.get('takserver', {})
     if not tak.get('installed'):
         return jsonify({'error': 'TAK Server not installed'}), 400
@@ -68147,6 +68498,74 @@ upgrade_status = {'running': False, 'complete': False, 'error': False}
 
 tak_migrate_log = []
 tak_migrate_status = {'running': False, 'complete': False, 'error': False}
+
+# ── v10.2.2 W9: every TAK Server update leaves a record Diagnostics can read ──────
+# A failed update used to leave its log only in this process's memory: visible in the
+# one browser tab that started it, gone at the next console restart, and nowhere in a
+# Diagnostics report. (Field 2026-10-01: a customer's 5.8 upgrade failed; all we had was
+# a screenshot of three lines.) Each update worker now ends by saving its result and the
+# tail of its log to .config/ — console-owned, mode 600 — and Help → Diagnostics lists the
+# recent runs and the log of the latest one that did not succeed, through the same
+# redaction as the rest of the report.
+TAK_UPDATE_HISTORY = os.path.join(CONFIG_DIR, 'takserver_update_history.json')
+_TAK_UPDATE_HISTORY_KEEP = 5
+_TAK_UPDATE_HISTORY_LINES = 400
+_TAK_UPDATE_HISTORY_LOCK = threading.Lock()
+
+
+def _tak_update_history():
+    """Recorded TAK Server update runs, newest first ([] when none or unreadable)."""
+    try:
+        with open(TAK_UPDATE_HISTORY) as f:
+            h = json.load(f)
+        return h if isinstance(h, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _tak_update_record(kind, pkg, log, status, started, exc=None):
+    lines = [str(l) for l in list(log)]
+    if exc is not None:
+        result = 'CRASHED (%s: %s)' % (type(exc).__name__, str(exc)[:160])
+    elif any('MID-UPGRADE' in l for l in lines):
+        result = 'FAILED (left mid-upgrade)'
+    elif status.get('error'):
+        result = 'FAILED'
+    elif status.get('complete'):
+        result = 'ok'
+    else:
+        result = 'unfinished'
+    entry = {'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
+             'finished': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+             'seconds': int(time.time() - started), 'kind': kind,
+             'package': os.path.basename(pkg or ''), 'result': result,
+             'total_lines': len(lines), 'lines': lines[-_TAK_UPDATE_HISTORY_LINES:]}
+    with _TAK_UPDATE_HISTORY_LOCK:
+        hist = [entry] + _tak_update_history()
+        tmp = TAK_UPDATE_HISTORY + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(hist[:_TAK_UPDATE_HISTORY_KEEP], f)
+        os.replace(tmp, TAK_UPDATE_HISTORY)
+
+
+def _tak_update_job(kind, target, log, status):
+    """Thread target for a TAK Server update worker: run it, then record how it ended —
+    success, failure, or an exception (recorded, then re-raised)."""
+    def run(*a, **kw):
+        started, exc = time.time(), None
+        try:
+            target(*a, **kw)
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            try:
+                _tak_update_record(kind, a[0] if a and isinstance(a[0], str) else '',
+                                   log, status, started, exc)
+            except Exception as _re:
+                print(f'TAK Server update: record not saved ({_re})', flush=True)
+    return run
 
 plugin_install_log = []
 plugin_install_status = {'running': False, 'complete': False, 'error': False}
@@ -69756,7 +70175,11 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         # 2. Backup — verified, not assumed. Refuse to continue without one.
         _say('')
         _say('Backing up before anything is changed…')
-        bk = _tak_58_backup(plog=_tak58_log)
+        # v10.2.2: `_say`, not `_tak58_log`. Driven by the Update button, `_log` is the page's
+        # panel and tak58_log is a list nobody polls — every snapshot line, including the
+        # pg_dump error itself, went there (field: lutak.net 2026-10-01 saw only "captured NO
+        # database dump" with no reason).
+        bk = _tak_58_backup(plog=_say)
         if not bk.get('ok'):
             return fail('Backup failed — refusing to migrate without one. %s'
                         % (bk.get('error') or ''))
@@ -69776,7 +70199,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
                    + shlex.quote(pkg_path) + ' 2>&1')
         rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
-                                               tak58_log, timeout_sec=1800)
+                                               _log, timeout_sec=1800)
         # The package is EXPECTED to complain about pg15 and stop short — that is
         # the documented 5.8 behaviour, not an install failure. The database
         # script below is what finishes it, so a non-zero rc here is reported and
@@ -70010,7 +70433,8 @@ def takserver_58_migrate():
         pkgs, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
     tak58_log.clear()
     tak58_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_takserver_58_migration, args=(pkg,), daemon=True).start()
+    threading.Thread(target=_tak_update_job('5.8 migration', run_takserver_58_migration, tak58_log, tak58_status),
+                     args=(pkg,), daemon=True).start()
     return jsonify({'success': True, 'package': os.path.basename(pkg)})
 
 
@@ -70135,7 +70559,8 @@ def takserver_update():
             _zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_58_container_migration,
+        threading.Thread(target=_tak_update_job('5.8 migration (container)', run_takserver_58_container_migration,
+                                                upgrade_log, upgrade_status),
                          args=(_zip,), kwargs={'log': upgrade_log, 'status': upgrade_status},
                          daemon=True).start()
         return jsonify({'success': True, 'migration': True, 'container': True,
@@ -70174,7 +70599,8 @@ def takserver_update():
                                          'both, then try again.'}), 400
             upgrade_log.clear()
             upgrade_status.update({'running': True, 'complete': False, 'error': False})
-            threading.Thread(target=run_takserver_58_two_server_migration,
+            threading.Thread(target=_tak_update_job('5.8 migration (two-server)', run_takserver_58_two_server_migration,
+                                                    upgrade_log, upgrade_status),
                              args=(os.path.join(UPLOAD_DIR, _core),
                                    os.path.join(UPLOAD_DIR, _dbp), _s1, _ts_cfg),
                              kwargs={'log': upgrade_log, 'status': upgrade_status},
@@ -70193,7 +70619,7 @@ def takserver_update():
             key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_58_migration,
+        threading.Thread(target=_tak_update_job('5.8 migration', run_takserver_58_migration, upgrade_log, upgrade_status),
                          args=(_pkg,), kwargs={'log': upgrade_log, 'status': upgrade_status},
                          daemon=True).start()
         return jsonify({'success': True, 'migration': True,
@@ -70215,7 +70641,8 @@ def takserver_update():
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
+        threading.Thread(target=_tak_update_job('upgrade (container)', run_takserver_upgrade_container, upgrade_log, upgrade_status),
+                         args=(_zip,), daemon=True).start()
         return jsonify({'success': True})
     # RHEL/Rocky native: upgrade from the new takserver-*.noarch.rpm via dnf.
     if _distro_family() == 'rhel' or settings.get('pkg_mgr') == 'dnf':
@@ -70240,7 +70667,8 @@ def takserver_update():
                 return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
             upgrade_log.clear()
             upgrade_status.update({'running': True, 'complete': False, 'error': False})
-            threading.Thread(target=run_takserver_upgrade_two_server_rhel, args=(
+            threading.Thread(target=_tak_update_job('upgrade (two-server, rpm)', run_takserver_upgrade_two_server_rhel,
+                                                    upgrade_log, upgrade_status), args=(
                 os.path.join(UPLOAD_DIR, _core_rpm), os.path.join(UPLOAD_DIR, _db_rpm), _s1, _tak_cfg,
             ), daemon=True).start()
             return jsonify({'success': True})
@@ -70256,7 +70684,8 @@ def takserver_update():
         _edb = _tak_cfg.get('external_db') if _tak_cfg.get('mode') == 'external_db' else None
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_rhel, args=(os.path.join(UPLOAD_DIR, _rpms[0]),),
+        threading.Thread(target=_tak_update_job('upgrade (rpm)', run_takserver_upgrade_rhel, upgrade_log, upgrade_status),
+                         args=(os.path.join(UPLOAD_DIR, _rpms[0]),),
                          kwargs={'external_db': _edb}, daemon=True).start()
         return jsonify({'success': True})
     if upgrade_status['running']:
@@ -70280,7 +70709,8 @@ def takserver_update():
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_two_server, args=(
+        threading.Thread(target=_tak_update_job('upgrade (two-server)', run_takserver_upgrade_two_server,
+                                                upgrade_log, upgrade_status), args=(
             os.path.join(UPLOAD_DIR, core_pkg),
             os.path.join(UPLOAD_DIR, db_pkg),
             s1, tak_cfg
@@ -70294,7 +70724,8 @@ def takserver_update():
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
+        threading.Thread(target=_tak_update_job('upgrade', run_takserver_upgrade, upgrade_log, upgrade_status),
+                         args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
     return jsonify({'success': True})
 
 @app.route('/api/takserver/update/log')
@@ -70862,16 +71293,26 @@ def _tak_snapshot(label, plog=None):
             except Exception as _pg_e:
                 plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:200]} — db_dump=False (config+certs captured)")
         else:
-            with open(pg_dump_path, 'wb') as _f:
-                r2 = subprocess.run(
-                    'sudo -u postgres pg_dump -Fc cot',
-                    shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
-                )
-            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+            # Root console. v10.2.2: the SAME command and window the broker uses for the
+            # non-root path (_do_pg_dump: runuser argv, 600 s) — this branch had a shell
+            # `sudo -u postgres` with a 300 s cap, and its TimeoutExpired surfaced only as a
+            # bare "pg_dump exception". No dev box runs as root, so T&E never exercised it.
+            r2 = None
+            try:
+                with open(pg_dump_path, 'wb') as _f:
+                    r2 = subprocess.run(['runuser', '-u', 'postgres', '--', 'pg_dump', '-Fc', 'cot'],
+                                        stdout=_f, stderr=subprocess.PIPE, cwd='/', timeout=600)
+            except subprocess.TimeoutExpired:
+                plog("  snapshot: pg_dump did not finish within 10 min — db_dump=False. A long "
+                     "VACUUM FULL / repack holding locks on the cot database is the usual cause; "
+                     "let it finish and retry.")
+            if r2 is not None and r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
                 meta['db_dump'] = True
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
             else:
-                plog(f"  snapshot: pg_dump FAILED: {(r2.stderr or b'').decode()[:200]}")
+                if r2 is not None:
+                    plog(f"  snapshot: pg_dump FAILED (exit {r2.returncode}): "
+                         f"{(r2.stderr or b'').decode(errors='replace').strip()[:300]}")
                 try: os.remove(pg_dump_path)
                 except Exception: pass
     except Exception as e:
@@ -74135,7 +74576,7 @@ def _deploy_takserver_container(config):
         # serves the self-signed PKI cert). Order mirrors the .deb deploy.
         # Auto-connect to LDAP if Authentik is already deployed
         try:
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if ak_installed and not _coreconfig_has_ldap():
                 log_step(""); log_step("━━━ Connecting TAK Server to LDAP (Authentik detected) ━━━")
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
@@ -74891,7 +75332,7 @@ def run_takserver_deploy(config):
 
         # Auto-connect to LDAP if Authentik is already deployed
         try:
-            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            ak_installed = bool(detect_modules(fresh=True).get('authentik', {}).get('installed'))
             if ak_installed and not _coreconfig_has_ldap():
                 log_step("Authentik detected — connecting TAK Server to LDAP...")
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
@@ -76825,6 +77266,7 @@ def run_full_uninstall():
         save_settings(settings)
         caddy_deploy_log.clear()
         caddy_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        _cleanup_caddy_leftovers()   # v10.2.2 W2: no longer a side effect of detect_modules()
         plog("✓ Caddy removed")
 
         plog("")
@@ -78081,7 +78523,7 @@ def _startup_ensure_broker():
         _shim_installer = os.path.join(os.path.dirname(_BROKER_SCRIPT), 'install-shims.sh')
         if os.path.isfile(_shim_installer):
             _senv = dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin')
-            _sr = subprocess.run(['bash', _shim_installer, _BROKER_SHIM_DIR, _BROKER_SCRIPT],
+            _sr = subprocess.run(['bash', _shim_installer, _BROKER_SHIM_DIR, _BROKER_CLIENT],
                                  capture_output=True, text=True, timeout=30, env=_senv)
             if _sr.returncode != 0:
                 print(f'Startup migration: shim regen failed (non-fatal): '
@@ -81323,6 +81765,9 @@ def _startup_migrations():
                 print("Startup migration: ⚠ broker not mediating exec after 30s — broker-dependent "
                       "migrations may fail and will retry on the next console restart", flush=True)
 
+        # v10.2.2 W2: was a side effect of every detect_modules() call.
+        _cleanup_caddy_leftovers()
+
         s = load_settings()
         settings_dirty = False
 
@@ -81597,7 +82042,7 @@ def _startup_migrations():
         # fleet without a MediaMTX redeploy). Idempotent; flag-gated.
         if (s.get('fqdn') or '').strip() and not s.get('caddy_hls_encfix_v1'):
             try:
-                if detect_modules().get('mediamtx', {}).get('installed'):
+                if detect_modules(fresh=True).get('mediamtx', {}).get('installed'):
                     _hcf = generate_caddyfile(s)
                     _caddy_reload()
                     _hls_https = ('reverse_proxy https://' in (_hcf or '') and 'tls_server_name' in (_hcf or ''))

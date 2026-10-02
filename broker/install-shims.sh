@@ -16,9 +16,15 @@
 #     /var …); otherwise exec the real binary so non-priv use (e.g. mkdir /tmp/x)
 #     is untouched. docker also stages `cp container:->host` so the dest is
 #     user-owned (see the docker shim).
+#
+# $2 is the client the shims exec — since v10.2.2 the light, stdlib-only
+# broker/takwerx_brokerctl.py (same `exec --` contract as `takwerx_broker.py
+# exec`, ~2.5x cheaper per call). `-I -S` keeps site/.pth processing and the
+# script dir off the import path; the client needs neither. Any client that
+# speaks `exec --` works here, including takwerx_broker.py itself.
 set -eu
 SHIM_DIR="${1:-/opt/infratak/.shims}"
-BROKER="${2:-/opt/infratak/broker/takwerx_broker.py}"
+BROKER="${2:-/opt/infratak/broker/takwerx_brokerctl.py}"
 mkdir -p "$SHIM_DIR"
 
 ALWAYS=(docker systemctl systemd-run journalctl loginctl ufw firewall-cmd dnf apt apt-get yum
@@ -33,7 +39,7 @@ for c in "${ALWAYS[@]}"; do
   cat > "$SHIM_DIR/$c" <<EOF
 #!/bin/bash
 if [ "\$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$BROKER" ]; then
-  exec python3 "$BROKER" exec -- $c "\$@"
+  exec python3 -I -S "$BROKER" exec -- $c "\$@"
 fi
 exec $(command -v "$c" 2>/dev/null || echo "/usr/bin/$c") "\$@"
 EOF
@@ -56,11 +62,11 @@ if [ "\${1:-}" = "cp" ]; then
   _a=( "\$@" ); _n=\${#_a[@]}; _src="\${_a[_n-2]}"; _dst="\${_a[_n-1]}"
   if [[ "\$_src" == *:* && "\$_dst" != *:* ]]; then
     _sd=\$(mktemp -d); _rc=0
-    if python3 "$BROKER" exec -- docker cp "\$_src" "\$_sd/f"; then "$_REALCP" -f "\$_sd/f" "\$_dst" || _rc=\$?; else _rc=1; fi
+    if python3 -I -S "$BROKER" exec -- docker cp "\$_src" "\$_sd/f"; then "$_REALCP" -f "\$_sd/f" "\$_dst" || _rc=\$?; else _rc=1; fi
     rm -rf "\$_sd"; exit \$_rc
   fi
 fi
-exec python3 "$BROKER" exec -- docker "\$@"
+exec python3 -I -S "$BROKER" exec -- docker "\$@"
 EOF
 
 # --- path-aware coreutils ---
@@ -72,7 +78,7 @@ if [ "\$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$BROKER" ];
   for _a in "\$@"; do
     case "\$_a" in
       /etc/*|/opt/*|/usr/*|/var/*|/run/*|/boot/*|/swapfile)
-        exec python3 "$BROKER" exec -- $c "\$@" ;;
+        exec python3 -I -S "$BROKER" exec -- $c "\$@" ;;
     esac
   done
 fi
