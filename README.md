@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.1-alpha)**
+**Current release: [v10.2.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.2-alpha — 2026-10-02 — Console pages load in a fraction of a second, phones stop getting banned, and failed TAK Server updates explain themselves
+
+**Headline: on servers where the console runs as its own unprivileged user — every install since v10.0.5 — pages that took 10 to 60 seconds now load in well under a second to a few seconds, and a TAK Server update that fails now says why, both on the page and in Help → Diagnostics.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.2-alpha))
+
+**Faster console.** Every privileged check the console makes (is a service running, what is in a container) goes through its root helper. Each one used to start a fresh copy of a 3,300-line program, so a single page could spend a minute waiting on 50 to 200 of them. Those checks now use a small dedicated client (about 2.5× cheaper each), the status of every module is cached and refreshed in the background instead of re-checked on every page, the TAK Server configuration is only re-read when it changes, and the status checks talk to the helper directly. Starting, stopping, installing or removing a module through the console shows up on the very next page load. The Authentik page no longer waits two seconds for container statistics; they fill in a moment after it loads.
+
+**fail2ban no longer bans phones.** The TAK Server jail counted a dropped connection as a failed login. Phones drop connections constantly (changing towers, the app sleeping), and several phones behind one mobile-carrier address added up to a ban for all of them. Dropped connections are now ignored; failed TLS handshakes and non-TLS traffic still count. Existing servers pick up the corrected filter on the next console restart unless you have customised it.
+
+**TAK Server updates.** When the TAK Server 5.8 upgrade could not take its database backup, the page showed only "captured NO database dump" — the actual error went to a log nothing displayed. It now appears on the page. On servers whose console still runs as root, the backup used a different command with a shorter time limit; it now uses the same one as every other install. And every TAK Server update now leaves a record — result and log — that Help → Diagnostics includes, so a failed update can be diagnosed from one report.
+
+**Help → Diagnostics** now shows what is using the CPU, each container's CPU and memory, and Guard Dog's real event log (it was reading a file nothing writes).
+
+**Authentik stability.** Two of the console's own Authentik safety nets could keep an overloaded Authentik from recovering: one treated busy database connections as abandoned and restarted Authentik repeatedly, emptying its login cache each time; the other restarted Authentik every 30 minutes while raising a tuning value. The first now acts only on connections that have genuinely been abandoned, and the second waits six hours between steps.
+
+> **Upgrade note.** Update the console as usual; everything applies on the console restart that follows. Nothing to configure.
 
 ### v10.2.1-alpha — 2026-10-01 — Faster password-reset emails, a one-click diagnostics report, and Guard Dog stops restarting healthy containerised TAK Servers
 
