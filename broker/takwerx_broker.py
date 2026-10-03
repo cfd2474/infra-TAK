@@ -1636,6 +1636,11 @@ SNAPSHOT_DIR = '/opt/tak/snapshots'
 # user/cluster) — the op then runs `docker exec -u postgres <this> pg_dump`.
 # Fixed name; any other container is denied.
 _PG_DUMP_CONTAINER = 'takserver-db'
+# v10.2.3: pg_dump waits forever for its table locks by default — one session holding
+# an exclusive lock on a cot table stalled the 5.8 pre-migration backup for the whole
+# window (lutak.net 2026-10-02). Fail after this and let the console name the holder.
+# Same value as the console's _COT_DUMP_LOCK_WAIT.
+_PG_DUMP_LOCK_WAIT = '120s'
 # Dump-authenticity key (SECURITY, v10.0.8): the snapshot dir lives under the
 # console-writable /opt/tak/ prefix, so the console CAN write arbitrary bytes to
 # a *.pgdump path. Restoring an attacker-crafted pg custom archive would run its
@@ -1901,26 +1906,47 @@ def _do_pg_dump(req):
         if not docker:
             return {'ok': False, 'error': 'docker not found on trusted PATH'}
         argv = [docker, 'exec', '-u', 'postgres', _PG_DUMP_CONTAINER,
-                'pg_dump', '-Fc', db]
+                'pg_dump', '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
     else:
         runuser = shutil.which('runuser', path=BROKER_TRUSTED_PATH)
         pg_dump = shutil.which('pg_dump', path=BROKER_TRUSTED_PATH)
         if not runuser or not pg_dump:
             return {'ok': False, 'error': 'runuser/pg_dump not found on trusted PATH'}
-        argv = [runuser, '-u', 'postgres', '--', pg_dump, '-Fc', db]
+        argv = [runuser, '-u', 'postgres', '--', pg_dump,
+                '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
     os.makedirs(os.path.dirname(path), exist_ok=True)
     timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
     # applies, and postgres needs no write access to the snapshot dir.
+    # Own session: a timeout kills pg_dump itself, not just runuser — an orphaned
+    # pg_dump kept its table locks and snapshot open until this daemon restarted.
+    # (With `docker exec` the pg_dump inside the container outlives the client;
+    # the lock-wait cap is what bounds that case.)
     with open(path, 'wb') as out:
-        proc = subprocess.run(argv, stdout=out, stderr=subprocess.PIPE, timeout=timeout)
+        proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            err = proc.communicate(timeout=timeout)[1]
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.communicate()
+            err = None
+    if err is None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return {'ok': False, 'error': 'pg_dump did not finish within %d s' % timeout}
     if proc.returncode != 0:
         try:
             os.unlink(path)    # never leave a truncated/empty dump behind
         except OSError:
             pass
         return {'ok': False, 'returncode': proc.returncode,
-                'error': (proc.stderr or b'').decode(errors='replace')[:500]}
+                'error': (err or b'').decode(errors='replace')[:500]}
     os.chmod(path, 0o600)
     # Authenticity sidecar — proves the broker produced this dump, so pg_restore
     # will accept it (and reject any console-planted archive). Best-effort: if the
