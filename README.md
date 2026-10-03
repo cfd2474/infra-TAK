@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.2-alpha)**
+**Current release: [v10.2.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.3-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,14 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.3-alpha — 2026-10-03 — A TAK Server backup stuck on a database lock now says who is holding it
+
+**Headline: when the TAK Server 5.8 upgrade's pre-migration backup cannot read the database because another session holds a lock on one of its tables, it now gives up after 2 minutes instead of 10 and names that session — on the page and in Help → Diagnostics.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.3-alpha))
+
+**Why a backup could sit there for 10 minutes.** The database backup waits for read access to every TAK table, and by default it waits forever. If any other session is holding an exclusive lock on one of those tables, the backup makes no progress at all — even on a small database — until the time limit runs out. The message then guessed at a cause. The backup now stops waiting after 2 minutes and the page lists what the database is doing: which session holds the lock, on which table, for how long, and the statement it is running (with any quoted values hidden). If the holder is TAK Server's own connection, the page says to restart TAK Server and try again. Help → Diagnostics shows the same information, so a stuck backup can be explained from one report without running the update again.
+
+**No leftover backup processes.** When a backup timed out, only the helper that launched it was stopped; the backup process itself kept running in the background, still holding its place in the database, until the console restarted. A timed-out backup is now stopped completely. This applies to scheduled and manual TAK Server snapshots as well as the 5.8 upgrade.
 
 ### v10.2.2-alpha — 2026-10-02 — Console pages load in a fraction of a second, phones stop getting banned, and failed TAK Server updates explain themselves
 
