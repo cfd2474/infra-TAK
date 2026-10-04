@@ -422,9 +422,9 @@ overrides, so treat that list as authoritative over this table.
 
 ## Changelog
 
-### v10.2.4-alpha — 2026-10-03 — MediaMTX: streams under live/ work properly, private ones stay private, and the watch page is safe
+### v10.2.4-alpha — 2026-10-03 — MediaMTX: streams under live/ get the right access check, off-box HLS works again, and the watch page is safe
 
-**Headline: streams published under a folder — OBS and DJI drones publish to `live/<name>` — now get a working watch page and the right public/private treatment, viewers outside the server can play HLS again, and a script-injection hole in the public watch page is closed.** Reported with a patch by cfd2474 in [#82](https://github.com/takwerx/infra-TAK/issues/82). ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.4-alpha))
+**Headline: streams published under a folder — OBS and DJI drones publish to `live/<name>` — now get a working watch page and are checked against their own public/private setting, viewers outside the server can play HLS again, and a script-injection hole in the public watch page is closed.** Reported with a patch by cfd2474 in [#82](https://github.com/takwerx/infra-TAK/issues/82). ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.4-alpha))
 
 **Streams under a folder.** The MediaMTX editor's access layer read only the first part of a stream's path, so a private `live/<name>` stream was checked as `live` — which has no setting and so counted as public. It now checks the stream the request actually names, and refuses paths with empty, `.` or `..` parts outright. The watch page (`/watch/live/<name>`) now opens nested streams instead of returning "not found".
 
