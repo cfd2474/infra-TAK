@@ -26,6 +26,7 @@ Patches the vanilla MediaMTX config editor Flask app to:
 """
 
 import os
+import re
 import json
 import urllib.request
 import urllib.error
@@ -63,6 +64,33 @@ ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
 
 VISIBILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream_visibility.json')
+
+# v10.2.4 (GH #82): MediaMTX stream paths may be nested — OBS and DJI publish to
+# rtmp://host/live/<name>. One path segment: MediaMTX's path-name characters (plus ':').
+_PATH_SEGMENT_RE = re.compile(r'^[A-Za-z0-9_.~:-]+$')
+
+
+def _valid_path(path):
+    """True when every '/'-separated segment is a plain path segment. Empty, '.' and
+    '..' segments are refused: the visibility lookup uses the name literally, so a name
+    some other layer would normalise (live/pub/../secret) must never reach it. Also the
+    guard for names written into the watch page's HTML and JS."""
+    segs = (path or '').split('/')
+    return all(_PATH_SEGMENT_RE.match(s) and s not in ('.', '..') for s in segs)
+
+
+def _yaml_scalar_text(raw):
+    """The string a YAML scalar holds. The editor saves passwords as `pass: "..."`;
+    returning the raw text sent the quotes to MediaMTX as part of the password, which
+    it refuses for every viewer outside the box (on-box requests pass as the loopback
+    `any` user, which is why this hid in testing)."""
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+        inner = raw[1:-1]
+        if raw[0] == '"':
+            return inner.replace('\\"', '"').replace('\\\\', '\\')
+        return inner.replace("''", "'")
+    return raw
 
 
 def _load_visibility():
@@ -162,7 +190,7 @@ def apply_ldap_overlay(app):
                 if 'user: hlsviewer' in line:
                     for j in range(i + 1, min(i + 10, len(lines))):
                         if 'pass:' in lines[j]:
-                            pw = lines[j].strip().split(':', 1)[1].strip()
+                            pw = _yaml_scalar_text(lines[j].strip().split(':', 1)[1])
                             if pw:
                                 return {'username': 'hlsviewer', 'password': pw}
                     break
@@ -202,9 +230,18 @@ def apply_ldap_overlay(app):
 
     @app.route('/hls-proxy/<path:subpath>')
     def hls_proxy(subpath):
-        stream_name = subpath.split('/')[0] if '/' in subpath else subpath
+        # Which stream is this? The first segment alone made live/<name> look up "live",
+        # which has no visibility entry and so defaulted to public — a private stream
+        # served to anyone (GH #82). MediaMTX reads <stream>/<file> for playlists and
+        # segments but <stream>/ for its player page, so the stream is either everything
+        # before the last segment or the whole path. Both are checked; either one being
+        # private makes the request private.
+        sub = subpath[:-1] if subpath.endswith('/') else subpath
+        if not _valid_path(sub):
+            return 'Not found', 404
+        names = {sub, sub.rsplit('/', 1)[0]} if '/' in sub else {sub}
         vis = _load_visibility()
-        level = vis.get(stream_name, 'public')
+        level = 'private' if any(vis.get(n, 'public') == 'private' for n in names) else 'public'
         if level == 'private':
             role = session.get('role')
             if role not in ('viewer', 'admin'):
@@ -241,9 +278,14 @@ def apply_ldap_overlay(app):
         with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             return resp.read(), resp.headers.get('Content-Type', 'application/octet-stream')
 
-    @app.route('/watch/<stream_name>')
+    @app.route('/watch/<path:stream_name>')
     def watch_stream_visibility(stream_name):
         """Public streams: serve HLS player. Private streams: reject unless logged in with vid_private."""
+        # Nested names (live/<name>) are valid streams. The name is also written into
+        # this page's <title> and a JS string unescaped, so only plain path segments
+        # get through — before v10.2.4 a quote in the URL ran script (GH #82).
+        if not _valid_path(stream_name):
+            return 'Stream not found', 404
         vis = _load_visibility()
         level = vis.get(stream_name, 'public')
         if level == 'private':
