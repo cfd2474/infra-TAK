@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.3-alpha)**
+**Current release: [v10.2.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.4-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.4-alpha — 2026-10-03 — MediaMTX: streams under live/ work properly, private ones stay private, and the watch page is safe
+
+**Headline: streams published under a folder — OBS and DJI drones publish to `live/<name>` — now get a working watch page and the right public/private treatment, viewers outside the server can play HLS again, and a script-injection hole in the public watch page is closed.** Reported with a patch by cfd2474 in [#82](https://github.com/takwerx/infra-TAK/issues/82). ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.4-alpha))
+
+**Streams under a folder.** The MediaMTX editor's access layer read only the first part of a stream's path, so a private `live/<name>` stream was checked as `live` — which has no setting and so counted as public. It now checks the stream the request actually names, and refuses paths with empty, `.` or `..` parts outright. The watch page (`/watch/live/<name>`) now opens nested streams instead of returning "not found".
+
+**HLS for viewers outside the server.** The editor saves the HLS viewer password in quotes, and the quotes were being sent to MediaMTX as part of the password, so every viewer outside the server was refused. The password is now read correctly.
+
+**Watch page.** The stream name in the address was written into the page without escaping, so a crafted link could run script on the stream domain. Only plain stream names are accepted now.
+
+Updating the console replaces the editor's access layer and restarts the editor automatically. On a split install (MediaMTX on its own server), use **Patch web editor** on the MediaMTX page.
 
 ### v10.2.3-alpha — 2026-10-03 — A TAK Server backup stuck on a database lock now says who is holding it
 
