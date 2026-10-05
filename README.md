@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.4-alpha)**
+**Current release: [v10.2.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.5-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.5-alpha — 2026-10-04 — After a reboot, Authentik and TAK Portal come back and stay up
+
+**Headline: a TAK Server restart in the first minutes after a reboot no longer stops Authentik and TAK Portal and leaves them down — so LDAP logins keep working after a reboot.** Reported with a full journal analysis in [#83](https://github.com/takwerx/infra-TAK/issues/83). ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.5-alpha))
+
+**What happened.** At boot, Guard Dog's boot sequencer pauses Authentik, TAK Portal, CloudTAK and Node-RED so TAK Server gets the CPU while it starts, and a post-start step brings them back in order once. The sequencer decided "this is a boot" from uptime alone, so any second TAK Server start in the first ten minutes paused everything again — after the post-start step had already run. Authentik and TAK Portal then stayed down until someone started them by hand, and every LDAP login failed with "incorrect Username or Password" in the meantime. Since v10.2, the console's own startup check could trigger exactly that restart on most reboots.
+
+**What changed.** Only the first TAK Server start of each boot is treated as a boot; a later restart in the same boot leaves everything running. And the console no longer restarts TAK Server after repairing the LDAP service account unless TAK's own configuration actually changed — TAK reads LDAP live and had nothing to reload.
+
+Updating the console redeploys Guard Dog with the new boot sequencer; it takes effect from the next reboot.
 
 ### v10.2.4-alpha — 2026-10-03 — MediaMTX: streams under live/ get the right access check, off-box HLS works again, and the watch page is safe
 
