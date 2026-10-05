@@ -28200,6 +28200,81 @@ def _get_mediamtx_hls_upstream(settings):
     return '127.0.0.1:8888', _hls_encrypted_from_yml()
 
 
+# MediaMTX vhost paths that sit OUTSIDE forward_auth. Share links carry their own token
+# (the editor checks it) and a /watch/ page is only HTML; its video is /hls-proxy/, which
+# needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
+MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
+
+
+def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue):
+    """Append the MediaMTX stream-domain vhost to `lines` (called by generate_caddyfile).
+
+    v10.2.6: with Authentik, /hls-proxy/* goes through the login to the web editor, whose
+    overlay applies per-stream visibility to the session and fetches from MediaMTX itself.
+    It used to go straight to MediaMTX, which asks every off-box browser for its password
+    — so a logged-in vid_public/vid_private viewer clicking Watch got a password box and
+    no video (measured test6 2026-10-05). Admins never noticed: the editor's own player
+    sends the password itself. Streams stay login-only (operator, 2026-10-05).
+
+    That player still sends `Authorization: Basic hlsviewer:…`, and the stream provider
+    intercepts header auth, so the outpost would try to log in as hlsviewer — the header
+    is dropped on /hls-proxy/ before forward_auth. The overlay never reads it.
+
+    With Authentik, every route strips client X-Authentik-*. The overlay believes those
+    headers from Caddy's address; the console vhost has stripped them since v10.1.0 and
+    this one never did, so a forged `authentik Admins` header on /watch/ got an admin
+    session (measured test6 2026-10-05). The catch-all strips before forward_auth puts
+    back the real ones.
+
+    ak_up: Authentik upstream, or None when Authentik is not installed.
+    hls:   (upstream, tls) from _get_mediamtx_hls_upstream to keep /hls-proxy/* going
+           straight to MediaMTX — without Authentik (no overlay deciding anything), and
+           on a split box, whose remote overlay a console update cannot reach. None
+           sends it through the login to the local editor.
+    emit_strip(indent) / emit_rescue(root_url): generate_caddyfile's own emitters.
+    """
+    lines.append("# MediaMTX Web Console")
+    lines.append(f"{mtx_host} {{")
+    if hls:
+        mtx_hls, hls_enc = hls
+        lines.append("    handle_path /hls-proxy/* {")
+        if hls_enc:
+            lines.append(f"        reverse_proxy https://{mtx_hls} {{")
+            lines.append("            transport http {")
+            lines.append(f"                tls_server_name {mtx_host}")
+            lines.append("            }")
+            lines.append("            header_down Location ^ /hls-proxy")
+            lines.append("        }")
+        else:
+            lines.append(f"        reverse_proxy {mtx_hls} {{")
+            lines.append("            header_down Location ^ /hls-proxy")
+            lines.append("        }")
+        lines.append("    }")
+    if ak_up:
+        for path in MEDIAMTX_OPEN_PATHS:
+            lines.append(f"    route {path} {{")
+            emit_strip("        ")
+            lines.append(f"        reverse_proxy {mtx_up}")
+            lines.append("    }")
+        lines.append("    route {")
+        emit_strip("        ")
+        if not hls:
+            lines.append("        request_header /hls-proxy/* -Authorization")
+        emit_rescue(f"https://{mtx_host}/")
+        lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+        lines.append(f"        forward_auth {ak_up} {{")
+        lines.append("            uri /outpost.goauthentik.io/auth/caddy")
+        lines.append("            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+        lines.append("            trusted_proxies private_ranges")
+        lines.append("        }")
+        lines.append(f"        reverse_proxy {mtx_up}")
+        lines.append("    }")
+    else:
+        lines.append(f"    reverse_proxy {mtx_up}")
+    lines.append("}")
+    lines.append("")
+
+
 def _get_nodered_upstream(settings):
     """Return Node-RED upstream for Caddy (127.0.0.1:1880 or remote_host:1880)."""
     cfg = _get_module_deployment_config(settings, 'nodered_deployment')
@@ -30953,46 +31028,14 @@ def generate_caddyfile(settings=None):
     if mtx.get('installed'):
         mtx_host = sd['mediamtx']
         mtx_up = _get_mediamtx_upstream(settings)
-        mtx_hls, hls_enc = _get_mediamtx_hls_upstream(settings)
-        lines.append(f"# MediaMTX Web Console")
-        lines.append(f"{mtx_host} {{")
-        lines.append(f"    handle_path /hls-proxy/* {{")
-        if hls_enc:
-            lines.append(f"        reverse_proxy https://{mtx_hls} {{")
-            lines.append(f"            transport http {{")
-            lines.append(f"                tls_server_name {mtx_host}")
-            lines.append(f"            }}")
-            lines.append(f"            header_down Location ^ /hls-proxy")
-            lines.append(f"        }}")
-        else:
-            lines.append(f"        reverse_proxy {mtx_hls} {{")
-            lines.append(f"            header_down Location ^ /hls-proxy")
-            lines.append(f"        }}")
-        lines.append(f"    }}")
-        if ak.get('installed'):
-            lines.append(f"    route /watch/* {{")
-            lines.append(f"        reverse_proxy {mtx_up}")
-            lines.append(f"    }}")
-            lines.append(f"    route /shared/* {{")
-            lines.append(f"        reverse_proxy {mtx_up}")
-            lines.append(f"    }}")
-            lines.append(f"    route /shared-hls/* {{")
-            lines.append(f"        reverse_proxy {mtx_up}")
-            lines.append(f"    }}")
-            lines.append(f"    route {{")
-            _emit_outpost_callback_rescue(f"https://{mtx_host}/")
-            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
-            lines.append(f"        reverse_proxy {mtx_up}")
-            lines.append(f"    }}")
-        else:
-            lines.append(f"    reverse_proxy {mtx_up}")
-        lines.append(f"}}")
-        lines.append("")
+        _mtx_ak = ak.get('installed')
+        # /hls-proxy/ through the login to the local editor only — see _emit_mediamtx_site.
+        _mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'
+        _emit_mediamtx_site(
+            lines, mtx_host, mtx_up,
+            ak_up if _mtx_ak else None,
+            _get_mediamtx_hls_upstream(settings) if _mtx_direct else None,
+            _emit_ak_header_strip, _emit_outpost_callback_rescue)
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
 
     fedhub = modules.get('fedhub', {})
@@ -82234,6 +82277,47 @@ def _startup_migrations():
                 # box being left exposed is visible in the journal.
                 print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
                       f"(box may be exposed until next restart): {_last_err}", flush=True)
+
+        # v10.2.6 SECURITY (one-time per box, retry-until-applied): the MediaMTX vhost strips
+        # client X-Authentik-* on every route — a forged admin group header used to earn an
+        # overlay admin session on /watch/ — and sends /hls-proxy/* through the login to the
+        # editor overlay so logged-in viewers can play. See _emit_mediamtx_site. MUST stay
+        # after _startup_converge_mediamtx_overlay(): only the overlay it ships forwards
+        # MediaMTX's ?session= query, and the old one cannot play past the first playlist.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_mtx_hls_overlay_v1'):
+            _applied = False
+            _last_err = None
+            for _mh_attempt in range(6):
+                try:
+                    _mh_mods = detect_modules(fresh=True)
+                    if not (_mh_mods.get('mediamtx', {}).get('installed')
+                            and _mh_mods.get('authentik', {}).get('installed')):
+                        # Nothing to converge; a later deploy regenerates with the new vhost.
+                        _applied = True
+                        break
+                    generate_caddyfile(s)
+                    # Read back the LIVE file: a Caddyfile Caddy rejects is restored to the
+                    # previous one (_caddy_validate_or_restore) while generate still returns
+                    # the new text, so checking that would stamp a box that never changed.
+                    _cf = _read_priv(CADDYFILE_PATH) or ''
+                    _mtx_blk = _cf.split('# MediaMTX Web Console', 1)[-1].split('\n}\n', 1)[0]
+                    if '# MediaMTX Web Console' in _cf and 'request_header -X-Authentik-Groups' in _mtx_blk:
+                        _caddy_reload()
+                        _applied = True
+                        break
+                    _last_err = 'MediaMTX vhost header strip absent from the live Caddyfile (rejected and restored?)'
+                except Exception as _mh_e:
+                    _last_err = str(_mh_e)[:160]
+                time.sleep(4)
+            if _applied:
+                s['caddy_mtx_hls_overlay_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: MediaMTX vhost — client X-Authentik-* stripped, "
+                      "/hls-proxy through the login to the editor overlay", flush=True)
+            else:
+                print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
+                      f"(retries next restart): {_last_err}", flush=True)
 
         # v10.1.1 S1: arm the proxy-auth gate (belt-and-suspenders for the bypass
         # class above). Regenerate the Caddyfile so forward_auth-passed requests
