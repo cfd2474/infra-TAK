@@ -80406,17 +80406,22 @@ def _startup_resync_ldap_service_account():
         except Exception:
             final_verdict = 'inconclusive'
 
-        # If healing happened AND the bind now works AND TAK Server is installed,
-        # restart takserver so it picks up:
-        #   - any new CoreConfig credential (Java reads CoreConfig once at boot)
-        #   - a healthy flow state (clears any retry-backoff / degraded internals
-        #     accumulated while binds were being denied by the broken policy)
+        # Restart takserver only when its CoreConfig credential changed — Java reads
+        # CoreConfig once at start, so that is the one thing a restart is needed for.
+        # v10.2.5 (GH #83): it used to restart after ANY heal "to flush cached state".
+        # TAK keeps no such state — it binds per request and has no negative auth
+        # cache (measured 2026-08-15) — and at boot the bind check fails routinely
+        # while Authentik starts, so once the resync began succeeding (10.2.x) every
+        # such boot restarted TAK ~100 s in, inside the boot sequencer's window.
         # Gate strictly on final_verdict='ok' so we never restart into a still-
         # broken state.
-        if (healing_performed
+        if healing_performed and final_verdict == 'ok' and not coreconfig_changed:
+            print("Startup migration: LDAP healed on the Authentik side — TAK Server not "
+                  "restarted (its CoreConfig credential was already correct; nothing to reload)")
+        elif (coreconfig_changed
                 and final_verdict == 'ok'
                 and os.path.exists('/opt/tak/CoreConfig.xml')):
-            print("Startup migration: LDAP healed — restarting takserver to flush cached state")
+            print("Startup migration: LDAP healed — restarting takserver to load the corrected CoreConfig credential")
             try:
                 r = subprocess.run(
                     _tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=120)  # v10.0.1: container-aware

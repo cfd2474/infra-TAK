@@ -35,8 +35,20 @@ _tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 # gets full CPU during its heavy 5-7 minute initialization.
 # On a manual restart (uptime > 10 min), the containers are already running
 # fine and should not be disturbed.
+#
+# v10.2.5 (GH #83): only the FIRST TAK start of each boot is a boot. Uptime
+# alone made any restart in the first 10 minutes look like another boot, and
+# what this branch stops is restored only by tak-post-start.service — a oneshot
+# that runs once per boot. Field: a TAK restart at 106 s uptime stopped every
+# container AFTER the boot's post-start had already brought Authentik back, so
+# Authentik and TAK Portal stayed down (and this gate stayed engaged on 8089)
+# until someone noticed. /run is a tmpfs, so the marker clears on every reboot.
 _uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)
-if [ "$_uptime_sec" -lt 600 ]; then
+_BOOT_MARK=/run/takguard-boot-sequenced
+if [ "$_uptime_sec" -lt 600 ] && [ -e "$_BOOT_MARK" ]; then
+  _log "Restart during boot (uptime ${_uptime_sec}s) — this boot was already sequenced; leaving containers running"
+elif [ "$_uptime_sec" -lt 600 ]; then
+  touch "$_BOOT_MARK" 2>/dev/null || true
   # ── 0. Hold the client port shut until TAK can actually account for clients ──
   # v10.1.46 (W1). TAK opens 8089 from the messaging JVM but serves the client
   # dashboard and /Marti/api/* from the api JVM, which finishes 5.5-30s LATER.
