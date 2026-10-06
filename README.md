@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.5-alpha)**
+**Current release: [v10.2.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.6-alpha — 2026-10-05 — MediaMTX: logged-in viewers can watch streams, and streams stay login-only
+
+**Headline: viewers who sign in to the MediaMTX stream site can now watch streams instead of getting a username/password prompt — streams still require a login, share links still work without one, and a hole that let a request pose as an admin on the stream site is closed.** Follow-up to [#82](https://github.com/takwerx/infra-TAK/issues/82). ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.6-alpha))
+
+**What happened.** On servers with Authentik, a viewer (vid_public or vid_private) who clicked Watch got a browser password prompt and no video: the stream site sent video requests straight to MediaMTX, which asks every browser outside the server for its own password. Admins did not see it because the editor's own player supplies that password. Separately, the stream site passed sign-in headers from the browser through to the web editor without removing them first, so a request claiming to be an admin was treated as one on the watch page; and the viewer page could fetch a MediaMTX password that reads every stream, private ones included.
+
+**What changed.** Video on the stream site now goes through the Authentik sign-in to the web editor, which checks each stream's access and fetches the video from MediaMTX itself — viewers need no extra password, and nobody gets video without signing in. Share links keep working without a login. Sign-in headers sent by a browser are now removed on every route of the stream site, and the endpoint that handed out the MediaMTX password is gone. Two-server installs, where MediaMTX runs on its own host, keep their current video path for now.
+
+Updating the console applies this automatically; the MediaMTX web editor restarts once.
 
 ### v10.2.5-alpha — 2026-10-04 — After a reboot, Authentik and TAK Portal come back and stay up
 

@@ -137,7 +137,7 @@ def _ak_delete(path):
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
 
-    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
+    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
     _untrusted_seen = set()
@@ -251,22 +251,49 @@ def apply_ldap_overlay(app):
                 if not (user_groups & {'vid_private'}):
                     return 'Unauthorized', 403
         try:
-            data, ct = _hls_fetch(subpath)
-            r = Response(data, content_type=ct)
-            r.headers['Cache-Control'] = 'no-cache'
-            return r
+            upstream = _hls_open(subpath, request.query_string)
         except Exception as e:
             return str(e)[:200], 502
+        ct = upstream.headers.get('Content-Type', 'application/octet-stream')
+
+        # v10.2.6: since this became the stream domain's only HLS path, segments are
+        # streamed through rather than read whole into memory per viewer.
+        def body():
+            try:
+                while True:
+                    chunk = upstream.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+        r = Response(body(), content_type=ct)
+        if upstream.headers.get('Content-Length'):
+            r.headers['Content-Length'] = upstream.headers['Content-Length']
+        # Playlists change every segment; segments never change once written.
+        if 'mpegurl' in ct.lower():
+            r.headers['Cache-Control'] = 'no-cache'
+        return r
 
     # ── Shared stream links (token-based, no login required) ────────────
 
-    def _hls_fetch(subpath):
-        """Internal: fetch HLS content from MediaMTX with credentials."""
+    def _hls_open(subpath, query=b''):
+        """Internal: open HLS content on MediaMTX with credentials. Caller closes.
+
+        The query string goes through (v10.2.6). MediaMTX >= 1.18 puts ?session=<id> on
+        every variant playlist and segment URL and answers 401 to the same URL without
+        it — measured on test6 (v1.20.0), so dropping the query left this proxy able to
+        serve the first playlist and nothing after it. LL-HLS _HLS_msn/_HLS_part ride
+        the query too."""
         import base64, ssl
         cred = _get_hlsviewer_credential()
         streaming = _get_streaming_domain()
         proto = streaming['protocol']
         url = f'{proto}://127.0.0.1:8888/{subpath}'
+        if isinstance(query, bytes):
+            query = query.decode('latin-1')
+        if query:
+            url = f'{url}?{query}'
         headers = {'Accept': '*/*'}
         if cred:
             auth = base64.b64encode(f"{cred['username']}:{cred['password']}".encode()).decode()
@@ -275,8 +302,7 @@ def apply_ldap_overlay(app):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-            return resp.read(), resp.headers.get('Content-Type', 'application/octet-stream')
+        return urllib.request.urlopen(req, timeout=10, context=ctx)
 
     @app.route('/watch/<path:stream_name>')
     def watch_stream_visibility(stream_name):
@@ -371,14 +397,10 @@ start();
         html = html.replace('{{USERNAME}}', session.get('username', ''))
         return Response(html, content_type='text/html')
 
-    @app.route('/api/viewer/hlscred')
-    def api_viewer_hlscred():
-        if session.get('role') not in ('viewer', 'admin'):
-            return jsonify({'error': 'Unauthorized'}), 403
-        cred = _get_hlsviewer_credential()
-        if cred:
-            return jsonify(cred)
-        return jsonify({'error': 'hlsviewer credential not found'}), 404
+    # v10.2.6: /api/viewer/hlscred is gone. It handed the hlsviewer credential — read on
+    # EVERY path, private included — to any viewer session, vid_public too, and nothing
+    # used it: the viewer page plays through /hls-proxy/, which holds the credential
+    # server-side. Admins' editor pages get it from the core's own login-gated route.
 
     @app.route('/api/viewer/streams')
     def api_viewer_streams():
@@ -387,13 +409,6 @@ start();
         try:
             user_groups = set(session.get('ldap_groups') or [])
             can_see_private = bool(user_groups & {'vid_private'})
-
-            streaming = _get_streaming_domain()
-            if streaming['domain']:
-                hls_base = f"{streaming['protocol']}://{streaming['domain']}:8888"
-            else:
-                host = request.host.split(':')[0]
-                hls_base = f"http://{host}:8888"
 
             api_url = os.environ.get('MEDIAMTX_API_URL', 'http://127.0.0.1:9898')
             req = urllib.request.Request(f'{api_url.rstrip("/")}/v3/paths/list', headers={'Accept': 'application/json'})
@@ -416,7 +431,8 @@ start();
                     'ready': ready,
                     'available': available,
                     'visibility': level,
-                    'hls_url': f"{hls_base}/{name}/index.m3u8",
+                    # Same-origin, through the overlay — not :8888, which is loopback-only.
+                    'hls_url': f"/hls-proxy/{name}/index.m3u8",
                 })
             return jsonify({'streams': streams})
         except Exception as e:
@@ -753,12 +769,14 @@ td{padding:12px;border-top:1px solid #333}
 <script>
 function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 
+function streamPath(name){return name.split('/').map(encodeURIComponent).join('/');}
+
 function watchStream(name){
-  var hlsUrl='/hls-proxy/'+encodeURIComponent(name)+'/index.m3u8';
+  var hlsUrl='/hls-proxy/'+streamPath(name)+'/index.m3u8';
   var w=1280,h=720,l=(screen.width-w)/2,t=(screen.height-h)/2;
   var popup=window.open('','streamViewer_'+name,
     'width='+w+',height='+h+',left='+l+',top='+t+',toolbar=no,location=no,directories=no,status=no,menubar=no,scrollbars=no,resizable=yes');
-  if(!popup){window.open('/watch/'+encodeURIComponent(name),'_blank');return;}
+  if(!popup){window.open('/watch/'+streamPath(name),'_blank');return;}
   var title=escapeHtml(name)+' - Live';
   popup.document.write('<!DOCTYPE html><html><head><title>'+title+'</title>'
     +'<style>*{margin:0;padding:0}body{background:#000;overflow:hidden}'
