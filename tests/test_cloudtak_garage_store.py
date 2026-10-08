@@ -207,7 +207,10 @@ def test_rollback_to_a_minio_tree_restores_env_and_sets_garage_aside(ct):
     assert 'GARAGE_RPC_SECRET' not in env and 'MINIO_LEGACY_IMAGE' not in env
     assert 'OPERATOR_KEY=keep me exactly   # with a comment' in env
     assert not (ct / '.docker-garage').exists() and list(ct.glob('.docker-garage-failed-*'))
-    assert c.calls[-1] == ['up', '-d']
+    # restart, never recreate: the build already re-tagged the images
+    assert c.calls[-2:] == [['up', '-d', '--no-deps', '--no-build', 'store'],
+                            ['start', 'api', 'events', 'tiles', 'retention']]
+    assert ['up', '-d'] not in c.calls
 
 
 def test_web_dir_follows_the_tree(tmp_path):
@@ -230,17 +233,31 @@ def _body(name):
     return re.search(rf'^def {name}\(.*?(?=^def )', APP, re.S | re.M).group(0)
 
 
-def test_update_runs_the_store_step_before_the_build_and_captures_minio_first():
+def test_update_builds_first_then_moves_the_store_then_starts():
+    # 2026-10-08 test6: with the store step BEFORE the build, a plugin route that no longer
+    # type-checked failed the build AFTER MinIO had been migrated — the revert put the old tree
+    # back on a Garage store with the app containers stopped. Build first: a failed build must
+    # touch nothing.
     body = re.sub(r'#.*', '', _body('run_cloudtak_update'))
     i_capture = body.index('legacy_minio_img = _cloudtak_legacy_minio_image(cloudtak_dir)')
-    i_checkout = body.index("'checkout', '-f'") if "'checkout', '-f'" in body else body.index('checkout -f {release_tag}')
+    i_checkout = body.index('checkout -f {release_tag}')
+    i_build = body.index("f'{dcc} build --no-cache',")
     i_store = body.index('_cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)')
-    i_build = body.index('Step 3/3: Rebuilding and restarting')
-    assert i_capture < i_checkout < i_store < i_build
+    i_up = body.index("_cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)")
+    assert i_capture < i_checkout < i_build < i_store < i_up
+    assert "build --no-cache && {dcc} up -d" not in body          # never chained again
+    r_build = body.index('f"cd ~/CloudTAK && {dcc} build --no-cache"')
+    r_store = body.index('_cloudtak_remote_garage_sh(legacy_minio_img)')
+    r_up = body.index('f"cd ~/CloudTAK && {dcc} up -d"')
+    assert r_build < r_store < r_up
     assert '_cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)' in body
     assert '_cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)' in body
     assert 'plugins_base = _cloudtak_plugins_dir(cloudtak_dir)' in body
 
+
+def test_deploy_moves_the_store_only_after_images_built():
+    body = re.sub(r'#.*', '', _body('run_cloudtak_deploy'))
+    assert body.index('plog("✓ Images built")') < body.index('_cloudtak_garage_converge(cloudtak_dir, plog, start=False)')
 
 def test_every_env_writer_runs_the_store_step():
     for fn in ('run_cloudtak_deploy', 'run_cloudtak_redeploy'):

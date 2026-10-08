@@ -40038,7 +40038,8 @@ def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True)
 def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
     """A failed MinIO->Garage migration during Update: put the stack back as it was.
 
-    Runs BEFORE the build, so the previous images are still the ones tagged. Order matters:
+    Runs AFTER a successful build (the images are already re-tagged), so the app containers
+    are restarted, never recreated. Order matters:
     revert the tree first, then let the reverted compose decide .env — a GARAGE_RPC_SECRET left
     in .env would make _cloudtak_store_endpoint() say 3900 on a MinIO box. .docker-store was
     never moved (nothing is archived until the copy verified); a half-filled Garage dir is set
@@ -40058,7 +40059,13 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
                     os.rename(_gd, _dst)
                 except OSError:
                     subprocess.run(_sudo_wrap(['mv', _gd, _dst]), capture_output=True, timeout=120)
-        rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=900)
+        # NOT a plain `up -d`: the build already re-tagged the images, so recreating the app
+        # services would put NEW images on the OLD compose. Recreate only the store from the
+        # reverted compose, then START the app containers the migration stopped — they still
+        # reference the previous images by ID.
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d', '--no-deps', '--no-build', 'store'], timeout=600)
+        if rc == 0:
+            rc, out = _cloudtak_compose_run(cloudtak_dir, ['start', 'api', 'events', 'tiles', 'retention'], timeout=300)
         plog("↩ CloudTAK restarted on the previous version and its MinIO store" if rc == 0
              else f"  ⚠ Could not restart the previous CloudTAK: {out.strip()[-300:]}")
     except Exception as e:
@@ -40141,7 +40148,8 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
             "sed -i '/^GARAGE_RPC_SECRET=/d;/^MINIO_LEGACY_IMAGE=/d' .env; "
             "sed -i 's|^AWS_S3_Endpoint=.*|AWS_S3_Endpoint=http://store:9000|' .env; "
             "[ -d .docker-garage ] && mv .docker-garage .docker-garage-failed-$(date +%Y%m%d_%H%M%S); "
-            "fi; docker compose up -d", timeout=900)
+            "fi; docker compose up -d --no-deps --no-build store && docker compose start api events tiles retention",
+            timeout=900)
         plog("↩ CloudTAK restarted on the previous version and its MinIO store" if ok
              else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
     except Exception as e:
@@ -41200,16 +41208,6 @@ def run_cloudtak_deploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
         with open(env_path, 'w') as f:
             f.write(env_content)
-
-        # v10.2.7: a Garage-based CloudTAK (>= 13.102.0) cannot start without GARAGE_RPC_SECRET,
-        # and MinIO data still in .docker-store has to move into Garage first (upstream's
-        # migrate-store, same steps). No-op on a MinIO-era tree.
-        if _cloudtak_compose_is_garage(cloudtak_dir):
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
-            if not _gok:
-                plog(f"✗ Garage store setup failed: {_gerr}")
-                cloudtak_deploy_status.update({'running': False, 'error': True})
-                return
         try:
             _pwfile = os.path.join(cloudtak_dir, '.postgres-password')
             with open(_pwfile, 'w') as _pf:
@@ -41403,6 +41401,18 @@ def run_cloudtak_deploy(cfg=None):
             return
 
         plog("✓ Images built")
+        # v10.2.7: the Garage store step runs AFTER the build (a failed build must leave a
+        # redeployed box untouched) and before anything is started: GARAGE_RPC_SECRET +
+        # endpoint for a fresh Garage install; upstream's migrate-store steps when MinIO data
+        # is still in .docker-store. No-op on a MinIO-era tree.
+        if _cloudtak_compose_is_garage(cloudtak_dir):
+            plog("")
+            plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            if not _gok:
+                plog(f"✗ Garage store setup failed: {_gerr}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         # Step 5: Start containers including media on remapped ports
         plog("")
@@ -42308,12 +42318,26 @@ def run_cloudtak_update():
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
 
-        # v10.2.7: CloudTAK >= 13.102.0 keeps its files in Garage, not MinIO. Same procedure as
-        # upstream's `cloudtak.sh migrate-store`, run BEFORE the build: until the build, the
-        # previous version's images are still the tagged ones, so a failed migration can put
-        # the box back exactly as it was. A MinIO-era tree skips this; an already-migrated one
-        # only re-checks .env.
+        plog("")
+        plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
         if is_remote:
+            dcc = _compose_cmd(remote_cfg=remote_cfg)
+            if not dcc:
+                plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
+                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_update_failed_note(plog)
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
+            # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
+            build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
+            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
+            if not ok:
+                plog(f"✗ Build failed on remote: {(out or '')[:600]}")
+                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_update_failed_note(plog)
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -42326,35 +42350,9 @@ def run_cloudtak_update():
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
-        elif _cloudtak_compose_is_garage(cloudtak_dir):
-            plog("")
-            plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)
-            if not _gok:
-                plog(f"✗ Garage store setup failed: {_gerr}")
-                _undo_plugin_moves()
-                _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
-                plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
-                cloudtak_deploy_status.update({'running': False, 'error': True})
-                return
-
-        plog("")
-        plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
-        if is_remote:
-            dcc = _compose_cmd(remote_cfg=remote_cfg)
-            if not dcc:
-                plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
-                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
-                _cloudtak_update_failed_note(plog)
-                cloudtak_deploy_status.update({'running': False, 'error': True})
-                return
-            # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
-            build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache && {dcc} up -d"
-            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} up -d", timeout=1800)
             if not ok:
-                plog(f"✗ Build/restart failed on remote: {(out or '')[:600]}")
-                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
-                _cloudtak_update_failed_note(plog)
+                plog(f"✗ Restart failed on remote: {(out or '')[:600]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         else:
@@ -42375,8 +42373,12 @@ def run_cloudtak_update():
             # buffers and dies at the broker's 600s default — the streaming Popen alone
             # can't help. TAKWERX_BROKER_TIMEOUT rides the env through the shim to the
             # broker CLI so the request survives the full build (broker clamps to 2h).
+            # v10.2.7: build ONLY here. The Garage store step and `up -d` follow a SUCCESSFUL
+            # build: a failed build (network, a plugin route that no longer type-checks —
+            # test6, 2026-10-08) must leave the box exactly as it was, and it does only if
+            # nothing has been stopped or migrated yet.
             proc = subprocess.Popen(
-                f'{dcc} build --no-cache && {dcc} up -d',
+                f'{dcc} build --no-cache',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
@@ -42396,7 +42398,7 @@ def run_cloudtak_update():
                 proc.wait(timeout=5400)  # 90 min (same as deploy)
                 reader.join(timeout=5)
                 if proc.returncode != 0:
-                    plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    plog(f"✗ Build failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
                     _undo_plugin_moves()
@@ -42411,6 +42413,29 @@ def run_cloudtak_update():
                 _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                 _cloudtak_update_failed_note(plog)
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            # v10.2.7: CloudTAK >= 13.102.0 keeps its files in Garage. Upstream's migrate-store
+            # procedure, AFTER the build succeeded and BEFORE anything is recreated: the old
+            # containers kept serving through the build, and if the move fails they are started
+            # again as they were (_cloudtak_garage_rollback). A MinIO-era tree skips this; an
+            # already-migrated one only re-checks .env.
+            if _cloudtak_compose_is_garage(cloudtak_dir):
+                plog("")
+                plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
+                _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)
+                if not _gok:
+                    plog(f"✗ Garage store setup failed: {_gerr}")
+                    _undo_plugin_moves()
+                    _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
+                    plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+            _urc, _uout = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)
+            for _l in _uout.strip().splitlines()[-12:]:
+                plog(f"  {_l}")
+            if _urc != 0:
+                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
