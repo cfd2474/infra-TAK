@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.6-alpha)**
+**Current release: [v10.2.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.7-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.7-alpha — 2026-10-08 — Authentik security patch, CloudTAK's new file store works, TAK 5.8 on root installs
+
+**Headline: Authentik moves to 2026.5.7 (five HIGH-severity security fixes), CloudTAK updates and new installs work again on CloudTAK 13.102 and later — your files move to the new store automatically and plugins come with them — root-installed consoles can upgrade to TAK Server 5.8, and two install failures are fixed ([#84](https://github.com/takwerx/infra-TAK/issues/84), [#85](https://github.com/takwerx/infra-TAK/issues/85)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.7-alpha))
+
+**Authentik security.** Authentik 2026.5.7 fixes five HIGH-severity advisories published 2026-09-09, including an MFA bypass through the email authenticator and a privilege escalation through delegated group management. After updating the console, press **Update** on the Authentik card.
+
+**CloudTAK.** CloudTAK 13.102 replaced its MinIO file store with Garage and moved its web app to a new folder. Updating CloudTAK from the console now moves your files into the new store (copied, verified, and the old data kept as a backup), puts plugins where the new version looks for them, and — if anything goes wrong — puts CloudTAK back exactly as it was. A server that was updated before this release and lost its file store is repaired automatically when the console restarts. Fresh CloudTAK installs work again.
+
+**Also fixed.** Root-installed consoles could not pass the backup check before the TAK Server 5.8 upgrade. Re-running the Authentik deploy no longer breaks its compose file (#85). Container TAK Server installs no longer fail building the database image after PostgreSQL moved its Debian 11 packages (#84). Authentik deploys and reconfigures were wrongly refused with a port 9000 conflict on servers running CloudTAK; as a result, the console update now restarts Authentik once on those servers (about a minute of sign-in downtime).
 
 ### v10.2.6-alpha — 2026-10-05 — MediaMTX: logged-in viewers can watch streams, and streams stay login-only
 
