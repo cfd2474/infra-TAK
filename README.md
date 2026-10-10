@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.9-alpha)**
+**Current release: [v10.2.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.10-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.10-alpha — 2026-10-10 — OS updates and Caddy work again while Caddy's apt repo is down; retention guard keeps mission content
+
+**Headline: Install updates, Caddy Deploy and Caddy Update work again on Ubuntu while Caddy's own apt repo is refusing downloads, and the Guard Dog retention guard no longer deletes CoT that belongs to missions ([#98](https://github.com/takwerx/infra-TAK/issues/98), [#105](https://github.com/takwerx/infra-TAK/issues/105)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.10-alpha))
+
+**OS updates and Caddy on Ubuntu.** Caddy's apt repo on Cloudsmith started answering "402 Payment Required" to everyone. apt fails the whole update when any one repo fails, so on every Ubuntu box with Caddy, Install updates ended in `FATAL: apt-get update failed (exit 100)` and Ubuntu security patches stopped. Caddy Deploy and Caddy Update failed too. Now, when the only failing repo is one infra-TAK added (Caddy, Docker or PostgreSQL), the update logs a warning and installs everything else. A failing Ubuntu mirror still stops the run. The console also turns off Caddy's repo while it's refusing downloads (a backup is kept) and turns it back on once it answers again. While it's off, Caddy Deploy and Caddy Update install Caddy from its official GitHub release, checksum-verified. Rocky/RHEL boxes were not affected.
+
+**Retention guard keeps mission content.** The Guard Dog retention guard deleted every CoT row older than the retention period, including rows TAK Server's own retention keeps: items that belong to a mission, and GeoChat. It now uses the same rule as TAK Server, so it can't delete anything TAK would keep. When the guard can't reach the TAK database (for example, the database is on another server and Guard Dog isn't set up for that), it now reports the run as failed instead of "0 expired rows, nothing to do".
+
+**Upgrade note.** Update the console. On Ubuntu boxes where Install updates was failing, run it again after the update. The new retention guard is installed automatically.
 
 ### v10.2.9-alpha — 2026-10-09 — WebTAK and CloudTAK stay connected when the console restarts
 
