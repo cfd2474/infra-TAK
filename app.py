@@ -16630,6 +16630,14 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
                 .replace('DB_PORT_PLACEHOLDER', db_port)
                 .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 .replace('SSH_USER_PLACEHOLDER', s1_user))
+            # This runs on every console start: leave an identical script alone (re-assert +x
+            # only), same as run_guarddog_deploy(), so mtimes only move when content does.
+            try:
+                if _read_priv(dest) == content:
+                    _chmod_priv(dest, 0o755)
+                    continue
+            except Exception:
+                pass
             _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
         except Exception as e:
             return False, f'{name}: {e}'
@@ -24208,6 +24216,10 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+                # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
+                # Leaving the placeholder in made the two renders differ, so every Update Now
+                # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')
             if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
                 fh_remote = fh_cfg.get('remote', {})
                 fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
