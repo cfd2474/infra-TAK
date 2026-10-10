@@ -35,6 +35,8 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 DEPLOY_SRC = APP[APP.index('def run_guarddog_deploy(alert_email):'):APP.index("@app.route('/nodered')")]
 SYNC_SRC = APP[APP.index('def _sync_guarddog_remote_db_from_settings('):
                APP.index('def _remotedb_host_port_from_tak_settings(')]
+STARTUP_SRC = APP[APP.index('def _auto_update_guarddog():'):
+                  APP.index('def _start_guarddog_background_at_boot(')]
 GD = '/opt/tak-guarddog'
 DB_SCRIPTS = ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh',
               'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh')
@@ -90,8 +92,10 @@ def h(tmp_path, monkeypatch):
     }
     exec(DEPLOY_SRC, ns)
     exec(SYNC_SRC, ns)
+    exec(STARTUP_SRC, ns)
     real_exists, real_isdir = os.path.exists, os.path.isdir
-    monkeypatch.setattr(os.path, 'exists', lambda p: True if p == '/opt/tak' else real_exists(p))
+    monkeypatch.setattr(os.path, 'exists',
+                        lambda p: True if p in ('/opt/tak', GD) else real_exists(p))
     monkeypatch.setattr(os.path, 'isdir', lambda p: True if p == GD else real_isdir(p))
 
     def deploy():
@@ -105,11 +109,19 @@ def h(tmp_path, monkeypatch):
         assert ok, msg
         return [w for w in writes if w.endswith('.sh')]
 
-    return deploy, sync, writes, box
+    def startup():
+        writes.clear()
+        try:
+            ns['_auto_update_guarddog']()
+        except AssertionError:
+            pass                 # reached the systemd-unit installs after the script loop
+        return [w for w in writes if w.endswith('.sh')]
+
+    return deploy, sync, writes, box, startup
 
 
 def test_both_writers_render_the_db_scripts_identically(h):
-    deploy, sync, writes, box = h
+    deploy, sync, writes, box, startup = h
     deploy()
     by_deploy = {n: (box / n).read_text() for n in DB_SCRIPTS}
     assert sync() == []          # nothing to rewrite: same bytes
@@ -119,7 +131,7 @@ def test_both_writers_render_the_db_scripts_identically(h):
 
 
 def test_update_after_startup_sync_reports_nothing_changed(h):
-    deploy, sync, writes, box = h
+    deploy, sync, writes, box, startup = h
     deploy()                     # box as installed
     sync()                       # console start
     lines = deploy()             # post-update redeploy
@@ -128,12 +140,21 @@ def test_update_after_startup_sync_reports_nothing_changed(h):
 
 
 def test_startup_sync_leaves_identical_scripts_alone(h):
-    deploy, sync, writes, box = h
+    deploy, sync, writes, box, startup = h
     first = sync()
     assert sorted(first) == sorted(DB_SCRIPTS)
     mtimes = {n: (box / n).stat().st_mtime_ns for n in DB_SCRIPTS}
     assert sync() == []
     assert {n: (box / n).stat().st_mtime_ns for n in DB_SCRIPTS} == mtimes
+
+
+def test_console_start_after_update_rewrites_no_db_script(h):
+    deploy, sync, writes, box, startup = h
+    deploy()                     # box as installed / last Update Now
+    assert [w for w in startup() if w in DB_SCRIPTS] == []   # startup copy
+    assert sync() == []          # startup two-server sync
+    lines = deploy()             # post-update redeploy
+    assert 'changed (' not in lines[0], lines[0]
 
 
 def test_deploy_leaves_an_identical_tasklog_purge_script_alone():
@@ -146,7 +167,7 @@ def test_deploy_leaves_an_identical_tasklog_purge_script_alone():
 
 
 def test_startup_sync_still_rewrites_a_changed_script(h):
-    deploy, sync, writes, box = h
+    deploy, sync, writes, box, startup = h
     sync()
     (box / 'tak-retention-guard.sh').write_text('#!/bin/bash\n# stale\n')
     assert sync() == ['tak-retention-guard.sh']
