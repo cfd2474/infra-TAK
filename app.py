@@ -24180,6 +24180,10 @@ def run_guarddog_deploy(alert_email):
         if _no_recip:
             plog(f"⚠ {_no_recip}")
         # Scripts (e.g. tak-cert-watch.sh) live in repo scripts/guarddog/ — read from disk each deploy.
+        # Only rewrite a script whose rendered content differs, same as _auto_update_guarddog().
+        # Update Now runs this right after the startup copy, and rewriting every file with
+        # identical bytes made the box's mtimes disagree with the "N script(s) updated" log line.
+        changed = []
         for name in script_files:
             src = os.path.join(scripts_dir, name)
             if not os.path.isfile(src):
@@ -24212,8 +24216,25 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
                 content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
             dest = os.path.join('/opt/tak-guarddog', name)
-            _write_priv(dest, content, perm=(0o755 if name.endswith('.sh') else None))
-        plog("✓ Scripts installed")
+            _perm = 0o755 if name.endswith('.sh') else None
+            try:
+                _unchanged = _read_priv(dest) == content
+            except Exception:
+                _unchanged = False
+            if _unchanged and _perm is not None:
+                try:
+                    _chmod_priv(dest, _perm)   # still repair a lost +x; chmod leaves mtime alone
+                except Exception:
+                    _unchanged = False         # legacy non-root: let _write_priv's sudo chmod do it
+            if _unchanged:
+                continue
+            _write_priv(dest, content, perm=_perm)
+            changed.append(name)
+        if changed:
+            plog(f"✓ Scripts installed: {len(changed)} changed ({', '.join(sorted(changed))}), "
+                 f"{len(script_files) - len(changed)} already current")
+        else:
+            plog(f"✓ Scripts installed: all {len(script_files)} already current")
         # Write config file for health endpoint (two-server DB host info)
         gd_conf = {}
         if is_two_server and s1_host:
@@ -86128,8 +86149,12 @@ def _post_update_auto_deploy():
                     print("Post-update: auto-deploying Guard Dog")
                     _auto_deploy_active['guarddog'] = True
                     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
+                    guarddog_deploy_log.clear()
                     try:
                         run_guarddog_deploy(alert_email)
+                        for _gd_line in list(guarddog_deploy_log):
+                            if 'Scripts installed' in _gd_line:
+                                print(f"Post-update: Guard Dog {_gd_line}", flush=True)
                     except Exception as e:
                         print(f"Post-update: Guard Dog deploy error: {e}")
                     finally:
