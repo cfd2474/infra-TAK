@@ -16630,6 +16630,14 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
                 .replace('DB_PORT_PLACEHOLDER', db_port)
                 .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 .replace('SSH_USER_PLACEHOLDER', s1_user))
+            # This runs on every console start: leave an identical script alone (re-assert +x
+            # only), same as run_guarddog_deploy(), so mtimes only move when content does.
+            try:
+                if _read_priv(dest) == content:
+                    _chmod_priv(dest, 0o755)
+                    continue
+            except Exception:
+                pass
             _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
         except Exception as e:
             return False, f'{name}: {e}'
@@ -24208,6 +24216,10 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+                # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
+                # Leaving the placeholder in made the two renders differ, so every Update Now
+                # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')
             if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
                 fh_remote = fh_cfg.get('remote', {})
                 fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
@@ -24330,7 +24342,14 @@ def run_guarddog_deploy(alert_email):
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            try:
+                _ak_purge_same = _read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+                if _ak_purge_same:
+                    _chmod_priv(_ak_purge_path, 0o755)   # keep +x; leave mtime alone
+            except Exception:
+                _ak_purge_same = False
+            if not _ak_purge_same:
+                _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -80123,6 +80142,7 @@ def _auto_update_guarddog():
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # as run_guarddog_deploy() and the startup sync
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
                 _fh_remote = _fh_cfg.get('remote', {})
