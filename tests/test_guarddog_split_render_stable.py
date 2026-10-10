@@ -136,6 +136,15 @@ def test_startup_sync_leaves_identical_scripts_alone(h):
     assert {n: (box / n).stat().st_mtime_ns for n in DB_SCRIPTS} == mtimes
 
 
+def test_deploy_leaves_an_identical_tasklog_purge_script_alone():
+    # Written outside the counted script loop, so it gets its own compare (seen rewritten
+    # with identical bytes on every Update Now on test8).
+    i = DEPLOY_SRC.index("_ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'")
+    block = DEPLOY_SRC[i:i + 600]
+    assert '_read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT' in block
+    assert block.index('if not _ak_purge_same:') < block.index('_write_priv(_ak_purge_path')
+
+
 def test_startup_sync_still_rewrites_a_changed_script(h):
     deploy, sync, writes, box = h
     sync()

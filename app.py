@@ -24342,7 +24342,14 @@ def run_guarddog_deploy(alert_email):
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            try:
+                _ak_purge_same = _read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+                if _ak_purge_same:
+                    _chmod_priv(_ak_purge_path, 0o755)   # keep +x; leave mtime alone
+            except Exception:
+                _ak_purge_same = False
+            if not _ak_purge_same:
+                _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
