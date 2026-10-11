@@ -73974,6 +73974,58 @@ def _tak_snapshot(label, plog=None):
     return True, meta
 
 
+def _tak_rollback_prepare_local_db(plog):
+    """Make sure the local cluster has a `martiuser` that can log in with the password in
+    CoreConfig.xml, and a `cot` database to restore into. Returns True when both hold.
+
+    Field: lutak2.net 2026-10-10. TAK Server 5.8 sat on a PostgreSQL 18 cluster with no
+    cot database, and martiuser could not log in. Restore ran `pg_restore --clean -d cot`
+    into a database that did not exist. pg_restore exits 1 for that, the same code it uses
+    for harmless warnings, so the rollback logged "warnings (non-fatal)" and then
+    "complete" with nothing restored. The snapshot held the data the whole time.
+
+    Same statements TAK's own takserver-setup-db.sh uses, with the password re-set even
+    when the role exists. TAK logs in with whatever CoreConfig says, so the role must match
+    it; this is the same re-encode _tak58_heal_md5_scram does. The password is never logged.
+    """
+    r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
+                  "select (select count(*) from pg_roles where rolname='martiuser')"
+                  " || ',' || (select count(*) from pg_database where datname='cot')"],
+                 timeout=60)
+    if not r or r.returncode != 0 or ',' not in (r.stdout or ''):
+        plog("  rollback: cannot reach the local PostgreSQL as postgres: "
+             f"{((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        return False
+    has_role, has_db = [p.strip() == '1' for p in r.stdout.strip().split(',', 1)]
+
+    pw = _tak58_db_password()
+    tag = '$takrbpw$'
+    if not pw:
+        plog("  rollback: no database password in CoreConfig.xml — cannot set up martiuser")
+        return False
+    if tag.strip('$') in pw:
+        plog("  rollback: database password contains the quoting tag — refusing to build the statement")
+        return False
+    verb = 'ALTER ROLE martiuser' if has_role else \
+        'CREATE ROLE martiuser LOGIN INHERIT CREATEDB NOCREATEROLE'
+    r = _pg_exec(['psql', '-q', '-d', 'postgres', '-c',
+                  "SET password_encryption = 'scram-sha-256'; "
+                  "%s PASSWORD %s%s%s;" % (verb, tag, pw, tag)], timeout=60)
+    if not r or r.returncode != 0:
+        plog(f"  rollback: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        return False
+    plog("  rollback: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
+                                     else "was missing — recreated with the CoreConfig.xml password"))
+
+    if not has_db:
+        r = _pg_exec(['createdb', '--owner=martiuser', 'cot'], timeout=120)
+        if not r or r.returncode != 0:
+            plog(f"  rollback: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
+            return False
+        plog("  rollback: cot database was missing — recreated, empty, owned by martiuser")
+    return True
+
+
 def _tak_rollback(label, plog=None):
     """Restore TAK Server from snapshot at /opt/tak/snapshots/<label>/.
 
@@ -73981,10 +74033,13 @@ def _tak_rollback(label, plog=None):
       1. Validate snapshot exists and has a pg_dump
       2. systemctl stop takserver
       3. Restore CoreConfig.xml, UserAuthenticationFile.xml, takserver.default, certs/
-      4. pg_restore --clean -d cot from snapshot
-      5. systemctl start takserver
+      4. Local DB: make sure martiuser + cot exist (_tak_rollback_prepare_local_db)
+      5. pg_restore --clean -d cot from snapshot; check the schema landed, and bring it up
+         to the installed TAK Server's schema if the snapshot is older
+      6. systemctl start takserver
 
-    Returns (True, None) on success, (False, error_str) on failure.
+    Returns (True, None) on success, (False, error_str) on failure — including a database
+    that did not come back, even though the files did.
     """
     import shutil as _shutil
     if plog is None:
@@ -74100,10 +74155,18 @@ def _tak_rollback(label, plog=None):
         except Exception as _e_stage:
             plog(f"  rollback: could not stage cot.pgdump for restore: {_e_stage}")
             _staged_dump = pg_dump_path  # fall back; open() may still work as root
+    # pg_restore's exit code cannot tell "restored with warnings" from "restored nothing"
+    # (both are 1), so on a local database the result is judged by asking the database
+    # afterwards, and a failure is returned as one instead of "complete".
+    _db_err = None
+    if not _rb_two_server and not _tak_rollback_prepare_local_db(plog):
+        _db_err = 'the local database could not be prepared for the restore (see above)'
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
         _rb_s1 = _rb_tak_cfg.get('server_one', {})
-        if _rb_two_server:
+        if _db_err:
+            plog("  rollback: skipping pg_restore")
+        elif _rb_two_server:
             plog("  rollback: two-server mode — streaming pg_restore to Server One via SSH")
             _rb_host = (_rb_s1.get('host') or '').strip()
             _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
@@ -74142,6 +74205,7 @@ def _tak_rollback(label, plog=None):
             else:
                 plog(f"  rollback: pg_restore failed (exit {resp.get('returncode')}): "
                      f"{(resp.get('error') or resp.get('stderr') or '')[:200]}")
+                _db_err = 'pg_restore failed (see above)'
         elif _tak_is_container():
             pg_container = TAK_DB_CONTAINER
             r = subprocess.run(
@@ -74162,8 +74226,10 @@ def _tak_rollback(label, plog=None):
                         plog("  rollback: pg_restore successful")
                 else:
                     plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                    _db_err = 'pg_restore failed (see above)'
             else:
                 plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+                _db_err = f'{pg_container} is not running, so the database was not restored'
         else:
             # v10.0.8: ROOT native single-server — restore directly via the local
             # postgres OS user. The old code only knew the takserver-db container
@@ -74182,13 +74248,39 @@ def _tak_rollback(label, plog=None):
                     plog("  rollback: pg_restore successful")
             else:
                 plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                _db_err = 'pg_restore failed (see above)'
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
+        if not _rb_two_server:
+            _db_err = f'pg_restore raised: {str(e)[:200]}'
     finally:
         # Remove the staged dump copy (broker-owned by the console uid now).
         if _staged_dump != pg_dump_path:
             try: subprocess.run(_sudo_wrap(['rm', '-f', _staged_dump]), capture_output=True, timeout=30)
             except Exception: pass
+
+    # 6b. Did it land, and does the schema match the TAK Server that is installed? A dump
+    # taken before a 5.8 upgrade (pre-58-*) carries the 5.7 schema; 5.8 must not run on it
+    # (see _TAK58_MIN_SCHEMA_VERSION), so apply TAK's own schema update, as the 5.8
+    # migration does.
+    if not _rb_two_server and not _db_err:
+        _sv = _tak58_schema_version()
+        if _sv is None:
+            _db_err = 'the cot database has no TAK schema after pg_restore — nothing was restored'
+        else:
+            plog(f"  rollback: cot database restored (schema_version {_sv})")
+            _inst = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
+            if (not _tak_is_container() and _inst and _inst >= TAK_GATE_BLOCK_FROM
+                    and _sv < _TAK58_MIN_SCHEMA_VERSION):
+                plog(f"  rollback: this snapshot predates TAK Server {_inst[0]}.{_inst[1]} — applying "
+                     "its schema updates (TAK's takserver-setup-db.sh)…")
+                _rc = _tak58_run_setup_db()
+                _sv2 = _tak58_schema_version()
+                if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
+                    _db_err = (f"the TAK Server {_inst[0]}.{_inst[1]} schema updates did not apply "
+                               f"(setup exit {_rc}, schema_version {_sv2 if _sv2 is not None else 'unreadable'})")
+                else:
+                    plog(f"  rollback: schema updated to version {_sv2}")
 
     # 7. Start TAK Server
     plog("  rollback: starting takserver…")
@@ -74208,6 +74300,9 @@ def _tak_rollback(label, plog=None):
     except Exception as _e_nr:
         plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
 
+    if _db_err:
+        plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored")
+        return False, _db_err
     plog(f"  ✓ rollback [{label}]: complete")
     return True, None
 
