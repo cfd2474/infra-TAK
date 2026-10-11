@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.8-alpha)**
+**Current release: [v10.2.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.11-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -428,6 +428,40 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.11-alpha — 2026-10-11 — Guard Dog fixes for split installs and busy hosts; snapshot Restore brings back a missing TAK database
+
+**Headline: Guard Dog's remote-database check only restarts PostgreSQL when it is really down (at most 3 times a day), split installs keep their database settings, Guard Dog stops restarting Authentik on an overloaded host, snapshot Restore can rebuild a missing TAK database, and module updates are no longer cut off by the daily console restart ([#99](https://github.com/takwerx/infra-TAK/issues/99), [#101](https://github.com/takwerx/infra-TAK/issues/101), [#106](https://github.com/takwerx/infra-TAK/issues/106), [#111](https://github.com/takwerx/infra-TAK/issues/111), [#113](https://github.com/takwerx/infra-TAK/issues/113), [#114](https://github.com/takwerx/infra-TAK/issues/114), [#117](https://github.com/takwerx/infra-TAK/issues/117)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.11-alpha))
+
+**Split (two-server) installs.** Guard Dog's remote-database check now restarts PostgreSQL only when the database server itself confirms it isn't responding, and at most 3 times in 24 hours. If it can't ask, it alerts instead of restarting. Update Now now refreshes the remote-database scripts on every split box, not only on boxes whose settings say two-server. `guarddog.conf` always carries the database topology (read from TAK Server's own CoreConfig when the settings don't say), and its other keys are no longer dropped when it's rewritten. Guard Dog no longer rewrites unchanged scripts on every start or update, and the update log shows what really changed.
+
+**Authentik on a busy host.** When the host is CPU-starved but Authentik is still answering, Guard Dog holds and alerts once an hour instead of restarting it over and over. Restarts back off (15 → 30 → 60 → 120 min), and the first one restarts only the Authentik server and worker. An old Authentik scheduler patch from an earlier 2026.5.x image no longer stays mounted after an upgrade and undoes the new version's fixes.
+
+**TAK Server database.** Snapshot **Restore** now recreates a missing `cot` database and `martiuser` role, applies the 5.8 schema to an older snapshot, and reports a failed restore as failed instead of "complete". The TAK 5.8 update gets past an apt hold on `takserver`, and if nothing was installed it starts TAK again instead of leaving it down. Help → Diagnostics now shows the TAK database state, recent package changes, and update runs that were cut off.
+
+**Module updates.** The daily console restart now waits for running module updates, deploys and removals (for example an ATLAS update). An ATLAS update that was interrupted mid-rebuild now finishes on the next try instead of saying it's already installed.
+
+**Upgrade note.** Update the console. Boxes that still carry the old Authentik scheduler patch get one Authentik server + worker restart on first start. Split boxes get the new remote-database check automatically.
+
+### v10.2.10-alpha — 2026-10-10 — OS updates and Caddy work again while Caddy's apt repo is down; retention guard keeps mission content
+
+**Headline: Install updates, Caddy Deploy and Caddy Update work again on Ubuntu while Caddy's own apt repo is refusing downloads, and the Guard Dog retention guard no longer deletes CoT that belongs to missions ([#98](https://github.com/takwerx/infra-TAK/issues/98), [#105](https://github.com/takwerx/infra-TAK/issues/105)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.10-alpha))
+
+**OS updates and Caddy on Ubuntu.** Caddy's apt repo on Cloudsmith started answering "402 Payment Required" to everyone. apt fails the whole update when any one repo fails, so on every Ubuntu box with Caddy, Install updates ended in `FATAL: apt-get update failed (exit 100)` and Ubuntu security patches stopped. Caddy Deploy and Caddy Update failed too. Now, when the only failing repo is one infra-TAK added (Caddy, Docker or PostgreSQL), the update logs a warning and installs everything else. A failing Ubuntu mirror still stops the run. The console also turns off Caddy's repo while it's refusing downloads (a backup is kept) and turns it back on once it answers again. While it's off, Caddy Deploy and Caddy Update install Caddy from its official GitHub release, checksum-verified. Rocky/RHEL boxes were not affected.
+
+**Retention guard keeps mission content.** The Guard Dog retention guard deleted every CoT row older than the retention period, including rows TAK Server's own retention keeps: items that belong to a mission, and GeoChat. It now uses the same rule as TAK Server, so it can't delete anything TAK would keep. When the guard can't reach the TAK database (for example, the database is on another server and Guard Dog isn't set up for that), it now reports the run as failed instead of "0 expired rows, nothing to do".
+
+**Upgrade note.** Update the console. On Ubuntu boxes where Install updates was failing, run it again after the update. The new retention guard is installed automatically.
+
+### v10.2.9-alpha — 2026-10-09 — WebTAK and CloudTAK stay connected when the console restarts
+
+**Headline: WebTAK and the CloudTAK map no longer lose their live connection every time the console starts or Caddy's config is reloaded ([#90](https://github.com/takwerx/infra-TAK/issues/90)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.9-alpha))
+
+**WebTAK and CloudTAK connections.** Every Caddy reload closed every open WebTAK and CloudTAK map connection on the spot, and the console reloaded Caddy twice on every start, even when nothing had changed. Those two startup steps now reload Caddy only when its config actually changed. The TAK Server and CloudTAK map sites also keep open connections for up to 5 minutes across a reload instead of cutting them; WebTAK reconnects on its own after that. This needs Caddy 2.7 or newer; older Caddy keeps today's behaviour.
+
+**Good to know.** TAK Server's web login lasts about 2 hours by default. After that, WebTAK can't reconnect until you reload the page and sign in again. That's TAK Server's own setting, not something the console changes.
+
+**Upgrade note.** Update the console. Caddy reloads once more while the update applies the new setting, so open WebTAK and CloudTAK sessions reconnect one last time.
 
 ### v10.2.8-alpha — 2026-10-09 — TAK Portal one-click Fix, certificates and CloudTAK survive a TAK Server upgrade, failed updates explain themselves
 

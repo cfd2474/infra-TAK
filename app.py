@@ -354,6 +354,7 @@ def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
 # the same value. Never per-box, never tier-derived, never operator-preserved.
 CADDY_GRACE_PERIOD = '10s'      # bounds Caddy's own shutdown of the outgoing config
 CADDY_RELOAD_TIMEOUT = 45       # our ceiling per attempt; >> the grace period on purpose
+CADDY_STREAM_CLOSE_DELAY = '5m'  # how long a reload leaves proxied WebSockets open (GH #90)
 
 
 def _caddy_reload_checked(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
@@ -437,6 +438,41 @@ def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True
     WITHOUT taking the deploy down with it."""
     return _caddy_reload_checked(plog=plog, timeout=timeout,
                                  restart_on_error=restart_on_error)[0]
+
+
+def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
+    """Load the on-disk Caddyfile ONLY if Caddy is not already running it. Returns (ok, detail).
+
+    GH #90 — `systemctl reload caddy` runs the packaged unit's ExecReload, which is
+    `caddy reload --config /etc/caddy/Caddyfile --force` (checked on test8 + nuc, 2026-10-09).
+    --force makes Caddy rebuild every server even when the config is byte-identical, and a
+    rebuild closes every proxied WebSocket — WebTAK went red on every console start, because
+    two startup steps regenerate the Caddyfile and reload it whether or not anything changed.
+
+    Without --force, Caddy compares the adapted config with the one it is running and skips
+    the reload when they match ("config is unchanged" — changeConfig() in caddy.go). That is
+    the check we want, and Caddy makes it against its RUNNING config, not the file: a file
+    that a previous reload refused still differs from what is running, so it is loaded (and
+    refused again, loudly) here. `caddy reload` only adapts and POSTs to the admin API on
+    localhost:2019, so it needs nothing privileged — unlike `caddy validate`, it never opens
+    the log files or certs that the console user cannot read.
+
+    ANY failure of the unforced attempt falls through to _caddy_reload_checked() with the
+    caller's own arguments, so the outcome is never worse than calling that directly. Do not
+    use this where a reload must re-read files the Caddyfile only points at (e.g. a swapped
+    custom cert) — only --force reprovisions those."""
+    # No EAB environment needed, unlike _caddy_validate_config(): adapting keeps the
+    # `{env.…}` placeholders verbatim and nothing is provisioned on this side.
+    try:
+        if shutil.which('caddy'):
+            r = subprocess.run(['caddy', 'reload', '--config', CADDYFILE_PATH,
+                                '--adapter', 'caddyfile'],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return True, ''
+    except Exception:
+        pass                        # never raises — same contract as _caddy_reload_checked()
+    return _caddy_reload_checked(plog=plog, timeout=timeout, restart_on_error=restart_on_error)
 
 
 def _priv_pipe(argv, filter_argv, timeout=60, **kw):
@@ -1033,7 +1069,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.9-alpha"
+VERSION = "10.2.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1690,8 +1726,13 @@ def save_settings(s):
             raise
 
 def _read_os_release():
-    """(os_type, os_name) from /etc/os-release, mirroring start.sh: '<ID>-<VERSION_ID>'
-    (e.g. ubuntu-22.04, rocky-9) and PRETTY_NAME. ('','') if unreadable."""
+    """(os_type, os_name) from /etc/os-release, mapped exactly as start.sh detect_os()
+    does (ubuntu-22.04, ubuntu-24.04, debian-12, rocky-9 for the whole EL9 family, else
+    '<ID>-<VERSION_ID>') and PRETTY_NAME. ('','') if unreadable.
+
+    GH #101: this used to be a plain '<ID>-<VERSION_ID>', which gives 'rhel-9.4' where
+    start.sh writes 'rocky-9' — harmless while it only filled an EMPTY os_type, wrong
+    the moment the boot heal refreshes a stale one (templates test `'rocky' in os_type`)."""
     try:
         d = {}
         with open('/etc/os-release') as f:
@@ -1701,7 +1742,14 @@ def _read_os_release():
                     d[k] = v.strip().strip('"')
         idv = (d.get('ID') or '').lower()
         ver = d.get('VERSION_ID') or ''
-        return (f"{idv}-{ver}" if idv and ver else idv), (d.get('PRETTY_NAME') or '')
+        name = d.get('PRETTY_NAME') or ''
+        if idv == 'ubuntu' and ver.startswith(('22.04', '24.04')):
+            return f"ubuntu-{ver[:5]}", name
+        if idv == 'debian' and ver.startswith('12'):
+            return 'debian-12', name
+        if idv in ('rocky', 'rhel', 'almalinux', 'centos'):
+            return ('rocky-9' if ver.startswith('9') else f"rocky-{ver}"), name
+        return (f"{idv}-{ver}" if idv and ver else idv), name
     except Exception:
         return '', ''
 
@@ -1767,12 +1815,17 @@ def _heal_settings_core_keys():
     except Exception:
         return
     _identity = ('os_type', 'os_name', 'pkg_mgr', 'arch', 'console_port', 'install_dir', 'ssl_mode')
+    # GH #101: the OS is a fact about the box, not an install-time choice. This heal used
+    # to fill only an EMPTY os_name/os_type, so an in-place release upgrade (22.04 -> 24.04)
+    # left the console footer on the old release forever. Re-read it every boot and
+    # correct a stale value; an unreadable os-release changes nothing.
+    _ot, _on = _read_os_release()
+    healed = {k: v for k, v in (('os_type', _ot), ('os_name', _on)) if v and s.get(k) != v}
     # Fast no-op: identity intact AND server_ip present AND (fqdn present OR genuinely
     # no domain to recover). server_ip is included so a value dropped by the
     # load_settings type guard (corrupted to a list on disk) gets re-derived here.
-    if all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
+    if not healed and all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
         return
-    healed = {}
     if not s.get('install_dir'):
         healed['install_dir'] = BASE_DIR
     if not s.get('arch'):
@@ -1782,12 +1835,6 @@ def _heal_settings_core_keys():
             healed['arch'] = 'amd64'
     if not s.get('pkg_mgr'):
         healed['pkg_mgr'] = 'dnf' if _distro_family() == 'rhel' else 'apt'
-    if not s.get('os_type') or not s.get('os_name'):
-        _ot, _on = _read_os_release()
-        if not s.get('os_type') and _ot:
-            healed['os_type'] = _ot
-        if not s.get('os_name') and _on:
-            healed['os_name'] = _on
     if not s.get('console_port'):
         healed['console_port'] = _detect_console_port()
     if not s.get('server_ip'):
@@ -1805,7 +1852,7 @@ def _heal_settings_core_keys():
     if healed:
         s.update(healed)
         save_settings(s)
-        print(f"[heal-settings] restored missing core keys: {list(healed)}", flush=True)
+        print(f"[heal-settings] restored missing or stale core keys: {list(healed)}", flush=True)
 
 # ---------------------------------------------------------------------------
 # v10.2.8 W10: a failed module update records its own reason
@@ -8129,7 +8176,9 @@ def _diag_section_takserver(settings):
         out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
     for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
                        ('auth', ('default', 'x509groups', 'x509useGroupCache')),
-                       ('connector', ('port', 'clientAuth', '_name'))):
+                       ('connector', ('port', 'clientAuth', '_name')),
+                       # v10.2.11: where TAK looks for its database and as whom (never the password)
+                       ('connection', ('url', 'username'))):
         for el in re.findall(rf'<{tag}\b[^>]*>', cc):
             out.append(f"<{tag}> " + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el) if a in attrs))
     for el in re.findall(r'<input\b[^>]*>', cc):
@@ -8192,22 +8241,275 @@ def _diag_tak_update_history(tail=150):
     """v10.2.2 W9: recent TAK Server update runs + the log of the latest that did not
     succeed (recorded by _tak_update_job; redacted with the rest of the report)."""
     out = []
-    if upgrade_status.get('running') or tak58_status.get('running'):
-        out.append('TAK Server update: one is RUNNING right now — its log is recorded when it ends')
+    live = upgrade_status.get('running') or tak58_status.get('running')
+    if live:
+        out.append('TAK Server update: one is RUNNING right now — its log so far is below')
     hist = _tak_update_history()
     if not hist:
         out.append('TAK Server updates recorded by this console: none (recording began in v10.2.2)')
         return out
-    out.append('TAK Server updates recorded by this console (newest first):')
+    # 'running' is a checkpoint (v10.2.11). Only the newest can still be live; any other —
+    # or the newest when no worker is running — was cut off mid-run.
+    for i, h in enumerate(hist):
+        if h.get('result') == 'running' and not (live and i == 0):
+            h['result'] = 'INTERRUPTED (the console stopped mid-run; last checkpoint shown)'
+    out.append('TAK Server updates recorded by this console (newest first; time = end, or last checkpoint):')
     for h in hist:
         out.append(f"  {h.get('finished', '?')}  {h.get('result', '?')}  {h.get('kind', '?')}  "
-                   f"{h.get('package') or '-'}  ({h.get('seconds', '?')} s)")
+                   f"{h.get('package') or '-'}  (started {h.get('started', '?')}, {h.get('seconds', '?')} s)")
     bad = next((h for h in hist if h.get('result') != 'ok'), None)
     if bad:
         lines = bad.get('lines') or []
-        out.append(f"log of the latest update that did not succeed ({bad.get('finished')}, "
+        out.append(f"log of the latest update that did not succeed or is still running ({bad.get('finished')}, "
                    f"{bad.get('kind')}), last {min(len(lines), tail)} of {bad.get('total_lines', len(lines))} lines:")
         out.extend('    ' + str(l)[:300] for l in lines[-tail:])
+    return out
+
+
+# ── v10.2.11 (ops #9): enough to say HOW a TAK database broke, from the report alone ──
+# lutak2.net (GH #105/#106) sent a report showing TAK 5.8 installed, "database cot does not
+# exist" and martiuser failing to log in — and nothing that said which PostgreSQL clusters
+# exist, what installed 5.8 and when, or whether the data is still on disk. Every answer
+# started "please run pg_lsclusters…". These two sections are those questions.
+_DIAG_PKG_RE = re.compile(r'takserver|postgres|postgis|openjdk', re.I)
+_DIAG_TRAIL_DAYS = 30
+
+
+def _diag_log_lines(path, max_bytes=_DIAG_TAIL_BYTES):
+    """Tail of a log as lines: a direct read, else (under a log or PostgreSQL directory the
+    broker may read) a privileged one. None when neither works."""
+    lines = _diag_tail(path, max_bytes)
+    if lines is None and path.startswith(('/var/log/', '/var/lib/postgresql/', '/var/lib/pgsql/')):
+        try:
+            txt = _read_own_or_priv(path)
+            lines = txt.splitlines()[-20000:] if txt is not None else None   # '' = an empty log
+        except Exception:
+            lines = None
+    return lines
+
+
+def _diag_rotated_lines(path, keep=2):
+    """A log and its rotated copies (path.1, path.2.gz, …), oldest first; unreadable ones skipped."""
+    import gzip
+    out = []
+    for i in range(keep, 0, -1):
+        for p in (f'{path}.{i}', f'{path}.{i}.gz'):
+            try:
+                with (gzip.open(p, 'rb') if p.endswith('.gz') else open(p, 'rb')) as f:
+                    out.extend(f.read(8 * 1024 * 1024).decode('utf-8', 'replace').splitlines())
+            except OSError:
+                pass
+    return out + (_diag_log_lines(path) or [])
+
+
+def _diag_pg_overview(port=None):
+    """Version, port, data directory, databases (with size) and login roles of a local
+    cluster. Fixed, console-authored SQL only (see _pg_exec's security invariant)."""
+    sql = ("SELECT 'server '||current_setting('server_version')||'  port '||current_setting('port')"
+           "||'  data '||current_setting('data_directory') "
+           "UNION ALL SELECT 'database '||datname||'  '||pg_size_pretty(pg_database_size(datname)) "
+           "FROM pg_database WHERE NOT datistemplate "
+           "UNION ALL SELECT 'login roles: '||coalesce(string_agg(rolname, ', ' ORDER BY rolname), '(none)') "
+           "FROM pg_roles WHERE rolcanlogin")
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'postgres'] + (['-p', str(port)] if port else []) + ['-c', sql],
+                     timeout=20)
+    except Exception as e:
+        return [f'  (could not query: {str(e)[:160]})']
+    if r.returncode != 0:
+        return ['  (could not query: %s)' % ((r.stderr or '').strip()[:160] or 'exit %s' % r.returncode)]
+    return ['  ' + l for l in (r.stdout or '').splitlines() if l.strip()]
+
+
+def _diag_pg_log(path):
+    """FATAL/ERROR/start/stop lines of a PostgreSQL server log, repeats counted."""
+    lines = _diag_log_lines(path, 1024 * 1024)
+    if lines is None:
+        return [f"  {path}: missing, or not readable by the console on this box"]
+    hits = [l for l in lines if re.search(r'FATAL|PANIC|ERROR|starting PostgreSQL|shutting down|'
+                                          r'database system (is ready|was shut down|was interrupted)|'
+                                          r'received \w+ shutdown', l)]
+    groups = {}
+    for l in hits:
+        msg = re.sub(r'^\S+ \S+ \S+ \[\d+\]\s*(\S+@\S+\s+)?', '', l)[:160]
+        groups[msg] = groups.get(msg, 0) + 1
+    out = [f"  {path}: {len(hits)} error/start/stop line(s) in the recent tail"]
+    out.extend(f"    {n:>6} x {m}" for m, n in sorted(groups.items(), key=lambda kv: -kv[1])[:10])
+    if hits:
+        out.append('    newest:')
+        out.extend('      ' + l[:240] for l in hits[-8:])
+    return out
+
+
+def _diag_section_tak_database(settings):
+    if not os.path.exists('/opt/tak') and not _tak_is_container():
+        return ['TAK Server not installed on this box']
+    out = []
+    deb = bool(shutil.which('dpkg-query'))
+    if deb:
+        pk = _diag_cmd(['dpkg-query', '-W', '-f=${db:Status-Abbrev} ${Package} ${Version}\n',
+                        'takserver*', 'postgresql*', 'postgis*'], priv=False)
+        # Status 'ii' = installed; 'iU'/'iF'/'iH' = unpacked or half-configured — an install
+        # that did not finish, which the next apt run will try to complete.
+        rows = [l for l in pk.splitlines() if l.strip() and not l.startswith(('un ', 'dpkg-query:'))]
+    else:
+        rows = _diag_cmd(['rpm', '-qa', '--last', 'takserver*', 'postgresql*', 'postgis*'], priv=False).splitlines()
+    out.append('packages (takserver / postgresql / postgis):' + ('' if rows else ' none found'))
+    out.extend('  ' + l.strip()[:160] for l in rows[:40])
+    mode = _get_tak_deployment_config(settings).get('mode')
+    units = []
+    if mode in ('two_server', 'external_db'):
+        out.append(f"PostgreSQL: the TAK database is not on this box ({mode}) — clusters not listed")
+    elif _tak_is_container():
+        out.append('PostgreSQL (inside the TAK database container):')
+        out.extend(_diag_pg_overview())
+    elif deb:
+        lsc = _diag_cmd(['pg_lsclusters', '--no-header'])
+        rows = [l.split() for l in lsc.splitlines() if l.strip()]
+        clusters = [r for r in rows if len(r) >= 6 and r[0].isdigit()]
+        out.append('PostgreSQL clusters (pg_lsclusters): version cluster port status owner data-dir log')
+        out.extend('  ' + ' '.join(r) for r in rows[:10])
+        if not clusters:
+            out.append('  (no clusters listed' + (f': {lsc[:160]}' if lsc else '') + ')')
+        for r in clusters:
+            if r[3].startswith('online'):
+                out.append(f'cluster {r[0]}/{r[1]} (port {r[2]}):')
+                out.extend(_diag_pg_overview(r[2]))
+        out.append('PostgreSQL server logs:')
+        for r in clusters:
+            # TAK's clusters log through logging_collector into <data>/log/postgresql-%a.log
+            # (pg_lsclusters prints that relative pattern): today's and yesterday's file.
+            if len(r) > 6 and not r[6].startswith('/') and r[5].startswith('/var/lib/postgresql/'):
+                for d in (1, 0):
+                    out.extend(_diag_pg_log(os.path.join(
+                        r[5], (datetime.now() - timedelta(days=d)).strftime(r[6]))))
+            else:
+                out.extend(_diag_pg_log(r[6] if len(r) > 6 else f'/var/log/postgresql/postgresql-{r[0]}-{r[1]}.log'))
+        units = [f'postgresql@{r[0]}-{r[1]}.service' for r in clusters]
+    else:
+        try:
+            dirs = sorted(d for d in os.listdir('/var/lib/pgsql') if d[:2].isdigit())
+        except OSError:
+            dirs = []
+        out.append(f"PostgreSQL data directories under /var/lib/pgsql: {', '.join(dirs) or '(none readable)'}")
+        units = _diag_cmd(['systemctl', 'list-units', '--all', '--no-legend', '--plain', 'postgresql*'], priv=False)
+        out.extend('  unit ' + ' '.join(l.split()[:4]) for l in units.splitlines() if l.strip())
+        out.append('cluster on the default port:')
+        out.extend(_diag_pg_overview())
+        out.append('PostgreSQL server logs:')
+        vers = sorted(set(re.findall(r'postgresql-(\d+)\.service', units)) | set(dirs))
+        for v in vers:
+            for d in (1, 0):
+                out.extend(_diag_pg_log(f"/var/lib/pgsql/{v}/data/log/"
+                                        f"postgresql-{(datetime.now() - timedelta(days=d)).strftime('%a')}.log"))
+        units = [f'postgresql-{v}.service' for v in vers]
+    if units and mode not in ('two_server', 'external_db') and not _tak_is_container():
+        # Start/stop history of each cluster's unit: when a cluster first came up and when one
+        # was stopped — the two events that bracket an upgrade. Named units, not a glob: a
+        # `-u 'postgresql*'` glob scans the whole journal (30 s and nothing, on test6).
+        j = _diag_cmd(['journalctl'] + [a for u in units for a in ('-u', u)] +
+                      ['--since', f'{_DIAG_TRAIL_DAYS} days ago', '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
+        ev = [l for l in j.splitlines() if re.search(r'Start|Stop|Fail|exited|Deactivated', l)]
+        out.append(f"PostgreSQL service start/stop ({', '.join(units)}), last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
+        out.extend('  ' + l[:200] for l in ev[-25:])
+    snaps = (settings.get('tak_snapshots') or [])[:6]
+    out.append(f"TAK snapshots recorded (newest first): {len(settings.get('tak_snapshots') or [])}")
+    for sn in snaps:
+        lbl = str(sn.get('label') or '?')
+        p = os.path.join(SNAPSHOT_DIR, lbl)
+        try:   # a directory: _exists_priv reads files, so ask `test -d` (broker-allowed) instead
+            on_disk = re.match(r'^[\w.-]+$', lbl) and (os.path.isdir(p) or subprocess.run(
+                _sudo_wrap(['test', '-d', p]), capture_output=True, timeout=10).returncode == 0)
+        except Exception:
+            on_disk = False
+        out.append(f"  {lbl}  taken {sn.get('taken_at', '?')}  TAK {sn.get('tak_version') or '?'}  "
+                   f"{sn.get('size_mb', '?')} MB  db_dump={sn.get('db_dump')}"
+                   f"{' (' + str(sn.get('db_dump_bytes') // 1024) + ' KB)' if isinstance(sn.get('db_dump_bytes'), int) else ''}"
+                   f"  on disk: {'yes' if on_disk else 'NO'}")
+    return out
+
+
+def _diag_apt_history(lines, cutoff):
+    """apt transactions since `cutoff` that touched TAK/PostgreSQL/Java: when, the command
+    line, who asked, the matching packages, and whether the transaction finished."""
+    out, block = [], {}
+
+    def flush():
+        if not block.get('Start-Date') or block['Start-Date'] < cutoff:
+            return
+        pk = []
+        for k in ('Install', 'Upgrade', 'Downgrade', 'Remove', 'Purge', 'Reinstall'):
+            hits = [p for p in re.findall(r'(\S+ \([^)]*\))', block.get(k, '')) if _DIAG_PKG_RE.search(p)]
+            if hits:
+                pk.append(f"{k}: {', '.join(hits)}")
+        if not pk and not _DIAG_PKG_RE.search(block.get('Commandline', '')):
+            return
+        out.append(f"  {block['Start-Date']}  {block.get('Commandline', '(no command line)')[:200]}"
+                   f"{'  [requested by ' + block['Requested-By'] + ']' if block.get('Requested-By') else ''}")
+        out.extend('      ' + p[:300] for p in pk)
+        if block.get('Error'):
+            out.append('      Error: ' + block['Error'][:240])
+        if not block.get('End-Date'):
+            out.append('      NO End-Date — this transaction did not finish')
+    for ln in lines + ['']:
+        if not ln.strip():
+            flush()
+            block = {}
+            continue
+        k, _, v = ln.partition(': ')
+        block[k.strip()] = v.strip()
+    return out
+
+
+def _diag_section_change_trail(settings):
+    out = []
+    cutoff = (datetime.utcnow() - timedelta(days=_DIAG_TRAIL_DAYS)).strftime('%Y-%m-%d')
+    if os.path.exists('/var/log/apt'):
+        hist = _diag_apt_history(_diag_rotated_lines('/var/log/apt/history.log'), cutoff)
+        out.append(f"apt transactions touching takserver/postgresql/postgis/java, last {_DIAG_TRAIL_DAYS} days: "
+                   f"{sum(1 for l in hist if not l.startswith('      '))}")
+        out.extend(hist[-60:])
+        # dpkg.log also catches a bare `dpkg -i`, which apt's history never sees.
+        dp = [l for l in _diag_rotated_lines('/var/log/dpkg.log')
+              if l[:10] >= cutoff and len(l.split()) > 3
+              and l.split()[2] in ('install', 'upgrade', 'remove', 'purge') and _DIAG_PKG_RE.search(l.split()[3])]
+        out.append(f"dpkg install/upgrade/remove of those packages, last {_DIAG_TRAIL_DAYS} days: {len(dp)}")
+        out.extend('  ' + l[:200] for l in dp[-40:])
+    else:
+        # Dated lines only: rpm scriptlet output is logged undated between them.
+        recent = lambda l: re.match(r'\d{4}-\d{2}-\d{2}', l) and l[:10] >= cutoff
+        rl = [l for l in _diag_rotated_lines('/var/log/dnf.rpm.log')
+              if recent(l) and _DIAG_PKG_RE.search(l)
+              and re.search(r'\b(Install|Upgrade|Upgraded|Downgrade|Erase|Reinstall)', l)]
+        out.append(f"rpm transactions touching takserver/postgresql/postgis/java, last {_DIAG_TRAIL_DAYS} days: {len(rl)}")
+        out.extend('  ' + l[:200] for l in rl[-40:])
+        cmds = [l for l in _diag_rotated_lines('/var/log/dnf.log')
+                if recent(l) and 'Command:' in l and _DIAG_PKG_RE.search(l)]
+        out.append(f"dnf commands naming those packages, last {_DIAG_TRAIL_DAYS} days: {len(cmds)}")
+        out.extend('  ' + l[:200] for l in cmds[-15:])
+    # The OS patch job (Help/Dashboard "Install updates"): apt full-upgrade / dnf upgrade
+    # with TAK held — but PostgreSQL is not held, and its runs are not otherwise visible here.
+    kp = _diag_log_lines(_KERNEL_PATCH_LOGFILE, 1024 * 1024)
+    if kp is None:
+        out.append(f"OS patch job log: {_diag_unreadable(_KERNEL_PATCH_LOGFILE)}")
+    else:
+        keep = [l for l in kp if re.search(r'=== |FATAL|WARN|held|released', l)
+                or (_DIAG_PKG_RE.search(l) and re.search(r'Unpacking|Setting up|Removing|Upgrading|Installing|'
+                                                         r'Erasing|Creating new|Stopping|Starting|cluster', l))]
+        runs = sum('job starting' in l for l in kp)
+        out.append(f"OS patch job log: {runs} run(s) in the recent tail; start/end, warnings and TAK/PostgreSQL/Java lines:")
+        out.extend('  ' + l[:220] for l in keep[-40:])
+    boots = _diag_cmd(['journalctl', '--list-boots', '--no-pager', '-q'], timeout=20)
+    bl = [l for l in boots.splitlines() if l.strip()]
+    out.append(f"boots in the journal: {len(bl)} (newest last)")
+    out.extend('  ' + l.strip()[:160] for l in bl[-8:])
+    for unit in ('takwerx-console.service', 'takserver.service'):
+        j = _diag_cmd(['journalctl', f'UNIT={unit}', '--since', f'{_DIAG_TRAIL_DAYS} days ago',
+                       '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
+        ev = [l for l in j.splitlines() if re.search(r'Started|Stopped|Stopping|Failed|exited|restart', l)
+              and 'Killing process' not in l]
+        out.append(f"{unit} start/stop, last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
+        out.extend('  ' + l[:200] for l in ev[-15:])
     return out
 
 
@@ -8323,6 +8625,8 @@ _DIAG_SECTIONS = (
     ('Containers', _diag_section_containers),
     ('Authentik / LDAP / webadmin', _diag_section_authentik),
     ('TAK Server', _diag_section_takserver),
+    ('TAK Server database — PostgreSQL, packages, snapshots', _diag_section_tak_database),
+    ('What changed on this box — installs, OS patches, reboots, restarts', _diag_section_change_trail),
     ('TAK Portal', _diag_section_takportal),
     ('Email Relay', _diag_section_emailrelay),
     ('Guard Dog', _diag_section_guarddog),
@@ -9011,6 +9315,86 @@ def update_apply():
     except Exception as e:
         return _fail_release_lock({'success': False, 'error': str(e)[:200]})
 
+# Issue #113: the daily restart's idle gate — what counts as "busy".
+# A module record left `running` longer than this is a thread that died without
+# finishing, not work in flight; past it the record stops holding the restart off.
+_RESTART_GATE_RECORD_MAX_S = 3 * 3600
+
+
+def _console_busy_reason():
+    """Why the daily console restart must wait, or None when the console is idle.
+
+    The original gate only looked at app.py's own `*_status` globals. Module
+    files keep their job state in their own namespaces (the registry's _JOBS,
+    ATLAS's per-deployment update/removal slots, TVR's and the simulator's
+    status dicts), so a running ATLAS update read as idle and the 04:00 restart
+    killed its `docker compose up` mid-recreate (#113). Every module operation
+    gets the same look now, plus the persisted module-results record as a
+    backstop for anything that ran through _mod_result_start().
+    """
+    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
+    #    (20-min TTL), so it survives even if the worker handling it is wedged.
+    try:
+        _lock = '/var/lib/takwerx-console/update-now.lock'
+        if os.path.exists(_lock):
+            _age = int(time.time() - os.path.getmtime(_lock))
+            if _age < 1200:
+                return f'Update Now in progress (~{_age}s ago)'
+    except Exception:
+        pass
+    # 2) Any in-memory *_status dict reporting a running operation. Scanned
+    #    dynamically so new deploy-status globals are covered automatically.
+    try:
+        for _name, _val in list(globals().items()):
+            if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
+                return f'{_name} running'
+    except Exception:
+        pass
+    # 3) Module registry jobs (deploy / uninstall through modules/__init__.py).
+    try:
+        _jobs = mod_registry.running_jobs()
+        if _jobs:
+            return f"module {', '.join(sorted(_jobs))} running"
+    except Exception:
+        pass
+    # 4) Module files' own state, scanned the same way as (2): a `*_status` dict
+    #    that is running, or a `*_slots` dict holding one (ATLAS keeps one slot
+    #    per deployment for updates and another for removals).
+    try:
+        for _mname, _mod in list(_sys.modules.items()):
+            if not _mname.startswith('modules.') or _mod is None:
+                continue
+            for _name, _val in list(vars(_mod).items()):
+                if not isinstance(_val, dict):
+                    continue
+                if _name.endswith('_status') and _val.get('running'):
+                    return f"{_mname.split('.', 1)[1]} {_name} running"
+                if _name.endswith('_slots'):
+                    for _key, _slot in list(_val.items()):
+                        if isinstance(_slot, dict) and _slot.get('running'):
+                            return f"{_mname.split('.', 1)[1]} {_name}[{_key}] running"
+    except Exception:
+        pass
+    # 5) A module-results record still `running`. This process marked every
+    #    leftover one interrupted when it started, so a live one is in flight.
+    try:
+        _now = datetime.utcnow()
+        for _module, _m in sorted(_mod_results_load().items()):
+            _last = (_m or {}).get('last') or {}
+            if _last.get('outcome') != 'running':
+                continue
+            try:
+                _age = (_now - datetime.strptime(_last.get('started_at') or '',
+                                                 '%Y-%m-%dT%H:%M:%SZ')).total_seconds()
+            except ValueError:
+                continue   # never let a malformed record hold the restart off forever
+            if _age < _RESTART_GATE_RECORD_MAX_S:
+                return f"{_module} {_last.get('kind') or 'operation'} running"
+    except Exception:
+        pass
+    return None
+
+
 @app.route('/api/console/restart-safe')
 def console_restart_safe():
     """v0.9.44: localhost-only readiness probe for the daily console-restart
@@ -9024,28 +9408,7 @@ def console_restart_safe():
     if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
         return jsonify({'error': 'forbidden'}), 403
 
-    busy = None
-    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
-    #    (20-min TTL), so it survives even if the worker handling it is wedged.
-    try:
-        _lock = '/var/lib/takwerx-console/update-now.lock'
-        if os.path.exists(_lock):
-            _age = int(time.time() - os.path.getmtime(_lock))
-            if _age < 1200:
-                busy = f'Update Now in progress (~{_age}s ago)'
-    except Exception:
-        pass
-    # 2) Any in-memory *_status dict reporting a running operation. Scanned
-    #    dynamically so new deploy-status globals are covered automatically.
-    if busy is None:
-        try:
-            for _name, _val in list(globals().items()):
-                if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
-                    busy = f'{_name} running'
-                    break
-        except Exception:
-            pass
-
+    busy = _console_busy_reason()
     return jsonify({'safe': busy is None, 'reason': busy})
 
 
@@ -16534,6 +16897,117 @@ def _find_ssh_key_for_server_one(s1_cfg):
     return None
 
 
+GUARDDOG_CONF_PATH = '/opt/tak-guarddog/guarddog.conf'
+_GD_DB_KEYS = ('two_server', 'external_db', 'db_host', 'db_port')
+
+
+def _tak_db_endpoint_from_coreconfig():
+    """(host, port) of the database TAK Server is configured to use; ('', 5432) if unreadable.
+
+    Not _tak_db_topology(): that one reports an unreadable CoreConfig as 'local', and a
+    guarddog.conf writer that can't read CoreConfig must keep what it has, not assume."""
+    try:
+        xml = _read_coreconfig() or ''
+    except Exception:
+        return '', 5432
+    m = re.search(r'jdbc:postgresql://([^:/"]+)(?::(\d+))?', xml)
+    if not m:
+        return '', 5432
+    return m.group(1).strip(), int(m.group(2) or 5432)
+
+
+def _guarddog_db_topology(settings):
+    """(section, source): the database section guarddog.conf should carry, and where it came from.
+
+    GH #101: every writer took this from settings.json's tak_deployment alone. A split box
+    whose settings never said two_server (split by hand, or tak_deployment lost to the
+    torn-write race) got a guarddog.conf with no database section, and every DB module fell
+    back to a local postgres that isn't there. Settings first (they also know the SSH side),
+    then TAK's own CoreConfig — the same ground truth _gd-tak-lib.sh and the console's
+    PostgreSQL card use.
+
+    section {} = the database is on this box. section None = can't tell (CoreConfig
+    unreadable): the writer keeps whatever the file already says rather than guess.
+    """
+    tak_cfg = _get_tak_deployment_config(settings)
+    mode = tak_cfg.get('mode')
+    if mode == 'two_server':
+        host = (tak_cfg.get('server_one', {}).get('host') or '').strip()
+        if host:
+            return ({'two_server': True, 'external_db': False, 'db_host': host,
+                     'db_port': int(tak_cfg.get('database', {}).get('port') or 5432)}, 'settings')
+    elif mode == 'external_db':
+        edb = tak_cfg.get('external_db', {})
+        host = (edb.get('host') or '').strip()
+        if host:
+            return ({'two_server': False, 'external_db': True, 'db_host': host,
+                     'db_port': int(edb.get('port') or 5432)}, 'settings')
+    # Container TAK: CoreConfig names a docker-network alias the host can't resolve, which
+    # would read as remote. Same evidence order as gd_db_running() in _gd-tak-lib.sh.
+    if _tak_is_container():
+        return {}, 'container'
+    host, port = _tak_db_endpoint_from_coreconfig()
+    if not host:
+        return None, 'unknown'
+    if _tak_db_is_remote(host):
+        return ({'two_server': True, 'external_db': False, 'db_host': host, 'db_port': port},
+                'coreconfig')
+    return {}, 'coreconfig'
+
+
+def _write_guarddog_conf(settings, updates=None):
+    """The one writer for guarddog.conf. Returns (ok, message).
+
+    Read-merge-write: a caller that owns one key (cert pass, container mode) never drops the
+    others. A None value in `updates` removes that key. The database section is restated from
+    _guarddog_db_topology() on every write, so no writer can emit a config without it on a
+    split box. If the file exists but can't be read, nothing is written — the old metrics
+    migration read it with open(), which a non-root console can't, and replaced the whole
+    file with just the cert password.
+    """
+    raw = ''
+    try:
+        raw = _read_priv(GUARDDOG_CONF_PATH)
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('utf-8', 'replace')
+    except Exception as e:
+        # The broker can't tell "missing" from "denied"; only a file that also doesn't stat
+        # counts as absent.
+        if os.path.exists(GUARDDOG_CONF_PATH):
+            return False, f'guarddog.conf unreadable, not rewritten: {e}'
+    try:
+        conf = json.loads(raw) if (raw or '').strip() else {}
+    except ValueError:
+        conf = {}           # corrupt: rewriting it is the repair
+    if not isinstance(conf, dict):
+        conf = {}
+    before = dict(conf)
+    for k, v in (updates or {}).items():
+        if v is None:
+            conf.pop(k, None)
+        else:
+            conf[k] = v
+    section, source = _guarddog_db_topology(settings)
+    if section is not None:
+        for k in _GD_DB_KEYS:
+            conf.pop(k, None)
+        conf.update(section)
+    elif any(k in conf for k in _GD_DB_KEYS):
+        source = 'kept'     # can't tell right now; keep what the file already says
+    conf['db_topology'] = ('external_db' if conf.get('external_db')
+                           else 'two_server' if conf.get('two_server')
+                           else 'local' if section is not None else 'unknown')
+    conf['db_topology_source'] = source
+    if conf == before:
+        return True, f"unchanged ({conf['db_topology']}, from {conf['db_topology_source']})"
+    try:
+        _write_priv(GUARDDOG_CONF_PATH, json.dumps(conf), perm=0o600)
+    except Exception as e:
+        return False, f'guarddog.conf: {e}'
+    where = f" {conf['db_host']}:{conf['db_port']}" if conf.get('db_host') else ''
+    return True, f"written ({conf['db_topology']}{where}, from {conf['db_topology_source']})"
+
+
 def _sync_guarddog_remote_db_from_settings(settings=None):
     """Rewrite guarddog.conf + tak-remotedb-*.sh from saved TAK deployment.
     Handles two-server (SSH-managed DB) and external_db (managed DB, no SSH).
@@ -16574,16 +17048,11 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         return False, 'no database host in settings'
 
     alert_email = (settings.get('guarddog_alert_email') or '').strip()
-    try:
-        gd_conf = {
-            'two_server': not is_external,
-            'external_db': is_external,
-            'db_host': db_host,
-            'db_port': int(db_port),
-        }
-        _write_priv(os.path.join(gd_dir, 'guarddog.conf'), json.dumps(gd_conf))
-    except Exception as e:
-        return False, f'guarddog.conf: {e}'
+    # Merge, not replace: this used to write the four DB keys alone, dropping the cert pass
+    # (Marti scrape) and the container keys every time it ran.
+    gd_ok, gd_msg = _write_guarddog_conf(settings)
+    if not gd_ok:
+        return False, gd_msg
 
     # v0.9.29 CRIT-08 fix: provision a pinned SSH known_hosts file for the
     # watchdog scripts. Watchdog SSH calls use StrictHostKeyChecking=accept-new
@@ -16625,6 +17094,14 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
                 .replace('DB_PORT_PLACEHOLDER', db_port)
                 .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 .replace('SSH_USER_PLACEHOLDER', s1_user))
+            # This runs on every console start: leave an identical script alone (re-assert +x
+            # only), same as run_guarddog_deploy(), so mtimes only move when content does.
+            try:
+                if _read_priv(dest) == content:
+                    _chmod_priv(dest, 0o755)
+                    continue
+            except Exception:
+                pass
             _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
         except Exception as e:
             return False, f'{name}: {e}'
@@ -19677,7 +20154,10 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
             # restart_on_error=False keeps the promise the comment above makes: a refused
             # config must leave the RUNNING Caddy untouched. A restart would read the same
             # bad file and take the edge down entirely.
-            rl_ok, rl_detail = _caddy_reload_checked(timeout=60, restart_on_error=False)
+            # GH #90: unforced, so Caddy skips it when it is already running this file —
+            # which is itself the proof it accepted it. This ran on every console start
+            # (and every gunicorn worker respawn) and cut every proxied WebSocket each time.
+            rl_ok, rl_detail = _caddy_reload_if_changed(timeout=60, restart_on_error=False)
             if not rl_ok:
                 _log('fail2ban: Caddy REFUSED the config carrying the portal access log '
                      '(%s). The running config is untouched, but the ON-DISK Caddyfile is '
@@ -24172,6 +24652,10 @@ def run_guarddog_deploy(alert_email):
         if _no_recip:
             plog(f"⚠ {_no_recip}")
         # Scripts (e.g. tak-cert-watch.sh) live in repo scripts/guarddog/ — read from disk each deploy.
+        # Only rewrite a script whose rendered content differs, same as _auto_update_guarddog().
+        # Update Now runs this right after the startup copy, and rewriting every file with
+        # identical bytes made the box's mtimes disagree with the "N script(s) updated" log line.
+        changed = []
         for name in script_files:
             src = os.path.join(scripts_dir, name)
             if not os.path.isfile(src):
@@ -24196,6 +24680,10 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+                # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
+                # Leaving the placeholder in made the two renders differ, so every Update Now
+                # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')
             if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
                 fh_remote = fh_cfg.get('remote', {})
                 fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
@@ -24204,22 +24692,43 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
                 content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
             dest = os.path.join('/opt/tak-guarddog', name)
-            _write_priv(dest, content, perm=(0o755 if name.endswith('.sh') else None))
-        plog("✓ Scripts installed")
-        # Write config file for health endpoint (two-server DB host info)
-        gd_conf = {}
-        if is_two_server and s1_host:
-            gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+            _perm = 0o755 if name.endswith('.sh') else None
+            try:
+                _unchanged = _read_priv(dest) == content
+            except Exception:
+                _unchanged = False
+            if _unchanged and _perm is not None:
+                try:
+                    _chmod_priv(dest, _perm)   # still repair a lost +x; chmod leaves mtime alone
+                except Exception:
+                    _unchanged = False         # legacy non-root: let _write_priv's sudo chmod do it
+            if _unchanged:
+                continue
+            _write_priv(dest, content, perm=_perm)
+            changed.append(name)
+        if changed:
+            plog(f"✓ Scripts installed: {len(changed)} changed ({', '.join(sorted(changed))}), "
+                 f"{len(script_files) - len(changed)} already current")
+        else:
+            plog(f"✓ Scripts installed: all {len(script_files)} already current")
+        # Config file for the DB modules and health endpoint. The database section comes from
+        # _guarddog_db_topology() (settings, else TAK's CoreConfig) — GH #101: this used to
+        # come from settings alone, so a split box settings didn't know about was written
+        # with no database section at all.
         # v10.0.1: container TAK — tell _gd-tak-lib.sh to dispatch DB/process/cert
         # work via docker exec against these containers (absent → native mode).
-        if _tak_is_container():
-            gd_conf['tak_mode'] = 'container'
-            gd_conf['tak_container'] = TAK_CONTAINER
-            gd_conf['db_container'] = TAK_DB_CONTAINER
-        # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
-        gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
-        _write_priv('/opt/tak-guarddog/guarddog.conf', json.dumps(gd_conf))
-        _chmod_priv('/opt/tak-guarddog/guarddog.conf', 0o600)
+        _is_ctr = _tak_is_container()
+        gd_ok, gd_msg = _write_guarddog_conf(settings, {
+            'tak_mode': 'container' if _is_ctr else None,
+            'tak_container': TAK_CONTAINER if _is_ctr else None,
+            'db_container': TAK_DB_CONTAINER if _is_ctr else None,
+            # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
+            'tak_cert_pass': _get_tak_cert_password(settings),
+        })
+        plog(f"{'✓' if gd_ok else '✗'} guarddog.conf {gd_msg}")
+        if not gd_ok:
+            guarddog_deploy_status.update({'running': False, 'error': True})
+            return
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
         _write_priv('/opt/tak-guarddog/server_identifier', server_identifier)
@@ -24301,7 +24810,14 @@ def run_guarddog_deploy(alert_email):
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            try:
+                _ak_purge_same = _read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+                if _ak_purge_same:
+                    _chmod_priv(_ak_purge_path, 0o755)   # keep +x; leave mtime alone
+            except Exception:
+                _ak_purge_same = False
+            if not _ak_purge_same:
+                _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -27442,6 +27958,133 @@ def caddy_control():
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
 
+# v10.2.10 — Caddy's Cloudsmith apt repo went dark 2026-10-08..10: the package
+# index answers `402 Payment Required` ("Access to the repository has been restricted")
+# while the GPG key and debian.deb.txt still answer 200. apt-get update exits 100 when ANY
+# source fails, so one dead third-party repo blocked every Ubuntu box's OS patch job
+# ("FATAL: apt-get update failed (exit 100)") and every Caddy deploy/update. Field: two
+# operators, both cleared it by hand with `mv caddy-stable.list caddy-stable.list.disabled`
+# — and Caddy Update would then have re-added the list and broken patching again.
+_CADDY_APT_LIST = '/etc/apt/sources.list.d/caddy-stable.list'
+_CADDY_APT_INDEX_URL = 'https://dl.cloudsmith.io/public/caddy/stable/deb/debian/dists/any-version/InRelease'
+# Only answers that mean "this repo will not serve you" count as dead. 5xx, timeouts and
+# DNS failures are transient and leave the list alone (apt's own retries handle those).
+_CADDY_APT_DEAD_CODES = (401, 402, 403, 404, 410)
+_CADDY_APT_DISABLED_RE = re.compile(r'^# disabled by infra-TAK \S+ \(Caddy apt repo returned HTTP \d+\): (.*)$')
+
+
+def _caddy_cloudsmith_state(timeout=10):
+    """('ok'|'dead'|'unknown', http_code) for Caddy's Cloudsmith package index."""
+    try:
+        req = urllib.request.Request(_CADDY_APT_INDEX_URL, headers={'User-Agent': 'infra-TAK'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return ('ok', r.status)
+    except urllib.error.HTTPError as e:
+        return ('dead' if e.code in _CADDY_APT_DEAD_CODES else 'unknown', e.code)
+    except Exception:
+        return ('unknown', None)
+
+
+def _caddy_apt_repo_heal(log_fn=None):
+    """Keep caddy-stable.list in step with whether Cloudsmith is actually serving.
+
+    dead  -> comment the list's entries out (timestamped backup in /etc/apt, same pattern as
+             _apt_disable_dead_local_sources) so it stops failing every apt-get update.
+    ok    -> undo exactly what we commented out, so the box goes back to apt-managed Caddy
+             updates on its own once Cloudsmith is back. Lines an operator commented are
+             not touched (only our marker is reversed).
+    Returns the probe state. DEBIAN FAMILY ONLY, never raises, and does not probe at all
+    on a box without the list (RHEL uses COPR; most boxes without Caddy have no list)."""
+    _log = log_fn or (lambda m: None)
+    if _distro_family() == 'rhel' or not os.path.exists(_CADDY_APT_LIST):
+        return 'absent'
+    try:
+        with open(_CADDY_APT_LIST, 'r', errors='replace') as f:
+            body = f.read()
+    except Exception:
+        return 'unknown'
+    lines = body.splitlines()
+    active = [i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith('#')]
+    ours = [i for i, ln in enumerate(lines) if _CADDY_APT_DISABLED_RE.match(ln)]
+    if not active and not ours:
+        return 'absent'
+    state, code = _caddy_cloudsmith_state()
+    try:
+        if state == 'dead' and active:
+            stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+            bak = os.path.join('/etc/apt', f'caddy-stable.list.infratak-{stamp}.bak')
+            _write_priv(bak, body)
+            for i in active:
+                lines[i] = f'# disabled by infra-TAK {stamp} (Caddy apt repo returned HTTP {code}): {lines[i]}'
+            _write_priv(_CADDY_APT_LIST, '\n'.join(lines) + '\n')
+            _log(f'  ⚠ Caddy apt repo (Cloudsmith) answered HTTP {code} — disabled {_CADDY_APT_LIST} '
+                 f'so it stops failing apt-get update (backup: {bak}). It is re-enabled '
+                 'automatically once Cloudsmith serves again.')
+        elif state == 'ok' and ours:
+            for i in ours:
+                lines[i] = _CADDY_APT_DISABLED_RE.match(lines[i]).group(1)
+            _write_priv(_CADDY_APT_LIST, '\n'.join(lines) + '\n')
+            _log(f'  ✓ Caddy apt repo (Cloudsmith) is serving again — re-enabled {_CADDY_APT_LIST}')
+    except Exception as e:
+        _log(f'  ⚠ could not update {_CADDY_APT_LIST}: {type(e).__name__}: {e}')
+    return state
+
+
+def _caddy_install_github_deb(log_fn=None):
+    """Install the latest Caddy .deb from Caddy's GitHub release. Returns True on success.
+
+    The fallback for when the Cloudsmith apt repo is not serving. The .deb (not the static
+    binary) because it carries the caddy user, the systemd unit and /etc/caddy, which a
+    fresh deploy needs. SHA-512 checked against the release's checksums file before
+    install. Already-current boxes are a no-op."""
+    _log = log_fn or (lambda m: None)
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    tmpd = None
+    try:
+        with urllib.request.urlopen('https://github.com/caddyserver/caddy/releases/latest', timeout=30) as r:
+            m = re.search(r'/tag/v(\d+\.\d+\.\d+)$', r.geturl())
+        if not m:
+            _log('  ✗ could not determine the latest Caddy release from GitHub')
+            return False
+        ver = m.group(1)
+        cur = _caddy_version_tuple(refresh=True)
+        if cur and cur >= tuple(int(x) for x in ver.split('.')):
+            _log(f'  ✓ Caddy {".".join(map(str, cur))} is already the latest release ({ver})')
+            return True
+        base = f'https://github.com/caddyserver/caddy/releases/download/v{ver}'
+        deb_name = f'caddy_{ver}_linux_{_arch}.deb'
+        with urllib.request.urlopen(f'{base}/caddy_{ver}_checksums.txt', timeout=30) as r:
+            sums = r.read().decode('utf-8', 'replace')
+        want = next((ln.split()[0] for ln in sums.splitlines()
+                     if len(ln.split()) == 2 and ln.split()[1] == deb_name), None)
+        if not want:
+            _log(f'  ✗ {deb_name} is not listed in the Caddy v{ver} checksums file')
+            return False
+        _log(f'  Downloading {deb_name} from Caddy\'s GitHub release...')
+        with urllib.request.urlopen(f'{base}/{deb_name}', timeout=300) as r:
+            data = r.read()
+        if hashlib.sha512(data).hexdigest() != want.lower():
+            _log(f'  ✗ {deb_name} failed its SHA-512 check — not installing it')
+            return False
+        tmpd = tempfile.mkdtemp(prefix='caddy-deb-')
+        os.chmod(tmpd, 0o755)   # apt drops to _apt to read local debs
+        deb_path = os.path.join(tmpd, deb_name)
+        with open(deb_path, 'wb') as f:
+            f.write(data)
+        os.chmod(deb_path, 0o644)
+        ok, out = _pkg_install([deb_path], log_fn=log_fn, timeout=300)
+        _caddy_version_cache['ver'] = None
+        if ok:
+            _log(f'  ✓ Caddy {ver} installed from GitHub release (SHA-512 verified)')
+        return ok
+    except Exception as e:
+        _log(f'  ✗ Caddy GitHub .deb install failed: {type(e).__name__}: {str(e)[:200]}')
+        return False
+    finally:
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+
 def _caddy_ensure_apt_repo(log_fn=None):
     """Make sure the cloudsmith Caddy repo exists and apt has refreshed against it.
 
@@ -27460,11 +28103,19 @@ def _caddy_ensure_apt_repo(log_fn=None):
     That is exactly what GH #59's reporter described ("tried your commands but it didn't
     update the caddy installed") — he was right, and he had to replace the binary by hand.
 
-    Returns True when apt can see a Caddy candidate from cloudsmith."""
+    Returns True when apt can see a Caddy candidate from cloudsmith. False when Cloudsmith
+    is not serving (Cloudsmith 402, 2026-10-10) — the list is then disabled, never (re-)added, and callers fall
+    back to _caddy_install_github_deb()."""
     _log = log_fn or (lambda m: None)
-    listf = '/etc/apt/sources.list.d/caddy-stable.list'
+    listf = _CADDY_APT_LIST
     env = _broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive',
                             'NEEDRESTART_MODE': 'a'})
+    _state = _caddy_apt_repo_heal(log_fn)
+    if _state == 'absent' and not os.path.exists(listf):
+        _state = _caddy_cloudsmith_state()[0]
+    if _state == 'dead':
+        _log('Caddy apt repo (Cloudsmith) is not serving — not adding it')
+        return False
     try:
         if not os.path.exists(listf):
             _log('Caddy repo missing — adding the cloudsmith repository')
@@ -27519,12 +28170,17 @@ def caddy_update():
         _before = _caddy_version_tuple(refresh=True)
         if pkg_mgr == 'apt':
             # Repo FIRST — otherwise apt cannot see a newer Caddy at all.
-            _caddy_ensure_apt_repo()
-            # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
-            # different origin, and `install` is what moves it across. Already-current boxes
-            # are a no-op either way.
-            r = _run_priv_chain([['apt-get', 'update', '-qq'],
-                                 ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+            if _caddy_ensure_apt_repo() or _caddy_cloudsmith_state()[0] != 'dead':
+                # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
+                # different origin, and `install` is what moves it across. Already-current boxes
+                # are a no-op either way.
+                r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                     ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+            else:
+                # v10.2.10 (Cloudsmith 402): Cloudsmith not serving — take the same release from Caddy's GitHub.
+                _gh_log = []
+                _ok = _caddy_install_github_deb(_gh_log.append)
+                r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
             _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
@@ -30694,6 +31350,7 @@ def _get_service_alias(settings, service_key):
 # box that ALREADY had Caddy — Ubuntu 22.04 universe ships 2.4.5, Debian bookworm 2.6.2 —
 # because the only checks anywhere were "does the binary execute".
 _CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
+_CADDY_MIN_STREAM_CLOSE_DELAY = (2, 7)  # reverse_proxy `stream_close_delay` landed here
 _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
@@ -30731,6 +31388,25 @@ def _caddy_supports_heredoc():
     """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
     v = _caddy_version_tuple()
     return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_stream_close_delay_lines(indent):
+    """`stream_close_delay` for a reverse_proxy block, or [] on Caddy < 2.7 / unknown.
+
+    GH #90 — Caddy closes every proxied WebSocket the instant a reload unloads the config
+    (close code 1001, measured on test12), so WebTAK and CloudTAK went red on
+    every reload. With a delay, the OUTGOING config leaves its streams open for that long
+    instead; Caddy's docs suggest 5m (https://caddyserver.com/docs/caddyfile/directives/
+    reverse_proxy). The close is scheduled on a timer and the reload returns at once, so
+    this does not hold the reload against grace_period. The cost is that each reload's old
+    config stays in memory until its open streams close or the delay runs out.
+
+    Same fail-closed gate as the heredoc: the directive arrived in Caddy 2.7.0 (caddy PR
+    #5567), and an unknown directive makes the WHOLE Caddyfile unloadable."""
+    v = _caddy_version_tuple()
+    if not (v and v >= _CADDY_MIN_STREAM_CLOSE_DELAY):
+        return []
+    return [f"{indent}stream_close_delay {CADDY_STREAM_CLOSE_DELAY}"]
 
 
 def _caddy_rescue_html_oneline(root_url):
@@ -31002,6 +31678,50 @@ def _startup_caddy_grace_period_converge():
     print('Startup migration: ✓ Caddyfile now carries grace_period %s and Caddy %s '
           '(reload-hang fix)' % (CADDY_GRACE_PERIOD,
                                  'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
+          flush=True)
+
+
+def _startup_caddy_stream_close_delay_converge():
+    """GH #90 — put stream_close_delay into the TAK Server / CloudTAK vhosts on boxes that
+    already have them. Same reason as _startup_caddy_grace_period_converge(): the emitter
+    alone reaches a box only when something regenerates the Caddyfile.
+
+    Idempotent: a box whose file already carries the directive, or has neither vhost, or
+    runs Caddy < 2.7 (nothing would be emitted) costs one read. The reload that delivers it
+    still drops open sockets once — the OUTGOING config has no delay to honour."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: stream_close_delay converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'stream_close_delay' in generated:
+        return
+    if '# TAK Server' not in generated and '# CloudTAK Web UI' not in generated:
+        return
+    if not _caddy_stream_close_delay_lines(''):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    # Read back: generate_caddyfile() restores the previous file if the new one is rejected.
+    try:
+        after = _read_priv(CADDYFILE_PATH)
+        if 'stream_close_delay' not in after:
+            if '# TAK Server' in after or '# CloudTAK Web UI' in after:
+                print('Startup migration: ⚠ stream_close_delay converge FAILED — the '
+                      'regenerated Caddyfile was rejected and rolled back. A Caddy reload '
+                      'still cuts WebTAK and CloudTAK sockets on this box.', flush=True)
+            return                  # else both vhosts are gone: nothing left to converge
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Server/CloudTAK vhosts now carry stream_close_delay %s '
+          'and Caddy %s (GH #90)' % (CADDY_STREAM_CLOSE_DELAY,
+                                     'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
           flush=True)
 
 
@@ -31465,6 +32185,8 @@ def generate_caddyfile(settings=None):
         # Location headers naming 127.0.0.1:8446 because that is the Host it was handed.
         # Kept as belt-and-braces; removing them is a separate, evidence-free change.
         lines.append(f"        header_up Host {{host}}")
+        # GH #90: a Caddy reload no longer cuts WebTAK's socket on the spot.
+        lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
         lines.append(f"            tls")
         lines.append(f"            tls_insecure_skip_verify")
@@ -31561,6 +32283,8 @@ def generate_caddyfile(settings=None):
         lines.append(f"{ct_map} {{")
         lines.append(f"    reverse_proxy {ct_up['map']} {{")
         lines.append(f"        flush_interval -1")
+        # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
+        lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
         lines.append(f"            read_timeout 120s")
         lines.append(f"            write_timeout 120s")
@@ -32780,7 +33504,20 @@ def run_caddy_deploy(domain):
             wait_for_apt_lock(plog, caddy_deploy_log)
 
         plog("━━━ Step 1/4: Installing Caddy ━━━")
+        _cs_dead = False
         if pkg_mgr == 'apt':
+            # v10.2.10 (Cloudsmith 402): if Cloudsmith is not serving, adding its list would fail this step's
+            # apt-get update (and every later one on the box). Install from GitHub instead.
+            _caddy_apt_repo_heal(plog)
+            _cs_dead = _caddy_cloudsmith_state()[0] == 'dead'
+        if _cs_dead:
+            plog("  ⚠ Caddy's apt repository (Cloudsmith) is not serving right now — "
+                 "installing the official .deb from Caddy's GitHub release instead.")
+            if not _caddy_install_github_deb(plog):
+                plog("✗ Caddy install failed (Cloudsmith repo unavailable and GitHub .deb install failed)")
+                caddy_deploy_status.update({'running': False, 'error': True})
+                return
+        elif pkg_mgr == 'apt':
             plog("  Adding Caddy repository...")
             cmds = [
                 'apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>&1',
@@ -50399,6 +51136,27 @@ def authentik_control():
             if _env_changed:
                 _pin_orig['env_prev'] = _env_prev
             _ensure_authentik_compose_patches(cp)
+            # GH #111 follow-up: the scheduler-typo broker.py patch is a copy of the OLD
+            # image's file — left mounted, the new image boots with the old broker.py and
+            # loses whatever upstream fixed there. Drop the mount so the new image runs its
+            # own file; the converge kicked after success re-patches only if it still needs it.
+            # On failure _restore_pin() writes the pre-update compose (mount included) back.
+            try:
+                import yaml as _yaml
+                try:
+                    with open(cp) as _f:
+                        _bc = _f.read()
+                except Exception:
+                    _bc = _read_priv(cp)
+                _nb = _ak_compose_without_broker_patch(_bc, _yaml) if _bc else None
+                if _nb:
+                    if _pin_orig['compose'] is None:
+                        _pin_orig['compose'] = _bc
+                    _write_priv(cp, _nb)
+                    _pin_orig['compose_changed'] = True
+                    _mod_result_step('authentik', 'drop the scheduler patch cut from the old image')
+            except ImportError:
+                pass
             # (c) VERIFY before pulling anything, with Compose's own verification command.
             _mod_result_step('authentik', 'verify with docker compose config')
             _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
@@ -50459,6 +51217,10 @@ def authentik_control():
                                          f'v{_run_tag}, expected v{latest}. Images were NOT '
                                          f'pruned.'}), 500
             _run_priv_chain([['docker', 'image', 'prune', '-f']], 'and', timeout=120, cwd=ak_dir)
+            # Re-run the idle-load converge against the NEW image (scheduler patch only if
+            # this image still carries the typo). Background: it waits for the server.
+            threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
+                             name='authentik-idle-load-converge-post-update').start()
             return jsonify({'success': True, 'running': True, 'action': action,
                             'version': _run_tag})
         except Exception as _e:
@@ -70208,9 +70970,11 @@ def _tak_update_history():
         return []
 
 
-def _tak_update_record(kind, pkg, log, status, started, exc=None):
+def _tak_update_record(kind, pkg, log, status, started, exc=None, running=False, run_id=None):
     lines = [str(l) for l in list(log)]
-    if exc is not None:
+    if running:
+        result = 'running'
+    elif exc is not None:
         result = 'CRASHED (%s: %s)' % (type(exc).__name__, str(exc)[:160])
     elif any('MID-UPGRADE' in l for l in lines):
         result = 'FAILED (left mid-upgrade)'
@@ -70220,13 +70984,15 @@ def _tak_update_record(kind, pkg, log, status, started, exc=None):
         result = 'ok'
     else:
         result = 'unfinished'
-    entry = {'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
+    entry = {'id': run_id or '%s@%.3f' % (kind, started),
+             'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
              'finished': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
              'seconds': int(time.time() - started), 'kind': kind,
              'package': os.path.basename(pkg or ''), 'result': result,
              'total_lines': len(lines), 'lines': lines[-_TAK_UPDATE_HISTORY_LINES:]}
     with _TAK_UPDATE_HISTORY_LOCK:
-        hist = [entry] + _tak_update_history()
+        # One entry per run: the in-flight checkpoints and the final record share an id.
+        hist = [entry] + [h for h in _tak_update_history() if h.get('id') != entry['id']]
         tmp = TAK_UPDATE_HISTORY + '.tmp'
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as f:
@@ -70239,16 +71005,45 @@ def _tak_update_job(kind, target, log, status):
     success, failure, or an exception (recorded, then re-raised)."""
     def run(*a, **kw):
         started, exc = time.time(), None
+        # ops #25: kind@ms alone collides when two runs start in the same millisecond, and
+        # the later one then replaces the earlier one's record. A random suffix keeps every
+        # run distinct; entries already on disk keep their old ids and are left alone.
+        run_id = '%s@%.3f#%s' % (kind, started, secrets.token_hex(4))
+        pkg = a[0] if a and isinstance(a[0], str) else ''
         _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
+        # v10.2.11 (ops #9): the record used to be written only when the worker ENDED, so a
+        # run cut off by a console restart, a reboot or an OOM kill left no log anywhere —
+        # the one run that changed the box was the one Diagnostics could not show (lutak2.net:
+        # TAK 5.8 installed, cot gone, update history only listing two runs that changed
+        # nothing). Checkpoint the log while it runs; a 'running' entry whose worker is gone
+        # is reported as interrupted, with the log up to the point it stopped.
+        stop, ck_lock = threading.Event(), threading.Lock()
+
+        def checkpoint():
+            seen = -1
+            while True:
+                with ck_lock:
+                    if stop.is_set():
+                        return
+                    if len(log) != seen:
+                        seen = len(log)
+                        try:
+                            _tak_update_record(kind, pkg, log, status, started, running=True,
+                                               run_id=run_id)
+                        except Exception:
+                            pass
+                stop.wait(15)
+        threading.Thread(target=checkpoint, daemon=True).start()
         try:
             target(*a, **kw)
         except BaseException as e:
             exc = e
             raise
         finally:
+            with ck_lock:
+                stop.set()
             try:
-                _tak_update_record(kind, a[0] if a and isinstance(a[0], str) else '',
-                                   log, status, started, exc)
+                _tak_update_record(kind, pkg, log, status, started, exc, run_id=run_id)
             except Exception as _re:
                 print(f'TAK Server update: record not saved ({_re})', flush=True)
             _tracked_finish('takserver', status, log,
@@ -71861,8 +72656,35 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
     def _say(m):
         _log.append(m)
 
+    # What a failure leaves behind depends on how far we got. Before TAK is stopped
+    # nothing changed; after the stop but before the package unpacked, the box is
+    # still a working 5.7 and only needs TAK started again. Only after the unpack is
+    # it truly mid-upgrade (#117: an apt hold refused the install, and the old code
+    # called that the pg15 abort and left TAK down on an untouched 5.7).
+    _stage = {'stopped': False, 'unpacked': False}
+
+    def _installed_version():
+        if _distro_family() == 'rhel':
+            argv = ['rpm', '-q', '--qf', '%{VERSION}-%{RELEASE}', 'takserver']
+        else:
+            argv = ['dpkg-query', '-W', '-f=${Version}', 'takserver']
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
     def fail(msg, wedged=False):
         _say(msg)
+        if not _stage['stopped']:
+            wedged = False
+        if wedged and not _stage['unpacked']:
+            _say('')
+            _say('Nothing was installed, so this server is still on its previous TAK Server '
+                 'version. Starting TAK Server again…')
+            subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']),
+                           capture_output=True, timeout=300)
+            wedged = False
         if wedged:
             _say('')
             _say('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
@@ -71873,12 +72695,12 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             # fixed-shape tak58_upgrade_db op, never as a shell command. The printed
             # escape hatch was therefore impossible to follow on exactly the boxes
             # that hit this, which is where nuc landed on 2026-09-21. Clicking
-            # Update again re-runs the same broker op, and the install step is a
-            # no-op the second time, so it is both correct and the shorter path.
+            # Update again re-runs the same broker op, so it is both correct and
+            # the shorter path.
             _say('Two ways forward, in order of preference:')
             _say('  1. Fix what the error above names, then click Update TAK Server on this')
-            _say('     page again. It re-runs the database migration; the package install')
-            _say('     is already done and will be skipped.')
+            _say('     page again. It runs the package install and the database migration')
+            _say('     again; the install finds 5.8 already unpacked.')
             _say('  2. Restore from the pre-migration backup taken at the start of this run')
             _say('     (see the snapshot path above). The old PostgreSQL cluster was left')
             _say('     intact by design and is still on disk.')
@@ -71917,20 +72739,49 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         _say('  Backup: %s' % bk.get('snapshot_path'))
 
         # 3. Stop TAK.
+        _ver_before = _installed_version()
+        _held_before = False
+        if _distro_family() != 'rhel':
+            try:
+                _held_before = subprocess.run(
+                    ['dpkg-query', '-W', '-f=${Status}', 'takserver'], capture_output=True,
+                    text=True, timeout=30).stdout.startswith('hold ')
+            except Exception:
+                pass
         _say('')
         _say('Stopping TAK Server…')
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']),
                        capture_output=True, timeout=300)
+        _stage['stopped'] = True
 
         # 4. Install the 5.8 package. After this line the box is mid-upgrade.
+        #
+        # --allow-change-held-packages: the OS patch job holds takserver so patching
+        # can never sweep in a TAK upgrade, and keeps any hold it finds already there.
+        # This IS the operator-driven upgrade that hold protects, so it must get past
+        # it — without the flag apt refuses with exit 100 and unpacks nothing (#117).
+        # apt clears the hold as it upgrades (measured on test12 2026-10-11, selection
+        # went hold -> install), so a hold that was there before is put back below.
         _say('Installing %s …' % os.path.basename(pkg_path))
         if _distro_family() == 'rhel':
             cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
         else:
             cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
-                   + shlex.quote(pkg_path) + ' 2>&1')
+                   '--allow-change-held-packages ' + shlex.quote(pkg_path) + ' 2>&1')
         rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
                                                _log, timeout_sec=1800)
+        # Did anything unpack? The pg15 stop below happens in the postinst, AFTER the
+        # new version is on disk, so an unchanged version means apt refused outright
+        # (hold, lock, bad file, dependency) and this is not the expected stop.
+        _ver_after = _installed_version()
+        if _held_before:
+            subprocess.run(_sudo_wrap(['dpkg', '--set-selections']), input='takserver hold\n',
+                           capture_output=True, text=True, timeout=30)
+        if rc != 0 and _ver_before and _ver_after == _ver_before:
+            return fail('The package installer failed (exit %d) and TAK Server is still '
+                        'version %s — nothing was installed. See the output above.'
+                        % (rc, _ver_before), wedged=True)
+        _stage['unpacked'] = True
         # The package is EXPECTED to complain about pg15 and stop short — that is
         # the documented 5.8 behaviour, not an install failure. The database
         # script below is what finishes it, so a non-zero rc here is reported and
@@ -73240,6 +74091,58 @@ def _tak_snapshot(label, plog=None):
     return True, meta
 
 
+def _tak_rollback_prepare_local_db(plog):
+    """Make sure the local cluster has a `martiuser` that can log in with the password in
+    CoreConfig.xml, and a `cot` database to restore into. Returns True when both hold.
+
+    Field: lutak2.net 2026-10-10. TAK Server 5.8 sat on a PostgreSQL 18 cluster with no
+    cot database, and martiuser could not log in. Restore ran `pg_restore --clean -d cot`
+    into a database that did not exist. pg_restore exits 1 for that, the same code it uses
+    for harmless warnings, so the rollback logged "warnings (non-fatal)" and then
+    "complete" with nothing restored. The snapshot held the data the whole time.
+
+    Same statements TAK's own takserver-setup-db.sh uses, with the password re-set even
+    when the role exists. TAK logs in with whatever CoreConfig says, so the role must match
+    it; this is the same re-encode _tak58_heal_md5_scram does. The password is never logged.
+    """
+    r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
+                  "select (select count(*) from pg_roles where rolname='martiuser')"
+                  " || ',' || (select count(*) from pg_database where datname='cot')"],
+                 timeout=60)
+    if not r or r.returncode != 0 or ',' not in (r.stdout or ''):
+        plog("  rollback: cannot reach the local PostgreSQL as postgres: "
+             f"{((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        return False
+    has_role, has_db = [p.strip() == '1' for p in r.stdout.strip().split(',', 1)]
+
+    pw = _tak58_db_password()
+    tag = '$takrbpw$'
+    if not pw:
+        plog("  rollback: no database password in CoreConfig.xml — cannot set up martiuser")
+        return False
+    if tag.strip('$') in pw:
+        plog("  rollback: database password contains the quoting tag — refusing to build the statement")
+        return False
+    verb = 'ALTER ROLE martiuser' if has_role else \
+        'CREATE ROLE martiuser LOGIN INHERIT CREATEDB NOCREATEROLE'
+    r = _pg_exec(['psql', '-q', '-d', 'postgres', '-c',
+                  "SET password_encryption = 'scram-sha-256'; "
+                  "%s PASSWORD %s%s%s;" % (verb, tag, pw, tag)], timeout=60)
+    if not r or r.returncode != 0:
+        plog(f"  rollback: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        return False
+    plog("  rollback: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
+                                     else "was missing — recreated with the CoreConfig.xml password"))
+
+    if not has_db:
+        r = _pg_exec(['createdb', '--owner=martiuser', 'cot'], timeout=120)
+        if not r or r.returncode != 0:
+            plog(f"  rollback: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
+            return False
+        plog("  rollback: cot database was missing — recreated, empty, owned by martiuser")
+    return True
+
+
 def _tak_rollback(label, plog=None):
     """Restore TAK Server from snapshot at /opt/tak/snapshots/<label>/.
 
@@ -73247,10 +74150,13 @@ def _tak_rollback(label, plog=None):
       1. Validate snapshot exists and has a pg_dump
       2. systemctl stop takserver
       3. Restore CoreConfig.xml, UserAuthenticationFile.xml, takserver.default, certs/
-      4. pg_restore --clean -d cot from snapshot
-      5. systemctl start takserver
+      4. Local DB: make sure martiuser + cot exist (_tak_rollback_prepare_local_db)
+      5. pg_restore --clean -d cot from snapshot; check the schema landed, and bring it up
+         to the installed TAK Server's schema if the snapshot is older
+      6. systemctl start takserver
 
-    Returns (True, None) on success, (False, error_str) on failure.
+    Returns (True, None) on success, (False, error_str) on failure — including a database
+    that did not come back, even though the files did.
     """
     import shutil as _shutil
     if plog is None:
@@ -73366,10 +74272,18 @@ def _tak_rollback(label, plog=None):
         except Exception as _e_stage:
             plog(f"  rollback: could not stage cot.pgdump for restore: {_e_stage}")
             _staged_dump = pg_dump_path  # fall back; open() may still work as root
+    # pg_restore's exit code cannot tell "restored with warnings" from "restored nothing"
+    # (both are 1), so on a local database the result is judged by asking the database
+    # afterwards, and a failure is returned as one instead of "complete".
+    _db_err = None
+    if not _rb_two_server and not _tak_rollback_prepare_local_db(plog):
+        _db_err = 'the local database could not be prepared for the restore (see above)'
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
         _rb_s1 = _rb_tak_cfg.get('server_one', {})
-        if _rb_two_server:
+        if _db_err:
+            plog("  rollback: skipping pg_restore")
+        elif _rb_two_server:
             plog("  rollback: two-server mode — streaming pg_restore to Server One via SSH")
             _rb_host = (_rb_s1.get('host') or '').strip()
             _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
@@ -73408,6 +74322,7 @@ def _tak_rollback(label, plog=None):
             else:
                 plog(f"  rollback: pg_restore failed (exit {resp.get('returncode')}): "
                      f"{(resp.get('error') or resp.get('stderr') or '')[:200]}")
+                _db_err = 'pg_restore failed (see above)'
         elif _tak_is_container():
             pg_container = TAK_DB_CONTAINER
             r = subprocess.run(
@@ -73428,8 +74343,10 @@ def _tak_rollback(label, plog=None):
                         plog("  rollback: pg_restore successful")
                 else:
                     plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                    _db_err = 'pg_restore failed (see above)'
             else:
                 plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+                _db_err = f'{pg_container} is not running, so the database was not restored'
         else:
             # v10.0.8: ROOT native single-server — restore directly via the local
             # postgres OS user. The old code only knew the takserver-db container
@@ -73448,13 +74365,39 @@ def _tak_rollback(label, plog=None):
                     plog("  rollback: pg_restore successful")
             else:
                 plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                _db_err = 'pg_restore failed (see above)'
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
+        if not _rb_two_server:
+            _db_err = f'pg_restore raised: {str(e)[:200]}'
     finally:
         # Remove the staged dump copy (broker-owned by the console uid now).
         if _staged_dump != pg_dump_path:
             try: subprocess.run(_sudo_wrap(['rm', '-f', _staged_dump]), capture_output=True, timeout=30)
             except Exception: pass
+
+    # 6b. Did it land, and does the schema match the TAK Server that is installed? A dump
+    # taken before a 5.8 upgrade (pre-58-*) carries the 5.7 schema; 5.8 must not run on it
+    # (see _TAK58_MIN_SCHEMA_VERSION), so apply TAK's own schema update, as the 5.8
+    # migration does.
+    if not _rb_two_server and not _db_err:
+        _sv = _tak58_schema_version()
+        if _sv is None:
+            _db_err = 'the cot database has no TAK schema after pg_restore — nothing was restored'
+        else:
+            plog(f"  rollback: cot database restored (schema_version {_sv})")
+            _inst = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
+            if (not _tak_is_container() and _inst and _inst >= TAK_GATE_BLOCK_FROM
+                    and _sv < _TAK58_MIN_SCHEMA_VERSION):
+                plog(f"  rollback: this snapshot predates TAK Server {_inst[0]}.{_inst[1]} — applying "
+                     "its schema updates (TAK's takserver-setup-db.sh)…")
+                _rc = _tak58_run_setup_db()
+                _sv2 = _tak58_schema_version()
+                if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
+                    _db_err = (f"the TAK Server {_inst[0]}.{_inst[1]} schema updates did not apply "
+                               f"(setup exit {_rc}, schema_version {_sv2 if _sv2 is not None else 'unreadable'})")
+                else:
+                    plog(f"  rollback: schema updated to version {_sv2}")
 
     # 7. Start TAK Server
     plog("  rollback: starting takserver…")
@@ -73474,6 +74417,9 @@ def _tak_rollback(label, plog=None):
     except Exception as _e_nr:
         plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
 
+    if _db_err:
+        plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored")
+        return False, _db_err
     plog(f"  ✓ rollback [{label}]: complete")
     return True, None
 
@@ -75941,7 +76887,9 @@ def _apt_update_capture(timeout=600):
             return False, f'{type(e).__name__}: {e}'
 
     ok, out = _run()
-    if not ok and _apt_disable_dead_local_sources():
+    # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
+    _healed = (not ok and 'cloudsmith.io' in out and _caddy_apt_repo_heal() == 'dead')
+    if not ok and (_apt_disable_dead_local_sources() or _healed):
         ok2, out2 = _run()
         if ok2:
             return True, (out + '\n[infra-TAK] disabled a dead install-medium apt source '
@@ -78465,6 +79413,9 @@ def _kernel_patch_start_job():
     # apt source. Clear it before firing rather than after diagnosing it. No-op on
     # cloud images and on RHEL.
     _apt_disable_dead_local_sources()
+    # v10.2.10 (Cloudsmith 402): same for Caddy's Cloudsmith repo while it answers 402 — the field failure
+    # that left two operators' boxes unpatchable. Re-enabled here too once it is back.
+    _caddy_apt_repo_heal()
     # If unit is in a failed state from a previous run, reset so systemd
     # accepts a fresh start request with the same unit name. Only meaningful
     # if LoadState=loaded — a transient unit that doesn't exist post-reboot
@@ -78533,12 +79484,50 @@ def _kernel_patch_start_job():
         # with nothing installed. Every failing URL returned 200 minutes later — one retry
         # would have carried it. Same class as the v10.1.37 lock-wait: do not hand the
         # operator a red FATAL panel for a transient upstream condition.
-        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        # v10.2.10 (Cloudsmith 402): apt-get update exits 100 when ANY source fails. A third-party repo that
+        # infra-TAK added (Caddy/Cloudsmith, Docker, PGDG) going dark must not block Ubuntu
+        # security patches — field 2026-10-10, Cloudsmith answered 402 and every patch run
+        # died here while the Ubuntu mirrors had refreshed fine. Still FATAL when any error
+        # names anything else (distro mirror, lock, disk), or when apt printed no E: line.
+        # apt keeps the dead repo's LAST index, so full-upgrade still tries to download its
+        # newer packages (measured on test8: caddy 2.11.7 -> 402 again, nothing installed).
+        # Hence --fix-missing on this path only, plus the distro-skip check after it.
+        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
+        'FIXMISSING=""\n'
+        'UPDLOG="$(mktemp)"\n'
+        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
+        'rc=${PIPESTATUS[0]}\n'
+        'if [ "$rc" -ne 0 ]; then\n'
+        '  ERRS="$(grep -E "^E: " "$UPDLOG" | grep -v "Some index files failed to download")"\n'
+        '  OTHER="$(grep -vE "$THIRD_PARTY" <<< "$ERRS" | grep -v "^$")"\n'
+        '  if [ -n "$ERRS" ] && [ -z "$OTHER" ]; then\n'
+        '    echo "[$(TS)] WARN: apt-get update could not refresh a third-party repository (see the E: lines above). Every error is from that repository, not the Ubuntu/Debian sources, so OS patching continues; packages from that repository stay at their current version until it is reachable again."\n'
+        '    FIXMISSING="--fix-missing"\n'
+        '  else\n'
+        '    echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; rm -f "$UPDLOG"; exit $rc\n'
+        '  fi\n'
+        'fi\n'
+        'rm -f "$UPDLOG"\n'
         'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
         'UPGLOG="$(mktemp)"\n'
-        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $FIXMISSING full-upgrade 2>&1 \\\n'
         '  | tee "$UPGLOG"\n'
         'rc=${PIPESTATUS[0]}\n'
+        # v10.2.10 (Cloudsmith 402): --fix-missing installs everything it could download and skips the rest, but
+        # still exits 100 (measured on test8: all Ubuntu + Docker updates set up, caddy 2.11.7
+        # skipped, rc=100). Skips that are ALL from the dead third-party repo are its expected
+        # cost — a clean patch. Any other error falls through to FATAL below.
+        'if [ "$rc" -ne 0 ] && [ -n "$FIXMISSING" ]; then\n'
+        '  UERRS="$(grep -E "^E: " "$UPGLOG" | grep -v "Unable to fetch some archives")"\n'
+        '  if [ -n "$UERRS" ] && ! grep -qvE "$THIRD_PARTY" <<< "$UERRS"; then\n'
+        '    echo "[$(TS)] WARN: packages from the unreachable third-party repository were skipped (see the E: lines above); everything else was installed."\n'
+        '    rc=0\n'
+        '  fi\n'
+        'fi\n'
+        'if [ "$rc" -ne 0 ] && [ -n "$FIXMISSING" ]; then\n'
+        '  echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc) — some packages could not be installed (see above). Packages that downloaded were installed. If the errors name a mirror, run Install updates again in a few minutes."\n'
+        '  rm -f "$UPGLOG"; exit $rc\n'
+        'fi\n'
         'if [ "$rc" -ne 0 ]; then\n'
         # A download failure and an install failure are NOT the same event and must not
         # read the same. On a fetch failure apt installs nothing, so the box is untouched
@@ -79766,6 +80755,25 @@ def _pin_takserver_jvm(plog=None):
     return {'java_home': home, 'changed': changed}
 
 
+_GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
+
+
+def _gd_baked_remote_values(path):
+    """The endpoint an installed remote-DB Guard Dog script was deployed with, read from
+    its own `KEY="value"` lines — {KEY: value} for each placeholder it filled, or None
+    when the script is absent or was never pointed at a host. GH #99."""
+    try:
+        cur = _read_priv(path)
+    except Exception:
+        return None
+    vals = {}
+    for k in _GD_BAKED_REMOTE_KEYS:
+        m = re.search(r'^%s="([^"\n]*)"$' % k, cur or '', re.M)
+        if m and 'PLACEHOLDER' not in m.group(1):
+            vals[k] = m.group(1)
+    return vals if vals.get('DB_HOST') else None
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -79799,8 +80807,18 @@ def _auto_update_guarddog():
             src = os.path.join(scripts_dir, name)
             if not os.path.isfile(src):
                 continue
+            # v10.2.11 (GH #99): the remote-DB scripts used to be skipped outright unless
+            # settings said two_server. A split box whose settings do not (built by hand,
+            # external_db, or changed since) kept the copy it was first deployed with — on
+            # the field box the May script that restarted a healthy production PostgreSQL
+            # five times — while every other Guard Dog script updated around it. Same trap
+            # as tak-db-watch.sh below. If the script is ON this box, refresh it, keeping
+            # the endpoint it was deployed with; if it is not, there is nothing to update.
+            baked = None
             if not is_two_server and 'remotedb' in name:
-                continue
+                baked = _gd_baked_remote_values(os.path.join('/opt/tak-guarddog', name))
+                if not baked:
+                    continue
             # v10.1.64 W1: tak-db-watch.sh used to be skipped on two-server boxes because it
             # was local-only — a watcher for a database that is not on this host. It is now
             # remote-aware (gd_db_is_remote), and the skip had become actively harmful: a box
@@ -79830,6 +80848,11 @@ def _auto_update_guarddog():
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # as run_guarddog_deploy() and the startup sync
+            if baked:
+                for _k, _v in baked.items():
+                    content = content.replace(f'{_k}_PLACEHOLDER', _v)
+                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # an install that never filled it: two-server
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
                 _fh_remote = _fh_cfg.get('remote', {})
@@ -80713,7 +81736,9 @@ def _startup_ensure_hardening_posture():
         if w1.get('caddy_login_locked'):
             try:
                 generate_caddyfile()
-                _caddy_reload()
+                # GH #90: only when Caddy is not already running this file. An unconditional
+                # forced reload here cut every WebTAK/CloudTAK socket on every console start.
+                _caddy_reload_if_changed()
                 print('[startup-posture] hardened: Caddy /login SSO-lock re-asserted', flush=True)
             except Exception as _ce:
                 print('[startup-posture] Caddy re-assert warning: %s' % str(_ce)[:140], flush=True)
@@ -81971,17 +82996,13 @@ def _startup_ensure_metrics_collector():
             return  # current version already applied AND running — no churn on every boot
         # (re)install: script
         _write_priv('/opt/tak-guarddog/tak-metrics-collector.py', new_src)
-        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Merge — never
-        # clobber two_server keys.
-        conf_path = '/opt/tak-guarddog/guarddog.conf'
-        try:
-            conf = json.load(open(conf_path)) if os.path.exists(conf_path) else {}
-        except Exception:
-            conf = {}
-        cp = _get_tak_cert_password(load_settings())
-        if cp and conf.get('tak_cert_pass') != cp:
-            conf['tak_cert_pass'] = cp
-            _write_priv(conf_path, json.dumps(conf), perm=0o600)
+        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Through the
+        # one writer: the open() read here failed on a non-root console (root-owned, 600), fell
+        # back to {}, and replaced the whole file with just the cert pass (GH #101).
+        _mc_settings = load_settings()
+        cp = _get_tak_cert_password(_mc_settings)
+        if cp:
+            _write_guarddog_conf(_mc_settings, {'tak_cert_pass': cp})
         # systemd unit
         unit_path = '/etc/systemd/system/tak-metrics-collector.service'
         if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
@@ -82299,6 +83320,63 @@ _AK_BROKER_TYPO_LINE = 'self.schedule_last_run = timezone.now()'
 _AK_BROKER_FIXED_LINE = 'self.scheduler_last_run = timezone.now()'
 _AK_EVENTS_BP_CONTAINER_PATH = '/blueprints/default/events-default.yaml'
 
+
+# GH #111 follow-up: the patched broker.py is a copy of ONE image's file with one line
+# fixed. Mounted over any other image it silently swaps that image's broker.py for an
+# older one. The pre-fix converge kept the mount whenever compose had it and the file
+# existed, and Update never touched it — so every box that took the scheduler patch on an
+# earlier 2026.5.x kept serving that Aug-3 file after updating to 2026.5.7 (test8, 2026-10-11:
+# 5.7's chunked task-expiry cleanup reverted to the one-shot DELETE it replaced; 5.7 no
+# longer carries the typo at all). So the patch file is now named after the image ID it
+# was cut from: a different image means a different expected mount, and the converge
+# re-derives (or retires) it instead of trusting what is already there.
+def _ak_broker_patch_name(image_id):
+    """`broker-<12 hex>.py` for a `sha256:<hex>` image ID, '' when the ID is not one.
+    The name lands in a compose bind-mount spec and a host path, so only hex gets in."""
+    m = re.match(r'^sha256:([0-9a-f]{12})[0-9a-f]*$', (image_id or '').strip())
+    return f'broker-{m.group(1)}.py' if m else ''
+
+
+def _ak_image_broker_source(image_ref):
+    """Read broker.py from the IMAGE, never from the running container: while our mount
+    is live the container shows our own patched file, not upstream's.
+    Returns (state, text) — state is 'typo', 'clean', 'missing' or 'error'."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--network', 'none',
+                                       '--entrypoint', 'cat', image_ref, _AK_BROKER_CONTAINER_PATH]),
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return 'error', str(e)[:200]
+    if r.returncode == 0 and r.stdout:
+        return ('typo' if _AK_BROKER_TYPO_LINE in r.stdout else 'clean'), r.stdout
+    if r.returncode == 1 and 'No such file' in (r.stderr or ''):
+        return 'missing', ''
+    return 'error', ((r.stderr or r.stdout) or '')[-200:]
+
+
+def _ak_compose_without_broker_patch(text, yaml_mod):
+    """Compose text with the broker.py patch mount removed from every service, or None
+    when there is none (or the text does not parse). Used by Update so the NEW image
+    boots its own broker.py; the converge re-patches it only if it still needs it."""
+    try:
+        data = yaml_mod.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('services'), dict):
+        return None
+    changed = False
+    for _svc in data['services'].values():
+        if not isinstance(_svc, dict) or not isinstance(_svc.get('volumes'), list):
+            continue
+        _keep = [v for v in _svc['volumes'] if _AK_BROKER_CONTAINER_PATH not in str(v)]
+        if len(_keep) != len(_svc['volumes']):
+            _svc['volumes'] = _keep
+            changed = True
+    if not changed:
+        return None
+    return yaml_mod.safe_dump(data, default_flow_style=False, sort_keys=False,
+                              allow_unicode=True, width=200)
+
 # Valid EMPTY blueprint — masks upstream events-default.yaml so the stock
 # default-notify-* rules are never recreated. Must parse as a blueprint
 # (version/metadata/entries); a zero-byte file fails validation and the
@@ -82358,22 +83436,25 @@ def _startup_authentik_idle_load_converge(log=None):
         with _AK_IDLE_CONVERGE_LOCK:
 
             patches_dir = os.path.join(ak_dir, 'patches')
-            broker_patch_path = os.path.join(patches_dir, 'broker.py')
 
             # The worker container tells us which image the box actually runs (the
             # compose tag alone can lie if the operator never pulled). At whole-box
             # boot Authentik may still be starting — retry briefly, then proceed
             # with what we can do without it.
-            img = ''
+            img, img_id = '', ''
             for _attempt in range(4):
-                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}',
                                                'authentik-worker-1']),
                                    capture_output=True, text=True, timeout=20)
                 if r.returncode == 0 and (r.stdout or '').strip():
-                    img = r.stdout.strip()
+                    img, _, img_id = r.stdout.strip().partition(' ')
                     break
                 time.sleep(30)
             tag = img.rsplit(':', 1)[-1] if ':' in img else ''
+            # The patch is tied to the image it was cut from (see _ak_broker_patch_name).
+            broker_patch_name = _ak_broker_patch_name(img_id)
+            broker_patch_path = os.path.join(patches_dir, broker_patch_name or 'broker.py')
+            broker_mount = f'./patches/{broker_patch_name}:{_AK_BROKER_CONTAINER_PATH}:ro'
 
             with open(compose_path) as f:
                 compose_data = _yaml.safe_load(f.read())
@@ -82383,6 +83464,8 @@ def _startup_authentik_idle_load_converge(log=None):
             services = compose_data.setdefault('services', {})
             worker_vols = (services.get('worker') or {}).get('volumes') or []
             broker_mounted = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in worker_vols)
+            broker_current = (bool(broker_patch_name) and broker_mount in [str(v) for v in worker_vols]
+                              and os.path.exists(broker_patch_path))
 
             # ── W1: decide desired broker.py mount state (True/False/None=leave alone) ──
             broker_desired = None
@@ -82392,40 +83475,42 @@ def _startup_authentik_idle_load_converge(log=None):
                 broker_desired = False
                 if broker_mounted:
                     _l(f'W1: image tag {tag or img} is outside 2026.5.x — retiring the scheduler patch mount')
-            elif broker_mounted and os.path.exists(broker_patch_path):
-                broker_desired = True  # already applied; canary below verifies it landed
+            elif broker_current:
+                broker_desired = True  # cut from THIS image; canary below verifies it landed
+            elif not broker_patch_name:
+                # No usable image ID → cannot tie a patch to an image. A mount we cannot
+                # prove belongs to this image is retired: a stale broker.py reverts
+                # upstream fixes, while the typo it fixes only costs CPU.
+                broker_desired = False
+                _l(f'W1: worker image ID unreadable ({img_id or "empty"}) — '
+                   f'{"retiring" if broker_mounted else "not applying"} the scheduler patch')
             else:
-                # Mount not yet active, so the container view of broker.py is the
-                # image's own file — grep it for the upstream typo.
-                g = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
-                                               _AK_BROKER_TYPO_LINE, _AK_BROKER_CONTAINER_PATH]),
-                                   capture_output=True, text=True, timeout=30)
-                if g.returncode == 0:
-                    c = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'cat',
-                                                   _AK_BROKER_CONTAINER_PATH]),
-                                       capture_output=True, text=True, timeout=30)
-                    src = c.stdout or ''
-                    if c.returncode == 0 and _AK_BROKER_TYPO_LINE in src:
-                        patched = src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE)
-                        os.makedirs(patches_dir, exist_ok=True)
-                        with open(broker_patch_path, 'w') as f:
-                            f.write(patched)
-                        os.chmod(broker_patch_path, 0o644)
-                        broker_desired = True
-                        _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched broker.py '
-                           f'written (schedule_last_run → scheduler_last_run)')
-                    else:
-                        _l('W1: could not extract broker.py from the worker — leaving unchanged this boot')
-                elif g.returncode == 1:
+                # Mount absent, or cut from a different image (an Update, or a pre-#111
+                # `patches/broker.py` with no image recorded). Ask the image itself.
+                state, src = _ak_image_broker_source(img_id)
+                if state == 'typo':
+                    os.makedirs(patches_dir, exist_ok=True)
+                    with open(broker_patch_path, 'w') as f:
+                        f.write(src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE))
+                    os.chmod(broker_patch_path, 0o644)
+                    broker_desired = True
+                    _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched {broker_patch_name} '
+                       f'written (schedule_last_run → scheduler_last_run)'
+                       + (' — replaces a patch cut from another image' if broker_mounted else ''))
+                elif state == 'clean':
                     broker_desired = False
-                    _l(f'W1: {img} does not carry the scheduler typo — patch not needed')
-                else:
-                    # grep rc 2 = path missing (unknown layout) → per plan, do not patch.
+                    _l(f'W1: {img} does not carry the scheduler typo — '
+                       + ('retiring the patch cut from an older image (it was overriding this '
+                          "image's own broker.py)" if broker_mounted else 'patch not needed'))
+                elif state == 'missing':
                     broker_desired = False
                     _l(f'W1: broker.py not found at the known path in {img} (unknown layout) — not patching')
+                else:
+                    broker_desired = False if broker_mounted else None
+                    _l(f'W1: could not read broker.py from image {img} ({src.strip()[:120]}) — '
+                       + ('retiring the unverified patch mount' if broker_mounted else 'leaving unchanged this boot'))
 
             # ── Mutate compose volumes: W1 broker mount (tri-state) + W2 mask (always) ──
-            broker_mount = f'./patches/broker.py:{_AK_BROKER_CONTAINER_PATH}:ro'
             events_mount = f'./patches/events-default.yaml:{_AK_EVENTS_BP_CONTAINER_PATH}:ro'
 
             # W2 mask file — write/refresh before it is ever mounted.
@@ -82457,10 +83542,13 @@ def _startup_authentik_idle_load_converge(log=None):
                     compose_changed = True
                     _l(f'W2: added events-default.yaml mask mount to {_svc_name}')
                 _has_broker = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _vols)
-                if broker_desired is True and not _has_broker:
-                    _vols.append(broker_mount)
+                if broker_desired is True and broker_mount not in [str(v) for v in _vols]:
+                    # Swap, not add: a mount cut from another image goes in the same move,
+                    # so the recreate below lands exactly one broker.py.
+                    _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
+                    _svc['volumes'].append(broker_mount)
                     compose_changed = True
-                    _l(f'W1: added broker.py patch mount to {_svc_name}')
+                    _l(f'W1: {"replaced" if _has_broker else "added"} broker.py patch mount on {_svc_name}')
                 elif broker_desired is False and _has_broker:
                     _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
                     compose_changed = True
@@ -84430,6 +85518,15 @@ def _startup_migrations():
             sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
             if sg_ok and 'synced' in (sg_msg or ''):
                 print(f"Startup migration: guarddog.conf synced — {sg_msg}")
+        elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
+            # GH #101: every other box too. A split box whose settings don't say two_server
+            # never reached the sync above, so its guarddog.conf kept no database section
+            # through every update. The writer takes the topology from TAK's CoreConfig.
+            sg_ok, sg_msg = _write_guarddog_conf(s)
+            print(f"Startup migration: guarddog.conf {sg_msg}")
+            if sg_ok and sg_msg.startswith('written'):
+                subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                               capture_output=True, timeout=20)
 
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
@@ -85280,6 +86377,11 @@ def _startup_migrations():
             print(f"Startup migration: grace_period converge error (non-fatal): {_gp_err}",
                   flush=True)
         try:
+            _startup_caddy_stream_close_delay_converge()
+        except Exception as _scd_err:
+            print(f"Startup migration: stream_close_delay converge error (non-fatal): {_scd_err}",
+                  flush=True)
+        try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
@@ -85849,8 +86951,12 @@ def _post_update_auto_deploy():
                     print("Post-update: auto-deploying Guard Dog")
                     _auto_deploy_active['guarddog'] = True
                     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
+                    guarddog_deploy_log.clear()
                     try:
                         run_guarddog_deploy(alert_email)
+                        for _gd_line in list(guarddog_deploy_log):
+                            if 'Scripts installed' in _gd_line:
+                                print(f"Post-update: Guard Dog {_gd_line}", flush=True)
                     except Exception as e:
                         print(f"Post-update: Guard Dog deploy error: {e}")
                     finally:
