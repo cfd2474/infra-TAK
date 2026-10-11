@@ -27,7 +27,9 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import stat
+import types
 import threading
 import time
 
@@ -43,7 +45,7 @@ def _cut(name):
 
 @pytest.fixture
 def ns(tmp_path):
-    n = {'os': os, 'json': json, 'time': time, 'threading': threading,
+    n = {'os': os, 'json': json, 'time': time, 'threading': threading, 'secrets': secrets,
          'datetime': _dt.datetime, 'TAK_UPDATE_HISTORY': str(tmp_path / 'takserver_update_history.json'),
          '_TAK_UPDATE_HISTORY_KEEP': 5, '_TAK_UPDATE_HISTORY_LINES': 400,
          '_TAK_UPDATE_HISTORY_LOCK': threading.Lock(),
@@ -92,6 +94,27 @@ def test_mid_upgrade_and_crash_and_success_are_told_apart(ns):
         run(ns, ['y'], raises=RuntimeError('boom'))
     h = run(ns, ['z'], end={'running': False, 'complete': True})
     assert [e['result'] for e in h] == ['ok', 'CRASHED (RuntimeError: boom)', 'FAILED (left mid-upgrade)']
+
+
+def test_runs_started_in_the_same_millisecond_both_keep_their_record(ns):
+    """ops #25: the id was kind@ms, so a run starting in the same millisecond as the one
+    before it replaced that run's record. Freeze the clock to force the collision."""
+    ns['time'] = types.SimpleNamespace(time=lambda: 1760000000.123, strftime=time.strftime,
+                                       gmtime=time.gmtime)
+    run(ns, ['first'], end={'error': True})
+    h = run(ns, ['second'], end={'complete': True})
+    assert [e['result'] for e in h] == ['ok', 'FAILED']
+    assert h[0]['id'] != h[1]['id'] and all(e['id'].startswith('5.8 migration@') for e in h)
+
+
+def test_records_with_old_style_ids_are_kept(ns):
+    """History files written before ops #25 hold kind@ms ids; a new run must not drop them."""
+    old = {'id': '5.8 migration@1759000000.000', 'result': 'FAILED', 'kind': '5.8 migration',
+           'finished': '2025-09-27 19:06:40 UTC', 'lines': ['old']}
+    with open(ns['TAK_UPDATE_HISTORY'], 'w') as f:
+        json.dump([old], f)
+    h = run(ns, ['new'], end={'complete': True})
+    assert [e['result'] for e in h] == ['ok', 'FAILED'] and h[1] == old
 
 
 def test_history_keeps_the_last_five_runs_and_the_log_tail(ns):

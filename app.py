@@ -70939,7 +70939,7 @@ def _tak_update_history():
         return []
 
 
-def _tak_update_record(kind, pkg, log, status, started, exc=None, running=False):
+def _tak_update_record(kind, pkg, log, status, started, exc=None, running=False, run_id=None):
     lines = [str(l) for l in list(log)]
     if running:
         result = 'running'
@@ -70953,7 +70953,7 @@ def _tak_update_record(kind, pkg, log, status, started, exc=None, running=False)
         result = 'ok'
     else:
         result = 'unfinished'
-    entry = {'id': '%s@%.3f' % (kind, started),
+    entry = {'id': run_id or '%s@%.3f' % (kind, started),
              'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
              'finished': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
              'seconds': int(time.time() - started), 'kind': kind,
@@ -70974,6 +70974,10 @@ def _tak_update_job(kind, target, log, status):
     success, failure, or an exception (recorded, then re-raised)."""
     def run(*a, **kw):
         started, exc = time.time(), None
+        # ops #25: kind@ms alone collides when two runs start in the same millisecond, and
+        # the later one then replaces the earlier one's record. A random suffix keeps every
+        # run distinct; entries already on disk keep their old ids and are left alone.
+        run_id = '%s@%.3f#%s' % (kind, started, secrets.token_hex(4))
         pkg = a[0] if a and isinstance(a[0], str) else ''
         _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
         # v10.2.11 (ops #9): the record used to be written only when the worker ENDED, so a
@@ -70993,7 +70997,8 @@ def _tak_update_job(kind, target, log, status):
                     if len(log) != seen:
                         seen = len(log)
                         try:
-                            _tak_update_record(kind, pkg, log, status, started, running=True)
+                            _tak_update_record(kind, pkg, log, status, started, running=True,
+                                               run_id=run_id)
                         except Exception:
                             pass
                 stop.wait(15)
@@ -71007,7 +71012,7 @@ def _tak_update_job(kind, target, log, status):
             with ck_lock:
                 stop.set()
             try:
-                _tak_update_record(kind, pkg, log, status, started, exc)
+                _tak_update_record(kind, pkg, log, status, started, exc, run_id=run_id)
             except Exception as _re:
                 print(f'TAK Server update: record not saved ({_re})', flush=True)
             _tracked_finish('takserver', status, log,
