@@ -8265,13 +8265,13 @@ _DIAG_TRAIL_DAYS = 30
 
 
 def _diag_log_lines(path, max_bytes=_DIAG_TAIL_BYTES):
-    """Tail of a log as lines: a direct read, else (under /var/log, which the broker may
-    read) a privileged one. None when neither works."""
+    """Tail of a log as lines: a direct read, else (under a log or PostgreSQL directory the
+    broker may read) a privileged one. None when neither works."""
     lines = _diag_tail(path, max_bytes)
-    if lines is None and path.startswith('/var/log/'):
+    if lines is None and path.startswith(('/var/log/', '/var/lib/postgresql/', '/var/lib/pgsql/')):
         try:
             txt = _read_own_or_priv(path)
-            lines = txt.splitlines()[-20000:] if txt else None
+            lines = txt.splitlines()[-20000:] if txt is not None else None   # '' = an empty log
         except Exception:
             lines = None
     return lines
@@ -8314,7 +8314,7 @@ def _diag_pg_log(path):
     """FATAL/ERROR/start/stop lines of a PostgreSQL server log, repeats counted."""
     lines = _diag_log_lines(path, 1024 * 1024)
     if lines is None:
-        return [f"  {path}: {_diag_unreadable(path)}"]
+        return [f"  {path}: missing, or not readable by the console on this box"]
     hits = [l for l in lines if re.search(r'FATAL|PANIC|ERROR|starting PostgreSQL|shutting down|'
                                           r'database system (is ready|was shut down|was interrupted)|'
                                           r'received \w+ shutdown', l)]
@@ -8346,6 +8346,7 @@ def _diag_section_tak_database(settings):
     out.append('packages (takserver / postgresql / postgis):' + ('' if rows else ' none found'))
     out.extend('  ' + l.strip()[:160] for l in rows[:40])
     mode = _get_tak_deployment_config(settings).get('mode')
+    units = []
     if mode in ('two_server', 'external_db'):
         out.append(f"PostgreSQL: the TAK database is not on this box ({mode}) — clusters not listed")
     elif _tak_is_container():
@@ -8365,8 +8366,15 @@ def _diag_section_tak_database(settings):
                 out.extend(_diag_pg_overview(r[2]))
         out.append('PostgreSQL server logs:')
         for r in clusters:
-            out.extend(_diag_pg_log(r[6] if len(r) > 6 and r[6].startswith('/')
-                                    else f'/var/log/postgresql/postgresql-{r[0]}-{r[1]}.log'))
+            # TAK's clusters log through logging_collector into <data>/log/postgresql-%a.log
+            # (pg_lsclusters prints that relative pattern): today's and yesterday's file.
+            if len(r) > 6 and not r[6].startswith('/') and r[5].startswith('/var/lib/postgresql/'):
+                for d in (1, 0):
+                    out.extend(_diag_pg_log(os.path.join(
+                        r[5], (datetime.now() - timedelta(days=d)).strftime(r[6]))))
+            else:
+                out.extend(_diag_pg_log(r[6] if len(r) > 6 else f'/var/log/postgresql/postgresql-{r[0]}-{r[1]}.log'))
+        units = [f'postgresql@{r[0]}-{r[1]}.service' for r in clusters]
     else:
         try:
             dirs = sorted(d for d in os.listdir('/var/lib/pgsql') if d[:2].isdigit())
@@ -8377,18 +8385,32 @@ def _diag_section_tak_database(settings):
         out.extend('  unit ' + ' '.join(l.split()[:4]) for l in units.splitlines() if l.strip())
         out.append('cluster on the default port:')
         out.extend(_diag_pg_overview())
-    # Start/stop history of every PostgreSQL unit: when a cluster first came up, and when
-    # one was stopped — the two events that bracket an upgrade.
-    j = _diag_cmd(['journalctl', '-u', 'postgresql*', '--since', f'{_DIAG_TRAIL_DAYS} days ago',
-                   '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
-    ev = [l for l in j.splitlines() if re.search(r'Start|Stop|Fail|exited|Deactivated', l)]
-    out.append(f"PostgreSQL service start/stop, last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
-    out.extend('  ' + l[:200] for l in ev[-25:])
+        out.append('PostgreSQL server logs:')
+        vers = sorted(set(re.findall(r'postgresql-(\d+)\.service', units)) | set(dirs))
+        for v in vers:
+            for d in (1, 0):
+                out.extend(_diag_pg_log(f"/var/lib/pgsql/{v}/data/log/"
+                                        f"postgresql-{(datetime.now() - timedelta(days=d)).strftime('%a')}.log"))
+        units = [f'postgresql-{v}.service' for v in vers]
+    if units and mode not in ('two_server', 'external_db') and not _tak_is_container():
+        # Start/stop history of each cluster's unit: when a cluster first came up and when one
+        # was stopped — the two events that bracket an upgrade. Named units, not a glob: a
+        # `-u 'postgresql*'` glob scans the whole journal (30 s and nothing, on test6).
+        j = _diag_cmd(['journalctl'] + [a for u in units for a in ('-u', u)] +
+                      ['--since', f'{_DIAG_TRAIL_DAYS} days ago', '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
+        ev = [l for l in j.splitlines() if re.search(r'Start|Stop|Fail|exited|Deactivated', l)]
+        out.append(f"PostgreSQL service start/stop ({', '.join(units)}), last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
+        out.extend('  ' + l[:200] for l in ev[-25:])
     snaps = (settings.get('tak_snapshots') or [])[:6]
     out.append(f"TAK snapshots recorded (newest first): {len(settings.get('tak_snapshots') or [])}")
     for sn in snaps:
         lbl = str(sn.get('label') or '?')
-        on_disk = _exists_priv(os.path.join(SNAPSHOT_DIR, lbl)) if re.match(r'^[\w.-]+$', lbl) else False
+        p = os.path.join(SNAPSHOT_DIR, lbl)
+        try:   # a directory: _exists_priv reads files, so ask `test -d` (broker-allowed) instead
+            on_disk = re.match(r'^[\w.-]+$', lbl) and (os.path.isdir(p) or subprocess.run(
+                _sudo_wrap(['test', '-d', p]), capture_output=True, timeout=10).returncode == 0)
+        except Exception:
+            on_disk = False
         out.append(f"  {lbl}  taken {sn.get('taken_at', '?')}  TAK {sn.get('tak_version') or '?'}  "
                    f"{sn.get('size_mb', '?')} MB  db_dump={sn.get('db_dump')}"
                    f"{' (' + str(sn.get('db_dump_bytes') // 1024) + ' KB)' if isinstance(sn.get('db_dump_bytes'), int) else ''}"
@@ -8443,13 +8465,16 @@ def _diag_section_change_trail(settings):
         out.append(f"dpkg install/upgrade/remove of those packages, last {_DIAG_TRAIL_DAYS} days: {len(dp)}")
         out.extend('  ' + l[:200] for l in dp[-40:])
     else:
+        # Dated lines only: rpm scriptlet output is logged undated between them.
+        recent = lambda l: re.match(r'\d{4}-\d{2}-\d{2}', l) and l[:10] >= cutoff
         rl = [l for l in _diag_rotated_lines('/var/log/dnf.rpm.log')
-              if l[:10] >= cutoff and _DIAG_PKG_RE.search(l)
+              if recent(l) and _DIAG_PKG_RE.search(l)
               and re.search(r'\b(Install|Upgrade|Upgraded|Downgrade|Erase|Reinstall)', l)]
         out.append(f"rpm transactions touching takserver/postgresql/postgis/java, last {_DIAG_TRAIL_DAYS} days: {len(rl)}")
         out.extend('  ' + l[:200] for l in rl[-40:])
         cmds = [l for l in _diag_rotated_lines('/var/log/dnf.log')
-                if l[:10] >= cutoff and 'Command:' in l and _DIAG_PKG_RE.search(l)]
+                if recent(l) and 'Command:' in l and _DIAG_PKG_RE.search(l)]
+        out.append(f"dnf commands naming those packages, last {_DIAG_TRAIL_DAYS} days: {len(cmds)}")
         out.extend('  ' + l[:200] for l in cmds[-15:])
     # The OS patch job (Help/Dashboard "Install updates"): apt full-upgrade / dnf upgrade
     # with TAK held — but PostgreSQL is not held, and its runs are not otherwise visible here.
@@ -8470,7 +8495,8 @@ def _diag_section_change_trail(settings):
     for unit in ('takwerx-console.service', 'takserver.service'):
         j = _diag_cmd(['journalctl', f'UNIT={unit}', '--since', f'{_DIAG_TRAIL_DAYS} days ago',
                        '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
-        ev = [l for l in j.splitlines() if re.search(r'Started|Stopped|Stopping|Failed|exited|Killing|restart', l)]
+        ev = [l for l in j.splitlines() if re.search(r'Started|Stopped|Stopping|Failed|exited|restart', l)
+              and 'Killing process' not in l]
         out.append(f"{unit} start/stop, last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
         out.extend('  ' + l[:200] for l in ev[-15:])
     return out
