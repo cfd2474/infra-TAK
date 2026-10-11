@@ -23,7 +23,7 @@
 #     resets the moment the state changes.
 #   - sudo -n everywhere so a password prompt fails fast and is distinguishable.
 #
-# v10.2.10 (GH #99 — a split install restarted a HEALTHY production PostgreSQL five
+# v10.2.11 (GH #99 — a split install restarted a HEALTHY production PostgreSQL five
 # times, and logged "is down, restart FAILED" 1,540 times over two months, after the
 # operator restricted the shared SSH key to rsync for their own backups):
 #   - TCP failing from HERE is not proof the database is down. It is just as often this

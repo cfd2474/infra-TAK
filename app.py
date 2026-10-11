@@ -80771,7 +80771,7 @@ def _auto_update_guarddog():
             src = os.path.join(scripts_dir, name)
             if not os.path.isfile(src):
                 continue
-            # v10.2.10 (GH #99): the remote-DB scripts used to be skipped outright unless
+            # v10.2.11 (GH #99): the remote-DB scripts used to be skipped outright unless
             # settings said two_server. A split box whose settings do not (built by hand,
             # external_db, or changed since) kept the copy it was first deployed with — on
             # the field box the May script that restarted a healthy production PostgreSQL
