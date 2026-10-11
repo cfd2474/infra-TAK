@@ -4578,6 +4578,36 @@ def _run_update_recorded(ctx, inst=None):
             finish(name, slot, slot.get('log'), exc=exc)
 
 
+def _unfinished_update(ctx, inst, dirpath, prefix, target):
+    """Why a checkout already at `target` is not a finished update, or None.
+
+    ⚠️ **The checkout moves first and proves nothing.** Step 1 checks out the
+    new tag before Step 2 rebuilds, so an update killed mid-rebuild left a
+    VERSION file that read as installed, and every retry answered "nothing to
+    install" over containers still on the old release — or none at all (#114).
+
+    Two witnesses, either one enough to retry:
+      * the recorded commit, which deploy and Step 3 write only after the
+        containers are up. A checkout that moved past it never got there.
+      * the running container, when it answers. A different version is a
+        rebuild that did not take.
+
+    ⚠️ A container that does not answer is not on its own a reason. A
+    deployment an operator stopped on purpose would be started by an update
+    with nothing to install — and by Update All, on every stopped agency.
+    """
+    recorded = (ctx['load_settings']().get(f'{prefix}commit_sha') or '').strip()
+    head = _module_head(ctx, dirpath)
+    if recorded and head and not (head.startswith(recorded)
+                                  or recorded.startswith(head)):
+        return ('the last update did not finish (recorded commit %s, '
+                'checkout %s).' % (recorded[:12], head[:12]))
+    running = _running_version(ctx, inst)
+    if running and running != target:
+        return 'the running container still reports v%s.' % running
+    return None
+
+
 def _run_update(ctx, inst=None):
     """Fetch the newest release and rebuild in place. Data is never touched.
 
@@ -4640,11 +4670,18 @@ def _run_update(ctx, inst=None):
             slot.update({'running': False, 'complete': True, 'error': False})
             return
         if here and there and there == here:
-            plog('✓ Already on the newest release for the ' + channel +
-                 ' channel — nothing to install')
-            _reconcile_access(ctx, inst, plog)
-            slot.update({'running': False, 'complete': True, 'error': False})
-            return
+            unfinished = _unfinished_update(ctx, inst, dirpath, _prefix, target)
+            if not unfinished:
+                plog('✓ Already on the newest release for the ' + channel +
+                     ' channel — nothing to install')
+                _reconcile_access(ctx, inst, plog)
+                slot.update({'running': False, 'complete': True, 'error': False})
+                return
+            # ⚠️ The checkout says done and the box says otherwise. Run the
+            # whole update again: every step is idempotent, and anything less
+            # leaves a deployment the Update button can no longer repair (#114).
+            plog('⚠ The source is already at v' + target + ', but ' + unfinished)
+            plog('  Finishing the update that was interrupted.')
 
         tag = 'v' + target
         plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')

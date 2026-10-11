@@ -410,11 +410,16 @@ def runner(monkeypatch, tmp_path):
                                          'settings_prefix': 'atlas_',
                                          'compose_project': 'takmdm'})
 
-    def _run(installed, channel, offers):
+    def _run(installed, channel, offers, recorded=None, head=None, running=None):
         monkeypatch.setattr(atlas, '_installed_version', lambda c, i=None: installed)
         monkeypatch.setattr(atlas, '_latest_version',
                             lambda use_cache=True, channel=None: offers.get(channel))
-        ctx, _ = box({atlas.CHANNEL_KEY: channel})
+        monkeypatch.setattr(atlas, '_module_head', lambda c, d: head)
+        monkeypatch.setattr(atlas, '_running_version', lambda c=None, i=None: running)
+        settings = {atlas.CHANNEL_KEY: channel}
+        if recorded:
+            settings['atlas_commit_sha'] = recorded
+        ctx, _ = box(settings)
         slot = atlas._update_slot(None)
         slot.clear()
         atlas._run_update(ctx, None)
@@ -455,6 +460,61 @@ def test_a_deployment_level_with_its_channel_is_a_plain_no_op(runner):
     assert 'Already on the newest release' in log, log
     assert 'Refusing' not in log
     assert slot['error'] is False
+
+
+def test_a_finished_update_is_still_a_no_op(runner):
+    """Recorded commit, checkout and container all agree: nothing to do."""
+    slot = runner('1.89.2', 'dev', {'dev': '1.89.2'},
+                  recorded='a' * 40, head='a' * 40, running='1.89.2')
+
+    log = chr(10).join(slot['log'])
+    assert 'Already on the newest release' in log, log
+    assert 'interrupted' not in log
+
+
+def test_an_update_killed_after_the_checkout_is_finished_on_retry(runner):
+    """⚠️ #114. Step 1 moved the checkout, the rebuild was killed, and the
+    retry used to answer "nothing to install" because VERSION already read
+    the new release. The recorded commit is written only after the containers
+    are up, so a checkout past it is an update that never finished."""
+    slot = runner('1.89.2', 'dev', {'dev': '1.89.2'},
+                  recorded='a' * 40, head='b' * 40, running=None)
+
+    log = chr(10).join(slot['log'])
+    assert 'Already on the newest release' not in log, log
+    assert 'did not finish' in log, log
+    assert 'Fetching v1.89.2' in log, log
+
+
+def test_a_container_on_the_old_release_is_rebuilt(runner):
+    """The record agrees but the container does not: a rebuild that did not
+    take is retried rather than reported as current."""
+    slot = runner('1.89.2', 'dev', {'dev': '1.89.2'},
+                  recorded='a' * 40, head='a' * 40, running='1.89.1')
+
+    log = chr(10).join(slot['log'])
+    assert 'Already on the newest release' not in log, log
+    assert 'still reports v1.89.1' in log, log
+    assert 'Fetching v1.89.2' in log, log
+
+
+def test_a_stopped_but_finished_deployment_is_left_stopped(runner):
+    """⚠️ A container that does not answer is not on its own a reason to
+    rebuild. Update All would otherwise start every agency an operator had
+    stopped on purpose."""
+    slot = runner('1.89.2', 'dev', {'dev': '1.89.2'},
+                  recorded='a' * 40, head='a' * 40, running=None)
+
+    assert 'Already on the newest release' in chr(10).join(slot['log'])
+
+
+def test_a_short_recorded_commit_matches_its_full_checkout(runner):
+    """An abbreviated SHA is the same commit, not an unfinished update."""
+    slot = runner('1.89.2', 'dev', {'dev': '1.89.2'},
+                  recorded='abc123def456', head='abc123def456' + '0' * 28,
+                  running='1.89.2')
+
+    assert 'Already on the newest release' in chr(10).join(slot['log'])
 
 
 def test_a_box_on_dev_is_offered_the_dev_release(runner):
