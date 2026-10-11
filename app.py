@@ -9304,6 +9304,86 @@ def update_apply():
     except Exception as e:
         return _fail_release_lock({'success': False, 'error': str(e)[:200]})
 
+# Issue #113: the daily restart's idle gate — what counts as "busy".
+# A module record left `running` longer than this is a thread that died without
+# finishing, not work in flight; past it the record stops holding the restart off.
+_RESTART_GATE_RECORD_MAX_S = 3 * 3600
+
+
+def _console_busy_reason():
+    """Why the daily console restart must wait, or None when the console is idle.
+
+    The original gate only looked at app.py's own `*_status` globals. Module
+    files keep their job state in their own namespaces (the registry's _JOBS,
+    ATLAS's per-deployment update/removal slots, TVR's and the simulator's
+    status dicts), so a running ATLAS update read as idle and the 04:00 restart
+    killed its `docker compose up` mid-recreate (#113). Every module operation
+    gets the same look now, plus the persisted module-results record as a
+    backstop for anything that ran through _mod_result_start().
+    """
+    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
+    #    (20-min TTL), so it survives even if the worker handling it is wedged.
+    try:
+        _lock = '/var/lib/takwerx-console/update-now.lock'
+        if os.path.exists(_lock):
+            _age = int(time.time() - os.path.getmtime(_lock))
+            if _age < 1200:
+                return f'Update Now in progress (~{_age}s ago)'
+    except Exception:
+        pass
+    # 2) Any in-memory *_status dict reporting a running operation. Scanned
+    #    dynamically so new deploy-status globals are covered automatically.
+    try:
+        for _name, _val in list(globals().items()):
+            if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
+                return f'{_name} running'
+    except Exception:
+        pass
+    # 3) Module registry jobs (deploy / uninstall through modules/__init__.py).
+    try:
+        _jobs = mod_registry.running_jobs()
+        if _jobs:
+            return f"module {', '.join(sorted(_jobs))} running"
+    except Exception:
+        pass
+    # 4) Module files' own state, scanned the same way as (2): a `*_status` dict
+    #    that is running, or a `*_slots` dict holding one (ATLAS keeps one slot
+    #    per deployment for updates and another for removals).
+    try:
+        for _mname, _mod in list(_sys.modules.items()):
+            if not _mname.startswith('modules.') or _mod is None:
+                continue
+            for _name, _val in list(vars(_mod).items()):
+                if not isinstance(_val, dict):
+                    continue
+                if _name.endswith('_status') and _val.get('running'):
+                    return f"{_mname.split('.', 1)[1]} {_name} running"
+                if _name.endswith('_slots'):
+                    for _key, _slot in list(_val.items()):
+                        if isinstance(_slot, dict) and _slot.get('running'):
+                            return f"{_mname.split('.', 1)[1]} {_key} running"
+    except Exception:
+        pass
+    # 5) A module-results record still `running`. This process marked every
+    #    leftover one interrupted when it started, so a live one is in flight.
+    try:
+        _now = datetime.utcnow()
+        for _module, _m in sorted(_mod_results_load().items()):
+            _last = (_m or {}).get('last') or {}
+            if _last.get('outcome') != 'running':
+                continue
+            try:
+                _age = (_now - datetime.strptime(_last.get('started_at') or '',
+                                                 '%Y-%m-%dT%H:%M:%SZ')).total_seconds()
+            except ValueError:
+                continue   # never let a malformed record hold the restart off forever
+            if _age < _RESTART_GATE_RECORD_MAX_S:
+                return f"{_module} {_last.get('kind') or 'operation'} running"
+    except Exception:
+        pass
+    return None
+
+
 @app.route('/api/console/restart-safe')
 def console_restart_safe():
     """v0.9.44: localhost-only readiness probe for the daily console-restart
@@ -9317,28 +9397,7 @@ def console_restart_safe():
     if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
         return jsonify({'error': 'forbidden'}), 403
 
-    busy = None
-    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
-    #    (20-min TTL), so it survives even if the worker handling it is wedged.
-    try:
-        _lock = '/var/lib/takwerx-console/update-now.lock'
-        if os.path.exists(_lock):
-            _age = int(time.time() - os.path.getmtime(_lock))
-            if _age < 1200:
-                busy = f'Update Now in progress (~{_age}s ago)'
-    except Exception:
-        pass
-    # 2) Any in-memory *_status dict reporting a running operation. Scanned
-    #    dynamically so new deploy-status globals are covered automatically.
-    if busy is None:
-        try:
-            for _name, _val in list(globals().items()):
-                if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
-                    busy = f'{_name} running'
-                    break
-        except Exception:
-            pass
-
+    busy = _console_busy_reason()
     return jsonify({'safe': busy is None, 'reason': busy})
 
 
