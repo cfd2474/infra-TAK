@@ -26,6 +26,7 @@ Uses the real scripts from scripts/guarddog/.
 
 import os
 import pathlib
+import re
 from datetime import datetime
 
 import pytest
@@ -33,7 +34,8 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 DEPLOY_SRC = APP[APP.index('def run_guarddog_deploy(alert_email):'):APP.index("@app.route('/nodered')")]
-SYNC_SRC = APP[APP.index('def _sync_guarddog_remote_db_from_settings('):
+# From GUARDDOG_CONF_PATH: the sync writes guarddog.conf through _write_guarddog_conf() (#101).
+SYNC_SRC = APP[APP.index("GUARDDOG_CONF_PATH = '/opt/tak-guarddog/guarddog.conf'"):
                APP.index('def _remotedb_host_port_from_tak_settings(')]
 STARTUP_SRC = APP[APP.index('def _auto_update_guarddog():'):
                   APP.index('def _start_guarddog_background_at_boot(')]
@@ -76,7 +78,7 @@ def h(tmp_path, monkeypatch):
 
     log = []
     ns = {
-        'os': os, 'json': __import__('json'), 'datetime': datetime, 'BASE_DIR': str(REPO),
+        'os': os, 'json': __import__('json'), 're': re, 'datetime': datetime, 'BASE_DIR': str(REPO),
         'VERSION': '10.2.11-alpha', 'AUTHENTIK_VETTED_RELEASE': '2025.10',
         'guarddog_deploy_log': log, 'guarddog_deploy_status': {}, 'subprocess': _Proc,
         '_sudo_wrap': lambda a: a, '_makedirs_priv': lambda d: None,
