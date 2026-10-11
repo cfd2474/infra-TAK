@@ -48165,6 +48165,10 @@ def _netbird_complete_setup(settings, plog):
         if e.code == 412:
             pat = settings.get('netbird_pat') or ''
             plog('  ✓ Setup already completed (HTTP 412)')
+            if pat and not _netbird_pat_is_valid(pat):
+                settings.pop('netbird_pat', None)
+                save_settings(settings)
+                pat = ''
             return pat or '__already_done__'
         err = ''
         try:
@@ -48450,10 +48454,15 @@ def _run_netbird_deploy(settings):
         authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
         auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
-        setup_pat = not settings.get('netbird_pat')
+        # Always allow the setup PAT during bootstrap (#72). Keying this off "no PAT in
+        # settings" broke every redeploy that still carried an old PAT (an uninstall that
+        # never reached its settings cleanup, a hand-removed ~/netbird): the fresh store's
+        # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
+        # registered, and the deploy still reported success. The flag only matters while
+        # setup is required, and Step 5 rewrites the compose without it.
         _nb_target_srv, _ = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
-        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat, store_key=nb_store_key)
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
 
         plog('  Pulling images...')
@@ -48466,6 +48475,11 @@ def _run_netbird_deploy(settings):
         plog('')
         plog('━━━ Step 4/6: Initial Setup (akadmin) ━━━')
         pat = _netbird_complete_setup(settings, plog)
+        if pat is None:
+            # No owner means nobody can sign in, and no PAT means Authentik can't be
+            # registered. Stop here instead of reporting success over a dead login (#72).
+            raise RuntimeError('NetBird owner setup failed (see the line above), so there is no '
+                               'account to sign in to. Fix the cause and press Deploy again.')
 
         plog('')
         plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
@@ -48474,7 +48488,10 @@ def _run_netbird_deploy(settings):
         plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
         pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
         if pat:
-            _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
+            if not _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
+                raise RuntimeError('Authentik could not be registered as the NetBird login provider '
+                                   '(see the line above), so the Authentik button would be missing. '
+                                   'Press Deploy again once the cause is fixed.')
         else:
             plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
 
