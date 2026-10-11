@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.10-alpha)**
+**Current release: [v10.2.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.11-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.11-alpha — 2026-10-11 — Guard Dog fixes for split installs and busy hosts; snapshot Restore brings back a missing TAK database
+
+**Headline: Guard Dog's remote-database check only restarts PostgreSQL when it is really down (at most 3 times a day), split installs keep their database settings, Guard Dog stops restarting Authentik on an overloaded host, snapshot Restore can rebuild a missing TAK database, and module updates are no longer cut off by the daily console restart ([#99](https://github.com/takwerx/infra-TAK/issues/99), [#101](https://github.com/takwerx/infra-TAK/issues/101), [#106](https://github.com/takwerx/infra-TAK/issues/106), [#111](https://github.com/takwerx/infra-TAK/issues/111), [#113](https://github.com/takwerx/infra-TAK/issues/113), [#114](https://github.com/takwerx/infra-TAK/issues/114), [#117](https://github.com/takwerx/infra-TAK/issues/117)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.11-alpha))
+
+**Split (two-server) installs.** Guard Dog's remote-database check now restarts PostgreSQL only when the database server itself confirms it isn't responding, and at most 3 times in 24 hours. If it can't ask, it alerts instead of restarting. Update Now now refreshes the remote-database scripts on every split box, not only on boxes whose settings say two-server. `guarddog.conf` always carries the database topology (read from TAK Server's own CoreConfig when the settings don't say), and its other keys are no longer dropped when it's rewritten. Guard Dog no longer rewrites unchanged scripts on every start or update, and the update log shows what really changed.
+
+**Authentik on a busy host.** When the host is CPU-starved but Authentik is still answering, Guard Dog holds and alerts once an hour instead of restarting it over and over. Restarts back off (15 → 30 → 60 → 120 min), and the first one restarts only the Authentik server and worker. An old Authentik scheduler patch from an earlier 2026.5.x image no longer stays mounted after an upgrade and undoes the new version's fixes.
+
+**TAK Server database.** Snapshot **Restore** now recreates a missing `cot` database and `martiuser` role, applies the 5.8 schema to an older snapshot, and reports a failed restore as failed instead of "complete". The TAK 5.8 update gets past an apt hold on `takserver`, and if nothing was installed it starts TAK again instead of leaving it down. Help → Diagnostics now shows the TAK database state, recent package changes, and update runs that were cut off.
+
+**Module updates.** The daily console restart now waits for running module updates, deploys and removals (for example an ATLAS update). An ATLAS update that was interrupted mid-rebuild now finishes on the next try instead of saying it's already installed.
+
+**Upgrade note.** Update the console. Boxes that still carry the old Authentik scheduler patch get one Authentik server + worker restart on first start. Split boxes get the new remote-database check automatically.
 
 ### v10.2.10-alpha — 2026-10-10 — OS updates and Caddy work again while Caddy's apt repo is down; retention guard keeps mission content
 
