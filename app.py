@@ -9361,7 +9361,7 @@ def _console_busy_reason():
                 if _name.endswith('_slots'):
                     for _key, _slot in list(_val.items()):
                         if isinstance(_slot, dict) and _slot.get('running'):
-                            return f"{_mname.split('.', 1)[1]} {_key} running"
+                            return f"{_mname.split('.', 1)[1]} {_name}[{_key}] running"
     except Exception:
         pass
     # 5) A module-results record still `running`. This process marked every

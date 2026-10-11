@@ -81,13 +81,12 @@ def test_idle_console_is_safe_to_restart(h):
 def test_atlas_update_in_flight_defers_the_restart(h):
     # The #113 case: an ATLAS update, which only ever touched modules/atlas.py.
     atlas._update_slot(None)['running'] = True
-    reason = h['_console_busy_reason']()
-    assert reason and 'atlas' in reason
+    assert h['_console_busy_reason']() == 'atlas _update_slots[atlas] running'
 
 
 def test_atlas_removal_in_flight_defers_the_restart(h):
     atlas._removal_slot(None)['running'] = True
-    assert h['_console_busy_reason']()
+    assert h['_console_busy_reason']() == 'atlas _removal_slots[atlas] running'
 
 
 def test_atlas_update_all_defers_the_restart(h):
