@@ -51105,6 +51105,27 @@ def authentik_control():
             if _env_changed:
                 _pin_orig['env_prev'] = _env_prev
             _ensure_authentik_compose_patches(cp)
+            # GH #111 follow-up: the scheduler-typo broker.py patch is a copy of the OLD
+            # image's file — left mounted, the new image boots with the old broker.py and
+            # loses whatever upstream fixed there. Drop the mount so the new image runs its
+            # own file; the converge kicked after success re-patches only if it still needs it.
+            # On failure _restore_pin() writes the pre-update compose (mount included) back.
+            try:
+                import yaml as _yaml
+                try:
+                    with open(cp) as _f:
+                        _bc = _f.read()
+                except Exception:
+                    _bc = _read_priv(cp)
+                _nb = _ak_compose_without_broker_patch(_bc, _yaml) if _bc else None
+                if _nb:
+                    if _pin_orig['compose'] is None:
+                        _pin_orig['compose'] = _bc
+                    _write_priv(cp, _nb)
+                    _pin_orig['compose_changed'] = True
+                    _mod_result_step('authentik', 'drop the scheduler patch cut from the old image')
+            except ImportError:
+                pass
             # (c) VERIFY before pulling anything, with Compose's own verification command.
             _mod_result_step('authentik', 'verify with docker compose config')
             _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
@@ -51165,6 +51186,10 @@ def authentik_control():
                                          f'v{_run_tag}, expected v{latest}. Images were NOT '
                                          f'pruned.'}), 500
             _run_priv_chain([['docker', 'image', 'prune', '-f']], 'and', timeout=120, cwd=ak_dir)
+            # Re-run the idle-load converge against the NEW image (scheduler patch only if
+            # this image still carries the typo). Background: it waits for the server.
+            threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
+                             name='authentik-idle-load-converge-post-update').start()
             return jsonify({'success': True, 'running': True, 'action': action,
                             'version': _run_tag})
         except Exception as _e:
@@ -83170,6 +83195,63 @@ _AK_BROKER_TYPO_LINE = 'self.schedule_last_run = timezone.now()'
 _AK_BROKER_FIXED_LINE = 'self.scheduler_last_run = timezone.now()'
 _AK_EVENTS_BP_CONTAINER_PATH = '/blueprints/default/events-default.yaml'
 
+
+# GH #111 follow-up: the patched broker.py is a copy of ONE image's file with one line
+# fixed. Mounted over any other image it silently swaps that image's broker.py for an
+# older one. The pre-fix converge kept the mount whenever compose had it and the file
+# existed, and Update never touched it — so every box that took the scheduler patch on an
+# earlier 2026.5.x kept serving that Aug-3 file after updating to 2026.5.7 (test8, 2026-10-11:
+# 5.7's chunked task-expiry cleanup reverted to the one-shot DELETE it replaced; 5.7 no
+# longer carries the typo at all). So the patch file is now named after the image ID it
+# was cut from: a different image means a different expected mount, and the converge
+# re-derives (or retires) it instead of trusting what is already there.
+def _ak_broker_patch_name(image_id):
+    """`broker-<12 hex>.py` for a `sha256:<hex>` image ID, '' when the ID is not one.
+    The name lands in a compose bind-mount spec and a host path, so only hex gets in."""
+    m = re.match(r'^sha256:([0-9a-f]{12})[0-9a-f]*$', (image_id or '').strip())
+    return f'broker-{m.group(1)}.py' if m else ''
+
+
+def _ak_image_broker_source(image_ref):
+    """Read broker.py from the IMAGE, never from the running container: while our mount
+    is live the container shows our own patched file, not upstream's.
+    Returns (state, text) — state is 'typo', 'clean', 'missing' or 'error'."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--network', 'none',
+                                       '--entrypoint', 'cat', image_ref, _AK_BROKER_CONTAINER_PATH]),
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return 'error', str(e)[:200]
+    if r.returncode == 0 and r.stdout:
+        return ('typo' if _AK_BROKER_TYPO_LINE in r.stdout else 'clean'), r.stdout
+    if r.returncode == 1 and 'No such file' in (r.stderr or ''):
+        return 'missing', ''
+    return 'error', ((r.stderr or r.stdout) or '')[-200:]
+
+
+def _ak_compose_without_broker_patch(text, yaml_mod):
+    """Compose text with the broker.py patch mount removed from every service, or None
+    when there is none (or the text does not parse). Used by Update so the NEW image
+    boots its own broker.py; the converge re-patches it only if it still needs it."""
+    try:
+        data = yaml_mod.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('services'), dict):
+        return None
+    changed = False
+    for _svc in data['services'].values():
+        if not isinstance(_svc, dict) or not isinstance(_svc.get('volumes'), list):
+            continue
+        _keep = [v for v in _svc['volumes'] if _AK_BROKER_CONTAINER_PATH not in str(v)]
+        if len(_keep) != len(_svc['volumes']):
+            _svc['volumes'] = _keep
+            changed = True
+    if not changed:
+        return None
+    return yaml_mod.safe_dump(data, default_flow_style=False, sort_keys=False,
+                              allow_unicode=True, width=200)
+
 # Valid EMPTY blueprint — masks upstream events-default.yaml so the stock
 # default-notify-* rules are never recreated. Must parse as a blueprint
 # (version/metadata/entries); a zero-byte file fails validation and the
@@ -83229,22 +83311,25 @@ def _startup_authentik_idle_load_converge(log=None):
         with _AK_IDLE_CONVERGE_LOCK:
 
             patches_dir = os.path.join(ak_dir, 'patches')
-            broker_patch_path = os.path.join(patches_dir, 'broker.py')
 
             # The worker container tells us which image the box actually runs (the
             # compose tag alone can lie if the operator never pulled). At whole-box
             # boot Authentik may still be starting — retry briefly, then proceed
             # with what we can do without it.
-            img = ''
+            img, img_id = '', ''
             for _attempt in range(4):
-                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}',
                                                'authentik-worker-1']),
                                    capture_output=True, text=True, timeout=20)
                 if r.returncode == 0 and (r.stdout or '').strip():
-                    img = r.stdout.strip()
+                    img, _, img_id = r.stdout.strip().partition(' ')
                     break
                 time.sleep(30)
             tag = img.rsplit(':', 1)[-1] if ':' in img else ''
+            # The patch is tied to the image it was cut from (see _ak_broker_patch_name).
+            broker_patch_name = _ak_broker_patch_name(img_id)
+            broker_patch_path = os.path.join(patches_dir, broker_patch_name or 'broker.py')
+            broker_mount = f'./patches/{broker_patch_name}:{_AK_BROKER_CONTAINER_PATH}:ro'
 
             with open(compose_path) as f:
                 compose_data = _yaml.safe_load(f.read())
@@ -83254,6 +83339,8 @@ def _startup_authentik_idle_load_converge(log=None):
             services = compose_data.setdefault('services', {})
             worker_vols = (services.get('worker') or {}).get('volumes') or []
             broker_mounted = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in worker_vols)
+            broker_current = (bool(broker_patch_name) and broker_mount in [str(v) for v in worker_vols]
+                              and os.path.exists(broker_patch_path))
 
             # ── W1: decide desired broker.py mount state (True/False/None=leave alone) ──
             broker_desired = None
@@ -83263,40 +83350,42 @@ def _startup_authentik_idle_load_converge(log=None):
                 broker_desired = False
                 if broker_mounted:
                     _l(f'W1: image tag {tag or img} is outside 2026.5.x — retiring the scheduler patch mount')
-            elif broker_mounted and os.path.exists(broker_patch_path):
-                broker_desired = True  # already applied; canary below verifies it landed
+            elif broker_current:
+                broker_desired = True  # cut from THIS image; canary below verifies it landed
+            elif not broker_patch_name:
+                # No usable image ID → cannot tie a patch to an image. A mount we cannot
+                # prove belongs to this image is retired: a stale broker.py reverts
+                # upstream fixes, while the typo it fixes only costs CPU.
+                broker_desired = False
+                _l(f'W1: worker image ID unreadable ({img_id or "empty"}) — '
+                   f'{"retiring" if broker_mounted else "not applying"} the scheduler patch')
             else:
-                # Mount not yet active, so the container view of broker.py is the
-                # image's own file — grep it for the upstream typo.
-                g = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
-                                               _AK_BROKER_TYPO_LINE, _AK_BROKER_CONTAINER_PATH]),
-                                   capture_output=True, text=True, timeout=30)
-                if g.returncode == 0:
-                    c = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'cat',
-                                                   _AK_BROKER_CONTAINER_PATH]),
-                                       capture_output=True, text=True, timeout=30)
-                    src = c.stdout or ''
-                    if c.returncode == 0 and _AK_BROKER_TYPO_LINE in src:
-                        patched = src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE)
-                        os.makedirs(patches_dir, exist_ok=True)
-                        with open(broker_patch_path, 'w') as f:
-                            f.write(patched)
-                        os.chmod(broker_patch_path, 0o644)
-                        broker_desired = True
-                        _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched broker.py '
-                           f'written (schedule_last_run → scheduler_last_run)')
-                    else:
-                        _l('W1: could not extract broker.py from the worker — leaving unchanged this boot')
-                elif g.returncode == 1:
+                # Mount absent, or cut from a different image (an Update, or a pre-#111
+                # `patches/broker.py` with no image recorded). Ask the image itself.
+                state, src = _ak_image_broker_source(img_id)
+                if state == 'typo':
+                    os.makedirs(patches_dir, exist_ok=True)
+                    with open(broker_patch_path, 'w') as f:
+                        f.write(src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE))
+                    os.chmod(broker_patch_path, 0o644)
+                    broker_desired = True
+                    _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched {broker_patch_name} '
+                       f'written (schedule_last_run → scheduler_last_run)'
+                       + (' — replaces a patch cut from another image' if broker_mounted else ''))
+                elif state == 'clean':
                     broker_desired = False
-                    _l(f'W1: {img} does not carry the scheduler typo — patch not needed')
-                else:
-                    # grep rc 2 = path missing (unknown layout) → per plan, do not patch.
+                    _l(f'W1: {img} does not carry the scheduler typo — '
+                       + ('retiring the patch cut from an older image (it was overriding this '
+                          "image's own broker.py)" if broker_mounted else 'patch not needed'))
+                elif state == 'missing':
                     broker_desired = False
                     _l(f'W1: broker.py not found at the known path in {img} (unknown layout) — not patching')
+                else:
+                    broker_desired = False if broker_mounted else None
+                    _l(f'W1: could not read broker.py from image {img} ({src.strip()[:120]}) — '
+                       + ('retiring the unverified patch mount' if broker_mounted else 'leaving unchanged this boot'))
 
             # ── Mutate compose volumes: W1 broker mount (tri-state) + W2 mask (always) ──
-            broker_mount = f'./patches/broker.py:{_AK_BROKER_CONTAINER_PATH}:ro'
             events_mount = f'./patches/events-default.yaml:{_AK_EVENTS_BP_CONTAINER_PATH}:ro'
 
             # W2 mask file — write/refresh before it is ever mounted.
@@ -83328,10 +83417,13 @@ def _startup_authentik_idle_load_converge(log=None):
                     compose_changed = True
                     _l(f'W2: added events-default.yaml mask mount to {_svc_name}')
                 _has_broker = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _vols)
-                if broker_desired is True and not _has_broker:
-                    _vols.append(broker_mount)
+                if broker_desired is True and broker_mount not in [str(v) for v in _vols]:
+                    # Swap, not add: a mount cut from another image goes in the same move,
+                    # so the recreate below lands exactly one broker.py.
+                    _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
+                    _svc['volumes'].append(broker_mount)
                     compose_changed = True
-                    _l(f'W1: added broker.py patch mount to {_svc_name}')
+                    _l(f'W1: {"replaced" if _has_broker else "added"} broker.py patch mount on {_svc_name}')
                 elif broker_desired is False and _has_broker:
                     _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
                     compose_changed = True
