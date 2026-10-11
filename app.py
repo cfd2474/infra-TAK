@@ -42239,16 +42239,19 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # it is re-applied after every clone/git-checkout, like the port patches.
             if _host_arch() == 'arm64':
                 _ct = _re.sub(r'(image:\s*)postgis/postgis:', r'\g<1>imresamu/postgis:', _ct)
-                # tiles (pmtiles) won't run on arm64: its @mapbox/vtquery@0.6.0
-                # native addon has no arm64 build and only compiles via the
-                # deprecated mason toolchain (amd64-only C++ deps). Stop the
-                # crash-loop — restart 'always' → 'no' so it exits once and stays
-                # quiet. pmtiles generation is unavailable on arm64 (non-core; the
-                # map + all other CloudTAK features work). Targets the tiles
-                # service uniquely via its dockerfile path.
-                _ct = _re.sub(
-                    r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)'?always'?",
-                    r"\g<1>'no'", _ct, count=1)
+                # tiles (pmtiles) on arm64: @mapbox/vtquery@0.6.0's arm64 prebuilt is
+                # glibc-only, so tiles runs only once _patch_cloudtak_tiles_arm64() has
+                # moved its build off Alpine. While the Dockerfile is still Alpine (the
+                # image on the box was built from it), the container crash-loops —
+                # restart 'always' → 'no' so it exits once and stays quiet. Once it
+                # builds on glibc, put 'always' back so tiles comes back after a reboot
+                # like every other service. Targets the tiles service uniquely via its
+                # dockerfile path.
+                _tiles_rs = r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)"
+                if _cloudtak_tiles_builds_on_alpine(cloudtak_dir):
+                    _ct = _re.sub(_tiles_rs + r"'?always'?", r"\g<1>'no'", _ct, count=1)
+                else:
+                    _ct = _re.sub(_tiles_rs + r"'no'", r"\g<1>'always'", _ct, count=1)
 
             if _ct != _orig:
                 with open(_path, 'w') as f:
@@ -42258,6 +42261,50 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             pass
         break  # only patch the first matching file
     return changed
+
+
+_CLOUDTAK_TILES_DOCKERFILE = os.path.join('tasks', 'pmtiles', 'Dockerfile.compose')
+
+
+def _cloudtak_tiles_builds_on_alpine(cloudtak_dir):
+    """True while CloudTAK's tiles Dockerfile still builds FROM a node Alpine image.
+    An unreadable or missing file counts as Alpine, so the arm64 restart gate stays on."""
+    try:
+        with open(os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)) as f:
+            return bool(re.search(r'(?m)^FROM\s+node:\S*alpine', f.read()))
+    except OSError:
+        return True
+
+
+def _patch_cloudtak_tiles_arm64(cloudtak_dir=None):
+    """arm64 only: build CloudTAK's tiles service (tasks/pmtiles) on a glibc Node image.
+
+    Upstream builds tiles FROM node:*-alpine (musl). Its native dep @mapbox/vtquery has
+    no musl-arm64 prebuilt; node-pre-gyp pulls the glibc one, which fails to load
+    ("__libc_single_threaded: symbol not found") and tiles exits 1. Debian bookworm-slim
+    is glibc, so the same prebuilt loads. x86 stays on Alpine (works there).
+
+    The Dockerfile is tracked, so every checkout puts Alpine back: call this after each
+    one, before the build and before _patch_cloudtak_compose_ports() (which reads the
+    result to decide tiles' restart policy). Until v10.2.12 only Deploy did, so the first
+    CloudTAK Update rebuilt tiles on Alpine and it stayed down on every arm64 box.
+    Returns True if the file changed."""
+    if _host_arch() != 'arm64':
+        return False
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    path = os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        cur = f.read()
+    new = re.sub(r'(?m)^FROM\s+node:([\w.\-]+)-alpine[\w.\-]*',
+                 r'FROM node:\1-bookworm-slim', cur, count=1)
+    if new == cur:
+        return False
+    with open(path, 'w') as f:
+        f.write(new)
+    return True
 
 
 def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
@@ -42965,6 +43012,11 @@ def run_cloudtak_deploy(cfg=None):
             if not _cloudtak_store_image_status(cloudtak_dir, log=plog)[0]:
                 # the pin is unfetchable: use an image the operator built, if there is one
                 _cloudtak_adopt_local_store_image(cloudtak_dir, log=plog)
+            try:
+                if _patch_cloudtak_tiles_arm64(cloudtak_dir):
+                    plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -42990,27 +43042,6 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"  API URL: {api_url}")
         if media_url:
             plog(f"  Media URL: {media_url} (CloudTAK media container — port 9997 hardcoded in source)")
-
-        # v10.0.1 arm64: CloudTAK's tiles task (tasks/pmtiles) builds FROM node:*-alpine
-        # (musl libc), but its native dep @mapbox/vtquery has NO musl-arm64 prebuilt — the
-        # glibc prebuilt it pulls fails to load at runtime ("__libc_single_threaded: symbol
-        # not found"), crashing cloudtak-tiles on arm64. Swap the tiles base to a glibc
-        # (Debian bookworm) Node image on arm64 so the prebuilt resolves. x86 stays on Alpine
-        # (works there). Re-applied on every deploy so it survives a CloudTAK source refresh.
-        try:
-            if (os.uname().machine or '').lower() in ('aarch64', 'arm64'):
-                _tiles_df = os.path.join(cloudtak_dir, 'tasks', 'pmtiles', 'Dockerfile.compose')
-                if os.path.isfile(_tiles_df):
-                    with open(_tiles_df) as _f:
-                        _dfc = _f.read()
-                    _newdf = re.sub(r'(?m)^FROM\s+node:([\w.\-]+)-alpine[\w.\-]*',
-                                    r'FROM node:\1-bookworm-slim', _dfc, count=1)
-                    if _newdf != _dfc:
-                        with open(_tiles_df, 'w') as _f:
-                            _f.write(_newdf)
-                        plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
-        except Exception as _te:
-            plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
 
         # Step 4: Build Docker images (stream output, 90 min timeout with retry + recovery)
         plog("")
@@ -44043,6 +44074,11 @@ def run_cloudtak_update():
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
         else:
+            try:
+                if _patch_cloudtak_tiles_arm64(cloudtak_dir):
+                    plog("  arm64: re-applied tiles Dockerfile base alpine→bookworm-slim after checkout")
+            except Exception as _te:
+                plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
             try:
                 _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
