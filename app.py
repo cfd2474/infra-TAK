@@ -48196,18 +48196,40 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
     }).encode()
 
     idp_redirect = None
+    # NetBird accepts a second POST with the same name, and every one is another
+    # "Authentik" button on the login page — so a redeploy updates the existing entry
+    # instead (#72). Extra entries from earlier redeploys are left alone: a dex user
+    # id embeds its connector id, so deleting one would orphan whoever signed in with it.
+    existing = None
     try:
-        resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
-        body = json.loads(resp.read().decode())
+        resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
+        idps = json.loads(resp.read().decode())
+        items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
+        existing = next((i for i in items if 'authentik' in (i.get('name') or '').lower() and i.get('id')), None)
+    except Exception:
+        pass
+    try:
+        if existing:
+            resp = _netbird_mgmt_request(f"/api/identity-providers/{existing['id']}", method='PUT',
+                                         data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik external OIDC IDP already registered — updated in place')
+        else:
+            resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik registered as external OIDC IDP')
         idp_redirect = body.get('redirect_uri') or body.get('redirectURL') or body.get('redirect_url')
-        plog('  ✓ Authentik registered as external OIDC IDP')
     except urllib.error.HTTPError as e:
         err_body = ''
         try:
             err_body = e.read().decode()[:300]
         except Exception:
             pass
-        if e.code in (400, 409, 422):
+        if existing:
+            # It is registered and the login button works; only the refresh failed.
+            plog(f'  ⚠ Authentik IDP already registered; update failed HTTP {e.code}: {err_body[:200]}')
+            idp_redirect = existing.get('redirect_uri') or existing.get('redirectURL')
+        elif e.code in (400, 409, 422):
             plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
             try:
                 resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)

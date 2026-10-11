@@ -174,6 +174,43 @@ def test_already_set_up_box_with_valid_pat_redeploys(tmp_path, monkeypatch):
     assert status['complete'] and not status['error'], status['log']
 
 
+def _register(idps, put_error=None):
+    src = next(ast.get_source_segment(APP, n) for n in ast.parse(APP).body
+               if isinstance(n, ast.FunctionDef) and n.name == '_netbird_register_authentik_idp')
+    calls = []
+
+    def mgmt(path, method='GET', data=None, token=None, timeout=15):
+        calls.append((method, path))
+        if method == 'GET':
+            return io.BytesIO(json.dumps(idps).encode())
+        if method == 'PUT' and put_error:
+            raise urllib.error.HTTPError(path, put_error, 'boom', {}, io.BytesIO(b'{}'))
+        return io.BytesIO(json.dumps({'id': 'new', 'name': 'Authentik'}).encode())
+
+    ns = {'json': json, '_netbird_mgmt_request': mgmt,
+          '_get_service_domain': lambda s, name: 'netbird.example.com',
+          '_netbird_patch_authentik_idp_redirect': lambda *a, **k: None}
+    exec(compile(src, 'app.py', 'exec'), ns)
+    ok = ns['_netbird_register_authentik_idp']('pat', 'https://ak/application/o/netbird/', 'cid', 'sec', {}, lambda m: None)
+    return ok, [c for c in calls if c[0] != 'GET']
+
+
+def test_redeploy_updates_authentik_idp_instead_of_adding_another():
+    """Each POST is another Authentik button on the login page (a redeploy-tested box reached 3 connectors)."""
+    ok, writes = _register([{'id': 'idp1', 'name': 'Authentik', 'type': 'oidc'}])
+    assert ok and writes == [('PUT', '/api/identity-providers/idp1')]
+
+
+def test_first_deploy_creates_authentik_idp():
+    ok, writes = _register([])
+    assert ok and writes == [('POST', '/api/identity-providers')]
+
+
+def test_failed_update_of_existing_idp_is_not_a_failed_deploy():
+    ok, writes = _register([{'id': 'idp1', 'name': 'Authentik'}], put_error=500)
+    assert ok and writes == [('PUT', '/api/identity-providers/idp1')]
+
+
 def test_already_set_up_box_with_lost_pat_still_redeploys(tmp_path, monkeypatch):
     """A working install whose PAT was lost keeps its earlier Authentik registration; a redeploy
     must not be turned into a failure (nothing to register with, nothing broken)."""
