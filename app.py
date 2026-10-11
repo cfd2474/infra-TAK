@@ -8165,7 +8165,9 @@ def _diag_section_takserver(settings):
         out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
     for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
                        ('auth', ('default', 'x509groups', 'x509useGroupCache')),
-                       ('connector', ('port', 'clientAuth', '_name'))):
+                       ('connector', ('port', 'clientAuth', '_name')),
+                       # v10.2.11: where TAK looks for its database and as whom (never the password)
+                       ('connection', ('url', 'username'))):
         for el in re.findall(rf'<{tag}\b[^>]*>', cc):
             out.append(f"<{tag}> " + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el) if a in attrs))
     for el in re.findall(r'<input\b[^>]*>', cc):
@@ -8228,22 +8230,275 @@ def _diag_tak_update_history(tail=150):
     """v10.2.2 W9: recent TAK Server update runs + the log of the latest that did not
     succeed (recorded by _tak_update_job; redacted with the rest of the report)."""
     out = []
-    if upgrade_status.get('running') or tak58_status.get('running'):
-        out.append('TAK Server update: one is RUNNING right now — its log is recorded when it ends')
+    live = upgrade_status.get('running') or tak58_status.get('running')
+    if live:
+        out.append('TAK Server update: one is RUNNING right now — its log so far is below')
     hist = _tak_update_history()
     if not hist:
         out.append('TAK Server updates recorded by this console: none (recording began in v10.2.2)')
         return out
-    out.append('TAK Server updates recorded by this console (newest first):')
+    # 'running' is a checkpoint (v10.2.11). Only the newest can still be live; any other —
+    # or the newest when no worker is running — was cut off mid-run.
+    for i, h in enumerate(hist):
+        if h.get('result') == 'running' and not (live and i == 0):
+            h['result'] = 'INTERRUPTED (the console stopped mid-run; last checkpoint shown)'
+    out.append('TAK Server updates recorded by this console (newest first; time = end, or last checkpoint):')
     for h in hist:
         out.append(f"  {h.get('finished', '?')}  {h.get('result', '?')}  {h.get('kind', '?')}  "
-                   f"{h.get('package') or '-'}  ({h.get('seconds', '?')} s)")
+                   f"{h.get('package') or '-'}  (started {h.get('started', '?')}, {h.get('seconds', '?')} s)")
     bad = next((h for h in hist if h.get('result') != 'ok'), None)
     if bad:
         lines = bad.get('lines') or []
-        out.append(f"log of the latest update that did not succeed ({bad.get('finished')}, "
+        out.append(f"log of the latest update that did not succeed or is still running ({bad.get('finished')}, "
                    f"{bad.get('kind')}), last {min(len(lines), tail)} of {bad.get('total_lines', len(lines))} lines:")
         out.extend('    ' + str(l)[:300] for l in lines[-tail:])
+    return out
+
+
+# ── v10.2.11 (ops #9): enough to say HOW a TAK database broke, from the report alone ──
+# lutak2.net (GH #105/#106) sent a report showing TAK 5.8 installed, "database cot does not
+# exist" and martiuser failing to log in — and nothing that said which PostgreSQL clusters
+# exist, what installed 5.8 and when, or whether the data is still on disk. Every answer
+# started "please run pg_lsclusters…". These two sections are those questions.
+_DIAG_PKG_RE = re.compile(r'takserver|postgres|postgis|openjdk', re.I)
+_DIAG_TRAIL_DAYS = 30
+
+
+def _diag_log_lines(path, max_bytes=_DIAG_TAIL_BYTES):
+    """Tail of a log as lines: a direct read, else (under a log or PostgreSQL directory the
+    broker may read) a privileged one. None when neither works."""
+    lines = _diag_tail(path, max_bytes)
+    if lines is None and path.startswith(('/var/log/', '/var/lib/postgresql/', '/var/lib/pgsql/')):
+        try:
+            txt = _read_own_or_priv(path)
+            lines = txt.splitlines()[-20000:] if txt is not None else None   # '' = an empty log
+        except Exception:
+            lines = None
+    return lines
+
+
+def _diag_rotated_lines(path, keep=2):
+    """A log and its rotated copies (path.1, path.2.gz, …), oldest first; unreadable ones skipped."""
+    import gzip
+    out = []
+    for i in range(keep, 0, -1):
+        for p in (f'{path}.{i}', f'{path}.{i}.gz'):
+            try:
+                with (gzip.open(p, 'rb') if p.endswith('.gz') else open(p, 'rb')) as f:
+                    out.extend(f.read(8 * 1024 * 1024).decode('utf-8', 'replace').splitlines())
+            except OSError:
+                pass
+    return out + (_diag_log_lines(path) or [])
+
+
+def _diag_pg_overview(port=None):
+    """Version, port, data directory, databases (with size) and login roles of a local
+    cluster. Fixed, console-authored SQL only (see _pg_exec's security invariant)."""
+    sql = ("SELECT 'server '||current_setting('server_version')||'  port '||current_setting('port')"
+           "||'  data '||current_setting('data_directory') "
+           "UNION ALL SELECT 'database '||datname||'  '||pg_size_pretty(pg_database_size(datname)) "
+           "FROM pg_database WHERE NOT datistemplate "
+           "UNION ALL SELECT 'login roles: '||coalesce(string_agg(rolname, ', ' ORDER BY rolname), '(none)') "
+           "FROM pg_roles WHERE rolcanlogin")
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'postgres'] + (['-p', str(port)] if port else []) + ['-c', sql],
+                     timeout=20)
+    except Exception as e:
+        return [f'  (could not query: {str(e)[:160]})']
+    if r.returncode != 0:
+        return ['  (could not query: %s)' % ((r.stderr or '').strip()[:160] or 'exit %s' % r.returncode)]
+    return ['  ' + l for l in (r.stdout or '').splitlines() if l.strip()]
+
+
+def _diag_pg_log(path):
+    """FATAL/ERROR/start/stop lines of a PostgreSQL server log, repeats counted."""
+    lines = _diag_log_lines(path, 1024 * 1024)
+    if lines is None:
+        return [f"  {path}: missing, or not readable by the console on this box"]
+    hits = [l for l in lines if re.search(r'FATAL|PANIC|ERROR|starting PostgreSQL|shutting down|'
+                                          r'database system (is ready|was shut down|was interrupted)|'
+                                          r'received \w+ shutdown', l)]
+    groups = {}
+    for l in hits:
+        msg = re.sub(r'^\S+ \S+ \S+ \[\d+\]\s*(\S+@\S+\s+)?', '', l)[:160]
+        groups[msg] = groups.get(msg, 0) + 1
+    out = [f"  {path}: {len(hits)} error/start/stop line(s) in the recent tail"]
+    out.extend(f"    {n:>6} x {m}" for m, n in sorted(groups.items(), key=lambda kv: -kv[1])[:10])
+    if hits:
+        out.append('    newest:')
+        out.extend('      ' + l[:240] for l in hits[-8:])
+    return out
+
+
+def _diag_section_tak_database(settings):
+    if not os.path.exists('/opt/tak') and not _tak_is_container():
+        return ['TAK Server not installed on this box']
+    out = []
+    deb = bool(shutil.which('dpkg-query'))
+    if deb:
+        pk = _diag_cmd(['dpkg-query', '-W', '-f=${db:Status-Abbrev} ${Package} ${Version}\n',
+                        'takserver*', 'postgresql*', 'postgis*'], priv=False)
+        # Status 'ii' = installed; 'iU'/'iF'/'iH' = unpacked or half-configured — an install
+        # that did not finish, which the next apt run will try to complete.
+        rows = [l for l in pk.splitlines() if l.strip() and not l.startswith(('un ', 'dpkg-query:'))]
+    else:
+        rows = _diag_cmd(['rpm', '-qa', '--last', 'takserver*', 'postgresql*', 'postgis*'], priv=False).splitlines()
+    out.append('packages (takserver / postgresql / postgis):' + ('' if rows else ' none found'))
+    out.extend('  ' + l.strip()[:160] for l in rows[:40])
+    mode = _get_tak_deployment_config(settings).get('mode')
+    units = []
+    if mode in ('two_server', 'external_db'):
+        out.append(f"PostgreSQL: the TAK database is not on this box ({mode}) — clusters not listed")
+    elif _tak_is_container():
+        out.append('PostgreSQL (inside the TAK database container):')
+        out.extend(_diag_pg_overview())
+    elif deb:
+        lsc = _diag_cmd(['pg_lsclusters', '--no-header'])
+        rows = [l.split() for l in lsc.splitlines() if l.strip()]
+        clusters = [r for r in rows if len(r) >= 6 and r[0].isdigit()]
+        out.append('PostgreSQL clusters (pg_lsclusters): version cluster port status owner data-dir log')
+        out.extend('  ' + ' '.join(r) for r in rows[:10])
+        if not clusters:
+            out.append('  (no clusters listed' + (f': {lsc[:160]}' if lsc else '') + ')')
+        for r in clusters:
+            if r[3].startswith('online'):
+                out.append(f'cluster {r[0]}/{r[1]} (port {r[2]}):')
+                out.extend(_diag_pg_overview(r[2]))
+        out.append('PostgreSQL server logs:')
+        for r in clusters:
+            # TAK's clusters log through logging_collector into <data>/log/postgresql-%a.log
+            # (pg_lsclusters prints that relative pattern): today's and yesterday's file.
+            if len(r) > 6 and not r[6].startswith('/') and r[5].startswith('/var/lib/postgresql/'):
+                for d in (1, 0):
+                    out.extend(_diag_pg_log(os.path.join(
+                        r[5], (datetime.now() - timedelta(days=d)).strftime(r[6]))))
+            else:
+                out.extend(_diag_pg_log(r[6] if len(r) > 6 else f'/var/log/postgresql/postgresql-{r[0]}-{r[1]}.log'))
+        units = [f'postgresql@{r[0]}-{r[1]}.service' for r in clusters]
+    else:
+        try:
+            dirs = sorted(d for d in os.listdir('/var/lib/pgsql') if d[:2].isdigit())
+        except OSError:
+            dirs = []
+        out.append(f"PostgreSQL data directories under /var/lib/pgsql: {', '.join(dirs) or '(none readable)'}")
+        units = _diag_cmd(['systemctl', 'list-units', '--all', '--no-legend', '--plain', 'postgresql*'], priv=False)
+        out.extend('  unit ' + ' '.join(l.split()[:4]) for l in units.splitlines() if l.strip())
+        out.append('cluster on the default port:')
+        out.extend(_diag_pg_overview())
+        out.append('PostgreSQL server logs:')
+        vers = sorted(set(re.findall(r'postgresql-(\d+)\.service', units)) | set(dirs))
+        for v in vers:
+            for d in (1, 0):
+                out.extend(_diag_pg_log(f"/var/lib/pgsql/{v}/data/log/"
+                                        f"postgresql-{(datetime.now() - timedelta(days=d)).strftime('%a')}.log"))
+        units = [f'postgresql-{v}.service' for v in vers]
+    if units and mode not in ('two_server', 'external_db') and not _tak_is_container():
+        # Start/stop history of each cluster's unit: when a cluster first came up and when one
+        # was stopped — the two events that bracket an upgrade. Named units, not a glob: a
+        # `-u 'postgresql*'` glob scans the whole journal (30 s and nothing, on test6).
+        j = _diag_cmd(['journalctl'] + [a for u in units for a in ('-u', u)] +
+                      ['--since', f'{_DIAG_TRAIL_DAYS} days ago', '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
+        ev = [l for l in j.splitlines() if re.search(r'Start|Stop|Fail|exited|Deactivated', l)]
+        out.append(f"PostgreSQL service start/stop ({', '.join(units)}), last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
+        out.extend('  ' + l[:200] for l in ev[-25:])
+    snaps = (settings.get('tak_snapshots') or [])[:6]
+    out.append(f"TAK snapshots recorded (newest first): {len(settings.get('tak_snapshots') or [])}")
+    for sn in snaps:
+        lbl = str(sn.get('label') or '?')
+        p = os.path.join(SNAPSHOT_DIR, lbl)
+        try:   # a directory: _exists_priv reads files, so ask `test -d` (broker-allowed) instead
+            on_disk = re.match(r'^[\w.-]+$', lbl) and (os.path.isdir(p) or subprocess.run(
+                _sudo_wrap(['test', '-d', p]), capture_output=True, timeout=10).returncode == 0)
+        except Exception:
+            on_disk = False
+        out.append(f"  {lbl}  taken {sn.get('taken_at', '?')}  TAK {sn.get('tak_version') or '?'}  "
+                   f"{sn.get('size_mb', '?')} MB  db_dump={sn.get('db_dump')}"
+                   f"{' (' + str(sn.get('db_dump_bytes') // 1024) + ' KB)' if isinstance(sn.get('db_dump_bytes'), int) else ''}"
+                   f"  on disk: {'yes' if on_disk else 'NO'}")
+    return out
+
+
+def _diag_apt_history(lines, cutoff):
+    """apt transactions since `cutoff` that touched TAK/PostgreSQL/Java: when, the command
+    line, who asked, the matching packages, and whether the transaction finished."""
+    out, block = [], {}
+
+    def flush():
+        if not block.get('Start-Date') or block['Start-Date'] < cutoff:
+            return
+        pk = []
+        for k in ('Install', 'Upgrade', 'Downgrade', 'Remove', 'Purge', 'Reinstall'):
+            hits = [p for p in re.findall(r'(\S+ \([^)]*\))', block.get(k, '')) if _DIAG_PKG_RE.search(p)]
+            if hits:
+                pk.append(f"{k}: {', '.join(hits)}")
+        if not pk and not _DIAG_PKG_RE.search(block.get('Commandline', '')):
+            return
+        out.append(f"  {block['Start-Date']}  {block.get('Commandline', '(no command line)')[:200]}"
+                   f"{'  [requested by ' + block['Requested-By'] + ']' if block.get('Requested-By') else ''}")
+        out.extend('      ' + p[:300] for p in pk)
+        if block.get('Error'):
+            out.append('      Error: ' + block['Error'][:240])
+        if not block.get('End-Date'):
+            out.append('      NO End-Date — this transaction did not finish')
+    for ln in lines + ['']:
+        if not ln.strip():
+            flush()
+            block = {}
+            continue
+        k, _, v = ln.partition(': ')
+        block[k.strip()] = v.strip()
+    return out
+
+
+def _diag_section_change_trail(settings):
+    out = []
+    cutoff = (datetime.utcnow() - timedelta(days=_DIAG_TRAIL_DAYS)).strftime('%Y-%m-%d')
+    if os.path.exists('/var/log/apt'):
+        hist = _diag_apt_history(_diag_rotated_lines('/var/log/apt/history.log'), cutoff)
+        out.append(f"apt transactions touching takserver/postgresql/postgis/java, last {_DIAG_TRAIL_DAYS} days: "
+                   f"{sum(1 for l in hist if not l.startswith('      '))}")
+        out.extend(hist[-60:])
+        # dpkg.log also catches a bare `dpkg -i`, which apt's history never sees.
+        dp = [l for l in _diag_rotated_lines('/var/log/dpkg.log')
+              if l[:10] >= cutoff and len(l.split()) > 3
+              and l.split()[2] in ('install', 'upgrade', 'remove', 'purge') and _DIAG_PKG_RE.search(l.split()[3])]
+        out.append(f"dpkg install/upgrade/remove of those packages, last {_DIAG_TRAIL_DAYS} days: {len(dp)}")
+        out.extend('  ' + l[:200] for l in dp[-40:])
+    else:
+        # Dated lines only: rpm scriptlet output is logged undated between them.
+        recent = lambda l: re.match(r'\d{4}-\d{2}-\d{2}', l) and l[:10] >= cutoff
+        rl = [l for l in _diag_rotated_lines('/var/log/dnf.rpm.log')
+              if recent(l) and _DIAG_PKG_RE.search(l)
+              and re.search(r'\b(Install|Upgrade|Upgraded|Downgrade|Erase|Reinstall)', l)]
+        out.append(f"rpm transactions touching takserver/postgresql/postgis/java, last {_DIAG_TRAIL_DAYS} days: {len(rl)}")
+        out.extend('  ' + l[:200] for l in rl[-40:])
+        cmds = [l for l in _diag_rotated_lines('/var/log/dnf.log')
+                if recent(l) and 'Command:' in l and _DIAG_PKG_RE.search(l)]
+        out.append(f"dnf commands naming those packages, last {_DIAG_TRAIL_DAYS} days: {len(cmds)}")
+        out.extend('  ' + l[:200] for l in cmds[-15:])
+    # The OS patch job (Help/Dashboard "Install updates"): apt full-upgrade / dnf upgrade
+    # with TAK held — but PostgreSQL is not held, and its runs are not otherwise visible here.
+    kp = _diag_log_lines(_KERNEL_PATCH_LOGFILE, 1024 * 1024)
+    if kp is None:
+        out.append(f"OS patch job log: {_diag_unreadable(_KERNEL_PATCH_LOGFILE)}")
+    else:
+        keep = [l for l in kp if re.search(r'=== |FATAL|WARN|held|released', l)
+                or (_DIAG_PKG_RE.search(l) and re.search(r'Unpacking|Setting up|Removing|Upgrading|Installing|'
+                                                         r'Erasing|Creating new|Stopping|Starting|cluster', l))]
+        runs = sum('job starting' in l for l in kp)
+        out.append(f"OS patch job log: {runs} run(s) in the recent tail; start/end, warnings and TAK/PostgreSQL/Java lines:")
+        out.extend('  ' + l[:220] for l in keep[-40:])
+    boots = _diag_cmd(['journalctl', '--list-boots', '--no-pager', '-q'], timeout=20)
+    bl = [l for l in boots.splitlines() if l.strip()]
+    out.append(f"boots in the journal: {len(bl)} (newest last)")
+    out.extend('  ' + l.strip()[:160] for l in bl[-8:])
+    for unit in ('takwerx-console.service', 'takserver.service'):
+        j = _diag_cmd(['journalctl', f'UNIT={unit}', '--since', f'{_DIAG_TRAIL_DAYS} days ago',
+                       '--no-pager', '-q', '-o', 'short-iso'], timeout=30)
+        ev = [l for l in j.splitlines() if re.search(r'Started|Stopped|Stopping|Failed|exited|restart', l)
+              and 'Killing process' not in l]
+        out.append(f"{unit} start/stop, last {_DIAG_TRAIL_DAYS} days: {len(ev)} line(s)")
+        out.extend('  ' + l[:200] for l in ev[-15:])
     return out
 
 
@@ -8359,6 +8614,8 @@ _DIAG_SECTIONS = (
     ('Containers', _diag_section_containers),
     ('Authentik / LDAP / webadmin', _diag_section_authentik),
     ('TAK Server', _diag_section_takserver),
+    ('TAK Server database — PostgreSQL, packages, snapshots', _diag_section_tak_database),
+    ('What changed on this box — installs, OS patches, reboots, restarts', _diag_section_change_trail),
     ('TAK Portal', _diag_section_takportal),
     ('Email Relay', _diag_section_emailrelay),
     ('Guard Dog', _diag_section_guarddog),
@@ -70477,9 +70734,11 @@ def _tak_update_history():
         return []
 
 
-def _tak_update_record(kind, pkg, log, status, started, exc=None):
+def _tak_update_record(kind, pkg, log, status, started, exc=None, running=False):
     lines = [str(l) for l in list(log)]
-    if exc is not None:
+    if running:
+        result = 'running'
+    elif exc is not None:
         result = 'CRASHED (%s: %s)' % (type(exc).__name__, str(exc)[:160])
     elif any('MID-UPGRADE' in l for l in lines):
         result = 'FAILED (left mid-upgrade)'
@@ -70489,13 +70748,15 @@ def _tak_update_record(kind, pkg, log, status, started, exc=None):
         result = 'ok'
     else:
         result = 'unfinished'
-    entry = {'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
+    entry = {'id': '%s@%.3f' % (kind, started),
+             'started': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(started)),
              'finished': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
              'seconds': int(time.time() - started), 'kind': kind,
              'package': os.path.basename(pkg or ''), 'result': result,
              'total_lines': len(lines), 'lines': lines[-_TAK_UPDATE_HISTORY_LINES:]}
     with _TAK_UPDATE_HISTORY_LOCK:
-        hist = [entry] + _tak_update_history()
+        # One entry per run: the in-flight checkpoints and the final record share an id.
+        hist = [entry] + [h for h in _tak_update_history() if h.get('id') != entry['id']]
         tmp = TAK_UPDATE_HISTORY + '.tmp'
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as f:
@@ -70508,16 +70769,40 @@ def _tak_update_job(kind, target, log, status):
     success, failure, or an exception (recorded, then re-raised)."""
     def run(*a, **kw):
         started, exc = time.time(), None
+        pkg = a[0] if a and isinstance(a[0], str) else ''
         _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
+        # v10.2.11 (ops #9): the record used to be written only when the worker ENDED, so a
+        # run cut off by a console restart, a reboot or an OOM kill left no log anywhere —
+        # the one run that changed the box was the one Diagnostics could not show (lutak2.net:
+        # TAK 5.8 installed, cot gone, update history only listing two runs that changed
+        # nothing). Checkpoint the log while it runs; a 'running' entry whose worker is gone
+        # is reported as interrupted, with the log up to the point it stopped.
+        stop, ck_lock = threading.Event(), threading.Lock()
+
+        def checkpoint():
+            seen = -1
+            while True:
+                with ck_lock:
+                    if stop.is_set():
+                        return
+                    if len(log) != seen:
+                        seen = len(log)
+                        try:
+                            _tak_update_record(kind, pkg, log, status, started, running=True)
+                        except Exception:
+                            pass
+                stop.wait(15)
+        threading.Thread(target=checkpoint, daemon=True).start()
         try:
             target(*a, **kw)
         except BaseException as e:
             exc = e
             raise
         finally:
+            with ck_lock:
+                stop.set()
             try:
-                _tak_update_record(kind, a[0] if a and isinstance(a[0], str) else '',
-                                   log, status, started, exc)
+                _tak_update_record(kind, pkg, log, status, started, exc)
             except Exception as _re:
                 print(f'TAK Server update: record not saved ({_re})', flush=True)
             _tracked_finish('takserver', status, log,
