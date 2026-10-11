@@ -53,11 +53,21 @@ body:
     validations:
       required: false
   - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: |
+        In the console: **Help → Diagnostics → Run diagnostics → Download report**, then drag
+        the file into this box. It changes nothing on your server and removes passwords, tokens
+        and keys. It usually answers our first round of questions, so please attach it.
+    validations:
+      required: false
+  - type: textarea
     id: logs
     attributes:
       label: Logs
       description: |
-        Whatever is relevant — `journalctl -u takwerx-console -n 200`,
+        Anything the diagnostics report doesn't cover — `journalctl -u takwerx-console -n 200`,
         `/var/log/takguard/restarts.log`, `docker logs <container>`, TAK Server logs.
         Paste as text rather than a screenshot where you can, so it is searchable.
       render: shell
