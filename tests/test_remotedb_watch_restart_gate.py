@@ -151,6 +151,16 @@ def test_update_refreshes_an_installed_script_with_its_own_endpoint():
     assert 'MAX_DAILY_DB_RESTARTS=3' in new
 
 
+def test_update_refreshes_the_auth_watch_too():
+    # The field box's tak-remotedb-auth-watch.sh was stuck at the same June mtime.
+    auth = (REPO / 'scripts' / 'guarddog' / 'tak-remotedb-auth-watch.sh').read_text()
+    vals = _baked('DB_HOST="10.20.0.5"\nDB_PORT="5432"\nSSH_KEY="/root/.ssh/id_ed25519"\nSSH_USER="root"\n')
+    for k, v in vals.items():
+        auth = auth.replace(f'{k}_PLACEHOLDER', v)
+    assert re.findall(r'^\w+="\w+_PLACEHOLDER"$', auth, re.M) == []
+    assert 'SSH_PROBE" != "__mgmt_ok__"' in auth                 # forced-command key -> skip, no resync
+
+
 def test_update_leaves_alone_what_it_cannot_fill():
     assert _baked(None) is None                                 # not installed on this box
     assert _baked('DB_HOST="DB_HOST_PLACEHOLDER"\n') is None    # never pointed at a host
