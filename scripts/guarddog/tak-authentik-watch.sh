@@ -1,9 +1,10 @@
 #!/bin/bash
 # Guard Dog: Authentik health monitor.
 # Checks both HTTP (server) and LDAP (outpost) independently.
-# - HTTP failure × 3 → full down + up -d (stronger than restart)
+# - HTTP failure × 3 → restart server+worker; a second escalation within 6h → full down + up -d
+# - HTTP failure while the host is CPU-starved → hold and alert, do not restart (GH #111)
 # - LDAP failure × 3 → targeted LDAP recreate (doesn't nuke the whole stack)
-# - 10-min boot grace period, 15-min cooldown between restarts.
+# - 10-min boot grace period; HTTP cooldown 15 min, doubling per restart in the last 6h (max 2h).
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
@@ -11,8 +12,16 @@ FAIL_HTTP="$STATE_DIR/authentik.failcount"
 FAIL_LDAP="$STATE_DIR/authentik_ldap.failcount"
 COOLDOWN_HTTP="$STATE_DIR/authentik_last_restart"
 COOLDOWN_LDAP="$STATE_DIR/authentik_ldap_last_restart"
+RESTART_HIST="$STATE_DIR/authentik_restart_history"
+HOLD_SINCE="$STATE_DIR/authentik_hold_since"
+HOLD_ALERTED="$STATE_DIR/authentik_hold_alerted"
 MAX_FAILS=3
 COOLDOWN_SECS=900
+COOLDOWN_MAX_SECS=7200
+HISTORY_WINDOW_SECS=21600
+HOLD_MAX_SECS=7200
+HOLD_ALERT_EVERY_SECS=3600
+PROBE_MAX_SECS=30
 
 mkdir -p "$STATE_DIR"
 
@@ -44,12 +53,71 @@ _alert() {
 }
 
 _cooldown_ok() {
-  local cf="$1"
+  local cf="$1" secs="${2:-$COOLDOWN_SECS}"
   [ ! -f "$cf" ] && return 0
   local last now
   last=$(cat "$cf")
   now=$(date +%s)
-  [ $(( now - last )) -ge $COOLDOWN_SECS ]
+  [ $(( now - last )) -ge "$secs" ]
+}
+
+# ── Restart backoff (GH #111) ────────────────────────────────────────────────
+# A fixed 15-min cooldown turned a CPU-starved host into a restart every ~20 min, all
+# night: each cold start burns ~1.5 cores for 2 min and drops the LDAP outpost's cache,
+# so the restart deepened the overload it was reacting to. Restarts in the last 6h now
+# double the cooldown: 15 → 30 → 60 → 120 min.
+_recent_restarts() {
+  local cutoff=$(( $(date +%s) - HISTORY_WINDOW_SECS ))
+  [ -f "$RESTART_HIST" ] || { echo 0; return; }
+  awk -v c="$cutoff" '$1+0 >= c' "$RESTART_HIST" 2>/dev/null | wc -l | tr -d ' '
+}
+
+_backoff_secs() {
+  local n="$1" s=$COOLDOWN_SECS
+  while [ "$n" -gt 0 ] && [ "$s" -lt "$COOLDOWN_MAX_SECS" ]; do s=$((s * 2)); n=$((n - 1)); done
+  [ "$s" -gt "$COOLDOWN_MAX_SECS" ] && s=$COOLDOWN_MAX_SECS
+  echo "$s"
+}
+
+_record_restart() {
+  local now cutoff
+  now=$(date +%s); cutoff=$(( now - HISTORY_WINDOW_SECS ))
+  { awk -v c="$cutoff" '$1+0 >= c' "$RESTART_HIST" 2>/dev/null; echo "$now"; } > "$RESTART_HIST.tmp" \
+    && mv -f "$RESTART_HIST.tmp" "$RESTART_HIST"
+}
+
+# ── Host CPU starvation (GH #111) ────────────────────────────────────────────
+# A slow Authentik on a starved host is not a dead Authentik, and restarting it only
+# adds load (field: load ~50 on 8 vCPUs, cpu pressure 83%; test6 2026-10-02 recovered
+# by itself once restarts stopped). PSI is the precise signal; RHEL 9 ships it disabled
+# by default, so fall back to the 1-min load average per CPU there.
+_cpu_saturated() {
+  local some ncpu load
+  some=$(awk '/^some/ { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub("avg60=", "", $i); print int($i) } }' \
+         /proc/pressure/cpu 2>/dev/null)
+  if [ -n "$some" ]; then
+    CPU_DESC="CPU pressure ${some}% (avg60)"
+    [ "$some" -ge 50 ]
+    return
+  fi
+  ncpu=$(nproc 2>/dev/null || echo 1)
+  load=$(awk '{ print int($1) }' /proc/loadavg 2>/dev/null || echo 0)
+  CPU_DESC="load average ${load} on ${ncpu} CPUs"
+  [ "$load" -ge $(( ncpu * 3 )) ]
+}
+
+# top, not ps: ps %CPU is the average since each process started, not what it is doing now.
+_top_cpu() {
+  if command -v top >/dev/null 2>&1; then top -b -n 1 -o %CPU 2>/dev/null | head -n 17
+  else ps -eo pcpu,comm --sort=-pcpu 2>/dev/null | head -n 8; fi
+}
+
+# A targeted restart only helps when what server+worker depend on is up; otherwise the
+# full down+up is the right tool, as it was before.
+_ak_deps_running() {
+  local svcs
+  svcs=$(cd "$AK_DIR" && timeout 60 docker compose ps --status running --services 2>/dev/null)
+  printf '%s\n' "$svcs" | grep -qx postgresql && printf '%s\n' "$svcs" | grep -qx redis
 }
 
 # Portable TCP liveness probe. RHEL ships NO `nc` by default, so the old
@@ -163,17 +231,26 @@ _ak_compose_restart_locked() {
 }
 
 # ── HTTP health check (Authentik server) ──
+# GH #111: --max-time bounds each probe. Without it a starved server held a probe open
+# for 100–200 s, so slow and down looked the same and one tick could run for minutes.
+# AK_LAST_RC 7 = connection refused (nothing listening), the one case that is "down"
+# however busy the host is.
 ak_http_ok() {
-  local url code
+  local url out code rc
   for url in \
     "http://127.0.0.1:9090/-/health/live/" \
     "http://127.0.0.1:9090/"; do
-    code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$url" 2>/dev/null || echo "000")
+    out=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --connect-timeout 5 \
+          --max-time "$PROBE_MAX_SECS" "$url" 2>/dev/null)
+    rc=$?
+    code="${out%% *}"; [ -z "$code" ] && code="000"
     case "$code" in
       200|204|301|302) return 0 ;;
     esac
   done
   AK_LAST_CODE="$code"
+  AK_LAST_RC="$rc"
+  AK_LAST_SECS="${out#* }"
   return 1
 }
 
@@ -187,30 +264,101 @@ fi
 
 if [ "$HTTP_OK" -eq 1 ]; then
   echo 0 > "$FAIL_HTTP"
+  if [ -f "$HOLD_SINCE" ]; then
+    _log "hold | Authentik HTTP healthy again — recovered without a restart"
+    rm -f "$HOLD_SINCE" "$HOLD_ALERTED"
+  fi
 else
   CODE="${AK_LAST_CODE:-000}"
+  case "${AK_LAST_RC:-0}" in
+    7)  PROBE_DESC="HTTP $CODE, connection refused" ;;
+    28) PROBE_DESC="HTTP $CODE, no answer within ${PROBE_MAX_SECS}s" ;;
+    *)  PROBE_DESC="HTTP $CODE in ${AK_LAST_SECS:-?}s" ;;
+  esac
   FAILS=$(( $(cat "$FAIL_HTTP" 2>/dev/null || echo 0) + 1 ))
   echo "$FAILS" > "$FAIL_HTTP"
 
-  if [ "$FAILS" -ge "$MAX_FAILS" ] && _cooldown_ok "$COOLDOWN_HTTP"; then
-    _log "restart | Authentik HTTP unhealthy ($CODE) for $FAILS checks — full restart"
-    SUBJ="Guard Dog: Authentik restarted on $SERVER_IDENTIFIER"
-    BODY="Authentik server failed HTTP health check (HTTP $CODE) for $FAILS consecutive checks.
+  RECENT=$(_recent_restarts)
+  HTTP_COOLDOWN=$(_backoff_secs "$RECENT")
+
+  if [ "$FAILS" -ge "$MAX_FAILS" ] && _cooldown_ok "$COOLDOWN_HTTP" "$HTTP_COOLDOWN"; then
+    NOW=$(date +%s)
+    HOLD_START=$(cat "$HOLD_SINCE" 2>/dev/null)
+    case "$HOLD_START" in ''|*[!0-9]*) HOLD_START="$NOW" ;; esac
+    HELD_FOR=$(( NOW - HOLD_START ))
+
+    # GH #111: on a CPU-starved host, a server that is still listening is slow, not dead.
+    # Hold and say so instead of restarting. Capped at 2h so a genuinely wedged server on a
+    # busy box is still restarted eventually (and the backoff above still applies then).
+    if [ "${AK_LAST_RC:-0}" != "7" ] && _cpu_saturated && [ "$HELD_FOR" -lt "$HOLD_MAX_SECS" ]; then
+      [ -f "$HOLD_SINCE" ] || echo "$NOW" > "$HOLD_SINCE"
+      _log "hold | Authentik HTTP unhealthy ($PROBE_DESC) for $FAILS checks, but host is CPU-starved ($CPU_DESC) — NOT restarting (held ${HELD_FOR}s)"
+      if _cooldown_ok "$HOLD_ALERTED" "$HOLD_ALERT_EVERY_SECS"; then
+        _alert "Guard Dog: Authentik slow, host CPU overloaded on $SERVER_IDENTIFIER" \
+"Authentik is answering too slowly ($PROBE_DESC) for $FAILS consecutive checks.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $(_ts)
-Action: Full restart (docker compose down + up -d).
+Host: $CPU_DESC
+
+Guard Dog is NOT restarting Authentik: the host is short of CPU, and a restart adds
+about 1.5 cores of load for 2 minutes and resets the LDAP outpost, which makes it worse.
+Find what is using the CPU. Top processes right now:
+
+$(_top_cpu)
+
+If the host is still overloaded after 2 hours, Guard Dog will restart Authentik anyway.
 "
-    _alert "$SUBJ" "$BODY"
-    # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
-  cd "$AK_DIR" && _ak_compose_restart_locked
-  # v10.1.64 W3 (GH #64): a full stack restart starts the outpost COLD too — same blind spot.
-  _ak_verify_ldap_groups "stack-restart" || true
-    echo 0 > "$FAIL_HTTP"
-    echo 0 > "$FAIL_LDAP"
-    date +%s > "$COOLDOWN_HTTP"
-    date +%s > "$COOLDOWN_LDAP"
-    exit 0
+        date +%s > "$HOLD_ALERTED"
+      fi
+    else
+      [ "$HELD_FOR" -ge "$HOLD_MAX_SECS" ] && _log "hold | held ${HELD_FOR}s with the host still starved — restarting anyway"
+      rm -f "$HOLD_SINCE" "$HOLD_ALERTED"
+
+      # Postgres, Redis and the LDAP outpost were healthy through the whole field loop;
+      # tearing them down added load and reset the outpost every time. The first restart
+      # in 6h touches only server+worker; another one within 6h escalates to the full
+      # down+up, which is what this watchdog always did.
+      if [ "$RECENT" -eq 0 ] && _ak_deps_running; then
+        ACTION="Restart of server and worker only (docker compose restart server worker)"
+        MODE="server-worker"
+      else
+        ACTION="Full restart (docker compose down + up -d)"
+        MODE="full"
+      fi
+      NEXT_COOLDOWN=$(_backoff_secs $(( RECENT + 1 )))
+      _log "restart | Authentik HTTP unhealthy ($PROBE_DESC) for $FAILS checks — $MODE restart (restart $(( RECENT + 1 )) in 6h; next allowed after $(( NEXT_COOLDOWN / 60 )) min)"
+      SUBJ="Guard Dog: Authentik restarted on $SERVER_IDENTIFIER"
+      BODY="Authentik server failed HTTP health check ($PROBE_DESC) for $FAILS consecutive checks.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(_ts)
+Action: $ACTION.
+Restarts in the last 6 hours, including this one: $(( RECENT + 1 )). Next restart allowed after $(( NEXT_COOLDOWN / 60 )) minutes.
+"
+      _alert "$SUBJ" "$BODY"
+      if [ "$MODE" = "server-worker" ]; then
+        cd "$AK_DIR" && _ak_compose_locked "server-worker-restart" restart -t 30 server worker
+        # The outpost reconnects to the restarted server by itself; if it still cannot
+        # resolve groups, restart it too (the order the LDAP alert below recommends).
+        _ak_verify_ldap_groups "server-worker-restart"
+        if [ $? -eq 1 ]; then
+          cd "$AK_DIR" && _ak_compose_locked "ldap-restart" restart ldap
+          _ak_verify_ldap_groups "ldap-restart" || true
+        fi
+      else
+        # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
+        cd "$AK_DIR" && _ak_compose_restart_locked
+        # v10.1.64 W3 (GH #64): a full stack restart starts the outpost COLD too — same blind spot.
+        _ak_verify_ldap_groups "stack-restart" || true
+      fi
+      _record_restart
+      echo 0 > "$FAIL_HTTP"
+      echo 0 > "$FAIL_LDAP"
+      date +%s > "$COOLDOWN_HTTP"
+      date +%s > "$COOLDOWN_LDAP"
+      exit 0
+    fi
   fi
 fi
 
