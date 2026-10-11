@@ -72474,8 +72474,35 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
     def _say(m):
         _log.append(m)
 
+    # What a failure leaves behind depends on how far we got. Before TAK is stopped
+    # nothing changed; after the stop but before the package unpacked, the box is
+    # still a working 5.7 and only needs TAK started again. Only after the unpack is
+    # it truly mid-upgrade (#117: an apt hold refused the install, and the old code
+    # called that the pg15 abort and left TAK down on an untouched 5.7).
+    _stage = {'stopped': False, 'unpacked': False}
+
+    def _installed_version():
+        if _distro_family() == 'rhel':
+            argv = ['rpm', '-q', '--qf', '%{VERSION}-%{RELEASE}', 'takserver']
+        else:
+            argv = ['dpkg-query', '-W', '-f=${Version}', 'takserver']
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
     def fail(msg, wedged=False):
         _say(msg)
+        if not _stage['stopped']:
+            wedged = False
+        if wedged and not _stage['unpacked']:
+            _say('')
+            _say('Nothing was installed, so this server is still on its previous TAK Server '
+                 'version. Starting TAK Server again…')
+            subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']),
+                           capture_output=True, timeout=300)
+            wedged = False
         if wedged:
             _say('')
             _say('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
@@ -72486,12 +72513,12 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             # fixed-shape tak58_upgrade_db op, never as a shell command. The printed
             # escape hatch was therefore impossible to follow on exactly the boxes
             # that hit this, which is where nuc landed on 2026-09-21. Clicking
-            # Update again re-runs the same broker op, and the install step is a
-            # no-op the second time, so it is both correct and the shorter path.
+            # Update again re-runs the same broker op, so it is both correct and
+            # the shorter path.
             _say('Two ways forward, in order of preference:')
             _say('  1. Fix what the error above names, then click Update TAK Server on this')
-            _say('     page again. It re-runs the database migration; the package install')
-            _say('     is already done and will be skipped.')
+            _say('     page again. It runs the package install and the database migration')
+            _say('     again; the install finds 5.8 already unpacked.')
             _say('  2. Restore from the pre-migration backup taken at the start of this run')
             _say('     (see the snapshot path above). The old PostgreSQL cluster was left')
             _say('     intact by design and is still on disk.')
@@ -72530,20 +72557,49 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         _say('  Backup: %s' % bk.get('snapshot_path'))
 
         # 3. Stop TAK.
+        _ver_before = _installed_version()
+        _held_before = False
+        if _distro_family() != 'rhel':
+            try:
+                _held_before = subprocess.run(
+                    ['dpkg-query', '-W', '-f=${Status}', 'takserver'], capture_output=True,
+                    text=True, timeout=30).stdout.startswith('hold ')
+            except Exception:
+                pass
         _say('')
         _say('Stopping TAK Server…')
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']),
                        capture_output=True, timeout=300)
+        _stage['stopped'] = True
 
         # 4. Install the 5.8 package. After this line the box is mid-upgrade.
+        #
+        # --allow-change-held-packages: the OS patch job holds takserver so patching
+        # can never sweep in a TAK upgrade, and keeps any hold it finds already there.
+        # This IS the operator-driven upgrade that hold protects, so it must get past
+        # it — without the flag apt refuses with exit 100 and unpacks nothing (#117).
+        # apt clears the hold as it upgrades (measured on test12 2026-10-11, selection
+        # went hold -> install), so a hold that was there before is put back below.
         _say('Installing %s …' % os.path.basename(pkg_path))
         if _distro_family() == 'rhel':
             cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
         else:
             cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
-                   + shlex.quote(pkg_path) + ' 2>&1')
+                   '--allow-change-held-packages ' + shlex.quote(pkg_path) + ' 2>&1')
         rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
                                                _log, timeout_sec=1800)
+        # Did anything unpack? The pg15 stop below happens in the postinst, AFTER the
+        # new version is on disk, so an unchanged version means apt refused outright
+        # (hold, lock, bad file, dependency) and this is not the expected stop.
+        _ver_after = _installed_version()
+        if _held_before:
+            subprocess.run(_sudo_wrap(['dpkg', '--set-selections']), input='takserver hold\n',
+                           capture_output=True, text=True, timeout=30)
+        if rc != 0 and _ver_before and _ver_after == _ver_before:
+            return fail('The package installer failed (exit %d) and TAK Server is still '
+                        'version %s — nothing was installed. See the output above.'
+                        % (rc, _ver_before), wedged=True)
+        _stage['unpacked'] = True
         # The package is EXPECTED to complain about pg15 and stop short — that is
         # the documented 5.8 behaviour, not an install failure. The database
         # script below is what finishes it, so a non-zero rc here is reported and
