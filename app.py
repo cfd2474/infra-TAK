@@ -54387,7 +54387,7 @@ def _detect_authentik_ldap_spiral(plog=None):
       - 'outpost_markers': dict of marker -> count from last 1000 lines of LDAP container log
       - 'outpost_spiral_specific_markers': int (count of distinct spiral-specific marker types matched)
       - 'outpost_general_markers': int (count of distinct general marker types — recorded but doesn't trip)
-      - 'pg_idle_in_trans': int (idle-in-transaction connections from authentik-server)
+      - 'pg_idle_in_trans': int (idle-in-transaction connections to the authentik DB)
       - 'pg_total_conns': int (total connections to authentik DB)
       - 'channels_msg_rows': int (rows in django_channels_postgres_message — v0.9.20 informational)
       - 'channels_msg_mb': int (size of django_channels_postgres_message in MB — informational)
@@ -54451,9 +54451,14 @@ def _detect_authentik_ldap_spiral(plog=None):
     # 'idle in transaction' on the policybindingmodel SELECT during a spiral; healthy
     # boxes sit at 0-3. Trigger threshold: ≥30 to leave plenty of headroom over a normal
     # baseline (at request peaks healthy boxes can hit 10-15 briefly).
+    # ops #38: count by DATABASE, not application_name. The server reaches Postgres through
+    # PgBouncer, which leaves application_name BLANK (see
+    # _authentik_pgbouncer_pg_activity_breakdown), so the old `LIKE '%authentik%'` filter
+    # matched only the worker's direct connection and this signal read 0 on every
+    # PgBouncer box. test8 2026-10-12, mid-storm: 57 idle-in-transaction, all blank.
     try:
         _pg = subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tA', '-c', "SELECT   (SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%'),  (SELECT count(*) FROM pg_stat_activity WHERE datname='authentik');"]), capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tA', '-c', "SELECT   (SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' AND state LIKE 'idle in transaction%' AND pid <> pg_backend_pid()),  (SELECT count(*) FROM pg_stat_activity WHERE datname='authentik');"]), capture_output=True, text=True, timeout=10
         )
         _out = (_pg.stdout or '').strip()
         if '|' in _out:
