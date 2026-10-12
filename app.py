@@ -48196,6 +48196,10 @@ def _netbird_complete_setup(settings, plog):
         if e.code == 412:
             pat = settings.get('netbird_pat') or ''
             plog('  ✓ Setup already completed (HTTP 412)')
+            if pat and not _netbird_pat_is_valid(pat):
+                settings.pop('netbird_pat', None)
+                save_settings(settings)
+                pat = ''
             return pat or '__already_done__'
         err = ''
         try:
@@ -48223,18 +48227,40 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
     }).encode()
 
     idp_redirect = None
+    # NetBird accepts a second POST with the same name, and every one is another
+    # "Authentik" button on the login page — so a redeploy updates the existing entry
+    # instead (#72). Extra entries from earlier redeploys are left alone: a dex user
+    # id embeds its connector id, so deleting one would orphan whoever signed in with it.
+    existing = None
     try:
-        resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
-        body = json.loads(resp.read().decode())
+        resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
+        idps = json.loads(resp.read().decode())
+        items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
+        existing = next((i for i in items if 'authentik' in (i.get('name') or '').lower() and i.get('id')), None)
+    except Exception:
+        pass
+    try:
+        if existing:
+            resp = _netbird_mgmt_request(f"/api/identity-providers/{existing['id']}", method='PUT',
+                                         data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik external OIDC IDP already registered — updated in place')
+        else:
+            resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik registered as external OIDC IDP')
         idp_redirect = body.get('redirect_uri') or body.get('redirectURL') or body.get('redirect_url')
-        plog('  ✓ Authentik registered as external OIDC IDP')
     except urllib.error.HTTPError as e:
         err_body = ''
         try:
             err_body = e.read().decode()[:300]
         except Exception:
             pass
-        if e.code in (400, 409, 422):
+        if existing:
+            # It is registered and the login button works; only the refresh failed.
+            plog(f'  ⚠ Authentik IDP already registered; update failed HTTP {e.code}: {err_body[:200]}')
+            idp_redirect = existing.get('redirect_uri') or existing.get('redirectURL')
+        elif e.code in (400, 409, 422):
             plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
             try:
                 resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
@@ -48481,10 +48507,15 @@ def _run_netbird_deploy(settings):
         authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
         auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
-        setup_pat = not settings.get('netbird_pat')
+        # Always allow the setup PAT during bootstrap (#72). Keying this off "no PAT in
+        # settings" broke every redeploy that still carried an old PAT (an uninstall that
+        # never reached its settings cleanup, a hand-removed ~/netbird): the fresh store's
+        # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
+        # registered, and the deploy still reported success. The flag only matters while
+        # setup is required, and Step 5 rewrites the compose without it.
         _nb_target_srv, _ = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
-        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat, store_key=nb_store_key)
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
 
         plog('  Pulling images...')
@@ -48497,6 +48528,11 @@ def _run_netbird_deploy(settings):
         plog('')
         plog('━━━ Step 4/6: Initial Setup (akadmin) ━━━')
         pat = _netbird_complete_setup(settings, plog)
+        if pat is None:
+            # No owner means nobody can sign in, and no PAT means Authentik can't be
+            # registered. Stop here instead of reporting success over a dead login (#72).
+            raise RuntimeError('NetBird owner setup failed (see the line above), so there is no '
+                               'account to sign in to. Fix the cause and press Deploy again.')
 
         plog('')
         plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
@@ -48505,7 +48541,10 @@ def _run_netbird_deploy(settings):
         plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
         pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
         if pat:
-            _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
+            if not _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
+                raise RuntimeError('Authentik could not be registered as the NetBird login provider '
+                                   '(see the line above), so the Authentik button would be missing. '
+                                   'Press Deploy again once the cause is fixed.')
         else:
             plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
 
