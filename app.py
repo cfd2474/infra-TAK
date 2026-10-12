@@ -62488,13 +62488,22 @@ def run_authentik_deploy(reconfigure=False):
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
-                                plog("  Recreating LDAP + restarting Authentik server/worker (no log output for up to ~2 min)...")
-                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                                # Server/worker FIRST, LDAP only after the API answers. The old order
+                                # (LDAP recreate, then server restart) started a fresh outpost against
+                                # the server that was about to go down: it fetched its config, got a
+                                # 502 on the provider list as the server stopped, and panicked
+                                # ("Failed to run server"), once per update on every box (v10.2.11
+                                # T&E). An outpost that starts while the server is still coming up
+                                # just retries its config fetch, so LDAP last is always safe.
+                                plog("  Restarting Authentik server/worker, then LDAP (no log output for up to ~2 min)...")
                                 subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-                                plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
                                 plog("  Waiting for Authentik to come back online...")
-                                _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True)
-                                plog("  \u2713 Authentik is online and ready")
+                                if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
+                                    plog("  \u2713 Authentik is online and ready")
+                                else:
+                                    plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
+                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                                plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
                             except Exception as e:
                                 plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
                     else:
@@ -87526,9 +87535,16 @@ def _post_update_auto_deploy():
                                     subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
                                     print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
                         if _ak != _ak_orig:
-                            print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
+                            print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
+                            # ops #30: LDAP after the server is healthy, never in the same
+                            # `up` (an outpost that starts against the old server panics
+                            # when that server goes away mid start-up).
                             subprocess.run(
-                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
+                            )
+                            _wait_for_authentik_stack_healthy(lambda m: print(f"Post-update: {m}"), timeout=180)
+                            subprocess.run(
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
                             )
                             # Verify CapDrop was applied to server and ldap (worker is intentionally excluded)
                             import time as _harden_t
