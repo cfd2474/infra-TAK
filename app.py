@@ -75274,6 +75274,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
                 upgrade_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
             ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+        _tak_repair_container_healthchecks(ulog)
         # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
         # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
@@ -76985,6 +76986,108 @@ def _tak_container_running(name):
         return False
 
 
+# The hardened 5.8 images' Docker HEALTHCHECKs, and the container each one runs in.
+_TAK_HEALTH_DIRS = ((TAK_CONTAINER, '/opt/tak/health/takserver'),
+                    (TAK_DB_CONTAINER, '/opt/tak/health/takserver-db'))
+# The stock takserver check's client-cert args (takserver-docker-hardened-5.8-RELEASE-75),
+# and what replaces them.
+_TAK_HEALTH_P12_ARGS = '--cert-type P12 --cert /opt/tak/certs/files/"$ADMIN_CERT_NAME".p12:"$ADMIN_CERT_PASS"'
+_TAK_HEALTH_PEM_ARGS = ('--cert /opt/tak/certs/files/"$ADMIN_CERT_NAME".pem '
+                        '--key /opt/tak/certs/files/"$ADMIN_CERT_NAME".key --pass "$ADMIN_CERT_PASS"')
+_TAK_HEALTH_CERT_DEFAULTS = (
+    '# infra-TAK: nothing sets ADMIN_CERT_NAME / ADMIN_CERT_PASS, so default them to the\n'
+    '# admin cert the deploy creates and the cert password from cert-metadata.sh.\n'
+    'ADMIN_CERT_NAME=${ADMIN_CERT_NAME:-admin}\n'
+    'if [ -z "$ADMIN_CERT_PASS" ]; then\n'
+    '    ADMIN_CERT_PASS=$(. /opt/tak/certs/cert-metadata.sh >/dev/null 2>&1; echo "$PASS")\n'
+    'fi\n\n')
+
+
+def _tak_repair_container_healthchecks(log=None):
+    """Make the hardened 5.8 containers' own HEALTHCHECKs able to pass. Idempotent.
+
+    UPSTREAM PACKAGING BUGS (5.8 hardened, measured on ARM64 2026-10-11): both
+    containers report (unhealthy) forever while TAK serves normally.
+
+      takserver     health_check.sh curls 8443 with "$ADMIN_CERT_NAME".p12:"$ADMIN_CERT_PASS",
+                    but nothing sets either variable (TAK's own README `docker run` doesn't
+                    either), so it asks for `/opt/tak/certs/files/.p12` -> HTTPS state 000.
+                    Setting them is not enough: makeCert.sh writes legacy RC2 .p12 files
+                    (ATAK needs them) that the image's OpenSSL 3 refuses -
+                    `RC2-40-CBC ... unsupported`. The admin PEM cert + key return 200.
+      both          critical_file_list.txt names /usr/share/crypto-policies/back-ends/*/
+                    openssl.config, which the UBI 10 base does not ship. The integrity
+                    script fails on the first unreadable file, deletes its baseline and
+                    exits 1, so no file was ever integrity-checked at all.
+
+    The fix lives in the health files on the shared /opt/tak mount, NOT in the container's
+    run flags, so an installed box is repaired on the next console update without
+    recreating (and restarting) TAK. Missing entries are commented out, not deleted, and
+    existence is judged INSIDE each container as its own user, which is exactly the check
+    the integrity script makes - every file that exists is still baselined and verified.
+    A new bundle (upgrade) brings fresh copies, so the upgrade path runs this again.
+    Pre-hardened bundles have no health dir and no-op.
+    """
+    def _say(msg):
+        if log:
+            log(msg)
+
+    def _cx(name, args, timeout=30):
+        return subprocess.run(_sudo_wrap(['docker', 'exec', name] + args),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _cread(name, path):
+        r = _cx(name, ['cat', path])
+        return r.stdout if r.returncode == 0 else None
+
+    def _cwrite(name, path, body):
+        # `>` truncates in place, so the file keeps the owner/mode the container needs.
+        r = _cx(name, ['bash', '-c', 'printf "%s" "$1" > "$2"', '_', body, path])
+        if r.returncode != 0:
+            _say(f"  ⚠ could not update {path} in {name}: {(r.stderr or r.stdout or '').strip()[:160]}")
+        return r.returncode == 0
+
+    changed = False
+    for name, hdir in _TAK_HEALTH_DIRS:
+        try:
+            if not _tak_container_running(name):
+                _say(f"  {name} not running — healthcheck repair skipped")
+                continue
+            if name == TAK_CONTAINER:
+                script = f'{hdir}/health_check.sh'
+                body = _cread(name, script)
+                if body and _TAK_HEALTH_P12_ARGS in body:
+                    anchor = 'takserver_https_response='
+                    new = body.replace(_TAK_HEALTH_P12_ARGS, _TAK_HEALTH_PEM_ARGS)
+                    new = new.replace(anchor, _TAK_HEALTH_CERT_DEFAULTS + anchor, 1)
+                    if _cwrite(name, script, new):
+                        changed = True
+                        _say(f"  ✓ {name} healthcheck: admin cert named, PEM cert/key instead of legacy .p12")
+            lst = f'{hdir}/critical_file_list.txt'
+            body = _cread(name, lst)
+            if not body:
+                continue
+            paths = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith('#')]
+            if not paths:
+                continue
+            r = _cx(name, ['bash', '-c', 'for f; do [ -r "$f" ] || echo "$f"; done', '_'] + paths)
+            if r.returncode != 0:
+                continue
+            missing = {l for l in r.stdout.splitlines() if l}
+            if not missing:
+                continue
+            new = ''.join(
+                f'# not in this image, skipped by infra-TAK: {l.strip()}\n' if l.strip() in missing else l
+                for l in body.splitlines(keepends=True))
+            if _cwrite(name, lst, new):
+                changed = True
+                _say(f"  ✓ {name} integrity list: {len(missing)} file(s) the image does not ship skipped "
+                     f"({', '.join(sorted(missing))[:200]})")
+        except Exception as e:
+            _say(f"  ⚠ {name} healthcheck repair failed: {str(e)[:160]}")
+    return changed
+
+
 @_with_authentik_deploy_guard
 def _tak_bundle_repair_exec_bits(root, log=None):
     """Make every .sh under an unpacked TAK docker bundle executable.
@@ -77334,6 +77437,7 @@ def _deploy_takserver_container(config):
                 deploy_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
             log_step("⚠ Did not see 'messaging Microservice started' within 10 min — admin promote may need a retry. Check `docker logs takserver`.")
+        _tak_repair_container_healthchecks(log_step)
 
         # ── Step 9/9: Promote admin ─────────────────────────────────────────
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
@@ -86742,6 +86846,11 @@ def _post_update_auto_deploy():
                         print("Post-update: cert-metadata.sh content-check OK (DIR set)")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
+
+            # The hardened 5.8 containers' own healthchecks can never pass as shipped.
+            # Repaired on the shared mount, so no TAK restart.
+            if _tak_is_container():
+                _tak_repair_container_healthchecks(lambda m: print(f"Post-update:{m}", flush=True))
 
             # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
