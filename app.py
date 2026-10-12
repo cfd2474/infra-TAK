@@ -1069,7 +1069,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.11-alpha"
+VERSION = "10.2.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -13908,8 +13908,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '792e80bfa6a7e9004dadfde0a4807abf5483c89e'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '52beb8a1584b260e1b4f1e247438224efce3e20f12fc2ec6e780b6298edae20a'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '44d6a17132f3e3c2a424c3bb3278b7bc5630ff2b'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'e86c99bcb1f76ef4e8059e281aff186c4e04120a3dccb226ac14045d7a628212'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -14166,6 +14166,9 @@ _CONN_VERIFY_PORTS = [
     (8446, 'Certificate + QR enrollment',                         True),
     (80,   "Let's Encrypt renewal (HTTP-01)",                     False),
 ]
+# Mirrors modules/atlas.py DEVICE_PORT (the module is loaded by the marketplace, not
+# imported here); tests/test_relay_forwards_module_ports.py keeps the two equal.
+ATLAS_DEVICE_PORT = 8449
 
 
 def _conn_verify_ports(settings):
@@ -14205,6 +14208,15 @@ def _conn_verify_ports(settings):
                           'EUD Remote Assist device enrolment (the QR points here)', True))
     except Exception:
         pass
+    # v10.2.9 (GH #92): ATLAS MDM's device channel, same shape as 8448 above: the
+    # provisioning QR points the tablet at :8449, the module opens it in the host
+    # firewall, and a relay or cloud security group that drops it shows up only as a
+    # SocketTimeoutException on the tablet. `atlas_enabled` is the flag ATLAS's own
+    # detect() treats as "installed" (it self-heals the flag from the running
+    # containers, so it does not have Remote Assist's lost-flag problem).
+    if settings.get('atlas_enabled'):
+        ports.append((ATLAS_DEVICE_PORT,
+                      'ATLAS MDM device channel (enrolled tablets connect here)', True))
     try:
         _mtx = _get_module_deployment_config(settings, 'mediamtx_deployment') or {}
         if _mtx.get('deployed'):
@@ -14215,6 +14227,25 @@ def _conn_verify_ports(settings):
             # distinguish "open" from "silently dropped". Reporting a made-up
             # state for it would be the exact defect this whole line of work is
             # about. It is called out in the UI instead.
+    except Exception:
+        pass
+    # v10.2.9 (GH #92 follow-up): TAK Video Restreamer's and CloudTAK's video ports, which
+    # the relay forwards from this release. TVR shares MediaMTX's 8554 (the two conflict, so
+    # only one is ever deployed) and adds RTSPS 8555 and RTMP 1935. CloudTAK's are probed
+    # only for a local deploy: the relay forwards to this box, not to a remote CloudTAK host.
+    # SRT (8890 / 18890) is UDP and not probed, for the reason given for MediaMTX above.
+    if settings.get('tak_video_restreamer_enabled'):
+        if 8554 not in {p for p, _label, _req in ports}:
+            ports.append((8554, 'Video RTSP (TAK Video Restreamer)', True))
+        ports.append((8555, 'Video RTSPS (TAK Video Restreamer)', True))
+        ports.append((1935, 'Video RTMP (TAK Video Restreamer)', True))
+    try:
+        _ct = _get_cloudtak_deployment_config(settings)
+        _ct_dir = os.path.expanduser('~/CloudTAK')
+        if _ct.get('target_mode') != 'remote' and any(
+                os.path.exists(os.path.join(_ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
+            ports.append((18554, 'CloudTAK video RTSP', True))
+            ports.append((11935, 'CloudTAK video RTMP', True))
     except Exception:
         pass
     return ports
@@ -42239,16 +42270,19 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # it is re-applied after every clone/git-checkout, like the port patches.
             if _host_arch() == 'arm64':
                 _ct = _re.sub(r'(image:\s*)postgis/postgis:', r'\g<1>imresamu/postgis:', _ct)
-                # tiles (pmtiles) won't run on arm64: its @mapbox/vtquery@0.6.0
-                # native addon has no arm64 build and only compiles via the
-                # deprecated mason toolchain (amd64-only C++ deps). Stop the
-                # crash-loop — restart 'always' → 'no' so it exits once and stays
-                # quiet. pmtiles generation is unavailable on arm64 (non-core; the
-                # map + all other CloudTAK features work). Targets the tiles
-                # service uniquely via its dockerfile path.
-                _ct = _re.sub(
-                    r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)'?always'?",
-                    r"\g<1>'no'", _ct, count=1)
+                # tiles (pmtiles) on arm64: @mapbox/vtquery@0.6.0's arm64 prebuilt is
+                # glibc-only, so tiles runs only once _patch_cloudtak_tiles_arm64() has
+                # moved its build off Alpine. While the Dockerfile is still Alpine (the
+                # image on the box was built from it), the container crash-loops —
+                # restart 'always' → 'no' so it exits once and stays quiet. Once it
+                # builds on glibc, put 'always' back so tiles comes back after a reboot
+                # like every other service. Targets the tiles service uniquely via its
+                # dockerfile path.
+                _tiles_rs = r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)"
+                if _cloudtak_tiles_builds_on_alpine(cloudtak_dir):
+                    _ct = _re.sub(_tiles_rs + r"'?always'?", r"\g<1>'no'", _ct, count=1)
+                else:
+                    _ct = _re.sub(_tiles_rs + r"'no'", r"\g<1>'always'", _ct, count=1)
 
             if _ct != _orig:
                 with open(_path, 'w') as f:
@@ -42258,6 +42292,50 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             pass
         break  # only patch the first matching file
     return changed
+
+
+_CLOUDTAK_TILES_DOCKERFILE = os.path.join('tasks', 'pmtiles', 'Dockerfile.compose')
+
+
+def _cloudtak_tiles_builds_on_alpine(cloudtak_dir):
+    """True while CloudTAK's tiles Dockerfile still builds FROM a node Alpine image.
+    An unreadable or missing file counts as Alpine, so the arm64 restart gate stays on."""
+    try:
+        with open(os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)) as f:
+            return bool(re.search(r'(?m)^FROM\s+node:\S*alpine', f.read()))
+    except OSError:
+        return True
+
+
+def _patch_cloudtak_tiles_arm64(cloudtak_dir=None):
+    """arm64 only: build CloudTAK's tiles service (tasks/pmtiles) on a glibc Node image.
+
+    Upstream builds tiles FROM node:*-alpine (musl). Its native dep @mapbox/vtquery has
+    no musl-arm64 prebuilt; node-pre-gyp pulls the glibc one, which fails to load
+    ("__libc_single_threaded: symbol not found") and tiles exits 1. Debian bookworm-slim
+    is glibc, so the same prebuilt loads. x86 stays on Alpine (works there).
+
+    The Dockerfile is tracked, so every checkout puts Alpine back: call this after each
+    one, before the build and before _patch_cloudtak_compose_ports() (which reads the
+    result to decide tiles' restart policy). Until v10.2.12 only Deploy did, so the first
+    CloudTAK Update rebuilt tiles on Alpine and it stayed down on every arm64 box.
+    Returns True if the file changed."""
+    if _host_arch() != 'arm64':
+        return False
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    path = os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        cur = f.read()
+    new = re.sub(r'(?m)^FROM\s+node:([\w.\-]+)-alpine[\w.\-]*',
+                 r'FROM node:\1-bookworm-slim', cur, count=1)
+    if new == cur:
+        return False
+    with open(path, 'w') as f:
+        f.write(new)
+    return True
 
 
 def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
@@ -42965,6 +43043,11 @@ def run_cloudtak_deploy(cfg=None):
             if not _cloudtak_store_image_status(cloudtak_dir, log=plog)[0]:
                 # the pin is unfetchable: use an image the operator built, if there is one
                 _cloudtak_adopt_local_store_image(cloudtak_dir, log=plog)
+            try:
+                if _patch_cloudtak_tiles_arm64(cloudtak_dir):
+                    plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -42990,27 +43073,6 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"  API URL: {api_url}")
         if media_url:
             plog(f"  Media URL: {media_url} (CloudTAK media container — port 9997 hardcoded in source)")
-
-        # v10.0.1 arm64: CloudTAK's tiles task (tasks/pmtiles) builds FROM node:*-alpine
-        # (musl libc), but its native dep @mapbox/vtquery has NO musl-arm64 prebuilt — the
-        # glibc prebuilt it pulls fails to load at runtime ("__libc_single_threaded: symbol
-        # not found"), crashing cloudtak-tiles on arm64. Swap the tiles base to a glibc
-        # (Debian bookworm) Node image on arm64 so the prebuilt resolves. x86 stays on Alpine
-        # (works there). Re-applied on every deploy so it survives a CloudTAK source refresh.
-        try:
-            if (os.uname().machine or '').lower() in ('aarch64', 'arm64'):
-                _tiles_df = os.path.join(cloudtak_dir, 'tasks', 'pmtiles', 'Dockerfile.compose')
-                if os.path.isfile(_tiles_df):
-                    with open(_tiles_df) as _f:
-                        _dfc = _f.read()
-                    _newdf = re.sub(r'(?m)^FROM\s+node:([\w.\-]+)-alpine[\w.\-]*',
-                                    r'FROM node:\1-bookworm-slim', _dfc, count=1)
-                    if _newdf != _dfc:
-                        with open(_tiles_df, 'w') as _f:
-                            _f.write(_newdf)
-                        plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
-        except Exception as _te:
-            plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
 
         # Step 4: Build Docker images (stream output, 90 min timeout with retry + recovery)
         plog("")
@@ -44043,6 +44105,11 @@ def run_cloudtak_update():
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
         else:
+            try:
+                if _patch_cloudtak_tiles_arm64(cloudtak_dir):
+                    plog("  arm64: re-applied tiles Dockerfile base alpine→bookworm-slim after checkout")
+            except Exception as _te:
+                plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
             try:
                 _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
@@ -48165,6 +48232,10 @@ def _netbird_complete_setup(settings, plog):
         if e.code == 412:
             pat = settings.get('netbird_pat') or ''
             plog('  ✓ Setup already completed (HTTP 412)')
+            if pat and not _netbird_pat_is_valid(pat):
+                settings.pop('netbird_pat', None)
+                save_settings(settings)
+                pat = ''
             return pat or '__already_done__'
         err = ''
         try:
@@ -48192,18 +48263,40 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
     }).encode()
 
     idp_redirect = None
+    # NetBird accepts a second POST with the same name, and every one is another
+    # "Authentik" button on the login page — so a redeploy updates the existing entry
+    # instead (#72). Extra entries from earlier redeploys are left alone: a dex user
+    # id embeds its connector id, so deleting one would orphan whoever signed in with it.
+    existing = None
     try:
-        resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
-        body = json.loads(resp.read().decode())
+        resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
+        idps = json.loads(resp.read().decode())
+        items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
+        existing = next((i for i in items if 'authentik' in (i.get('name') or '').lower() and i.get('id')), None)
+    except Exception:
+        pass
+    try:
+        if existing:
+            resp = _netbird_mgmt_request(f"/api/identity-providers/{existing['id']}", method='PUT',
+                                         data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik external OIDC IDP already registered — updated in place')
+        else:
+            resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
+            body = json.loads(resp.read().decode())
+            plog('  ✓ Authentik registered as external OIDC IDP')
         idp_redirect = body.get('redirect_uri') or body.get('redirectURL') or body.get('redirect_url')
-        plog('  ✓ Authentik registered as external OIDC IDP')
     except urllib.error.HTTPError as e:
         err_body = ''
         try:
             err_body = e.read().decode()[:300]
         except Exception:
             pass
-        if e.code in (400, 409, 422):
+        if existing:
+            # It is registered and the login button works; only the refresh failed.
+            plog(f'  ⚠ Authentik IDP already registered; update failed HTTP {e.code}: {err_body[:200]}')
+            idp_redirect = existing.get('redirect_uri') or existing.get('redirectURL')
+        elif e.code in (400, 409, 422):
             plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
             try:
                 resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
@@ -48450,10 +48543,15 @@ def _run_netbird_deploy(settings):
         authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
         auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
-        setup_pat = not settings.get('netbird_pat')
+        # Always allow the setup PAT during bootstrap (#72). Keying this off "no PAT in
+        # settings" broke every redeploy that still carried an old PAT (an uninstall that
+        # never reached its settings cleanup, a hand-removed ~/netbird): the fresh store's
+        # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
+        # registered, and the deploy still reported success. The flag only matters while
+        # setup is required, and Step 5 rewrites the compose without it.
         _nb_target_srv, _ = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
-        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat, store_key=nb_store_key)
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
 
         plog('  Pulling images...')
@@ -48466,6 +48564,11 @@ def _run_netbird_deploy(settings):
         plog('')
         plog('━━━ Step 4/6: Initial Setup (akadmin) ━━━')
         pat = _netbird_complete_setup(settings, plog)
+        if pat is None:
+            # No owner means nobody can sign in, and no PAT means Authentik can't be
+            # registered. Stop here instead of reporting success over a dead login (#72).
+            raise RuntimeError('NetBird owner setup failed (see the line above), so there is no '
+                               'account to sign in to. Fix the cause and press Deploy again.')
 
         plog('')
         plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
@@ -48474,7 +48577,10 @@ def _run_netbird_deploy(settings):
         plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
         pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
         if pat:
-            _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
+            if not _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
+                raise RuntimeError('Authentik could not be registered as the NetBird login provider '
+                                   '(see the line above), so the Authentik button would be missing. '
+                                   'Press Deploy again once the cause is fixed.')
         else:
             plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
 
@@ -62418,13 +62524,22 @@ def run_authentik_deploy(reconfigure=False):
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
-                                plog("  Recreating LDAP + restarting Authentik server/worker (no log output for up to ~2 min)...")
-                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                                # Server/worker FIRST, LDAP only after the API answers. The old order
+                                # (LDAP recreate, then server restart) started a fresh outpost against
+                                # the server that was about to go down: it fetched its config, got a
+                                # 502 on the provider list as the server stopped, and panicked
+                                # ("Failed to run server"), once per update on every box (v10.2.11
+                                # T&E). An outpost that starts while the server is still coming up
+                                # just retries its config fetch, so LDAP last is always safe.
+                                plog("  Restarting Authentik server/worker, then LDAP (no log output for up to ~2 min)...")
                                 subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-                                plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
                                 plog("  Waiting for Authentik to come back online...")
-                                _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True)
-                                plog("  \u2713 Authentik is online and ready")
+                                if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
+                                    plog("  \u2713 Authentik is online and ready")
+                                else:
+                                    plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
+                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                                plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
                             except Exception as e:
                                 plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
                     else:
@@ -73624,10 +73739,53 @@ def _validate_snapshot_label(label):
 # _do_pg_dump uses the same value.
 _COT_DUMP_LOCK_WAIT = '120s'
 
-# The cot sessions that can stall a dump: every pg_dump, everything waiting on a lock and
-# whatever it is waiting behind, anything holding an exclusive table lock, transactions
-# left idle for over 30 s, and statements running for over a minute. One text column per
-# row (chr(31)-separated) so a stray character in a query can't shift the fields.
+# How long a cot pg_dump may run, from the database's size. A fixed 600 s killed a
+# HEALTHY dump of a 14 GB cot database (6.3 GB `resource`, 71 M `data_feed_cot` rows) still
+# in COPY with 1.2 GB written, so the 5.8 upgrade refused to start (infra-TAK #126). A dump
+# that cannot get its locks already gives up after _COT_DUMP_LOCK_WAIT, so this window only
+# bounds a dump that is making progress: 10 min, plus 15 min per GB, capped at the 6 h
+# upgrade-db.sh itself is allowed. Unknown size gets the cap — failing a good backup is
+# what this exists to stop. The broker clamps to the same cap (_PG_DUMP_MAX_TIMEOUT).
+_COT_DUMP_MIN_S = 600
+_COT_DUMP_S_PER_GB = 900
+_COT_DUMP_MAX_S = 6 * 3600
+
+
+def _cot_dump_timeout(size_bytes):
+    """Seconds a cot pg_dump may run for a database of size_bytes (None = unknown)."""
+    if size_bytes is None:
+        return _COT_DUMP_MAX_S
+    return min(_COT_DUMP_MIN_S + int(size_bytes) * _COT_DUMP_S_PER_GB // (1 << 30), _COT_DUMP_MAX_S)
+
+
+def _cot_dump_window_text(seconds):
+    return f'{seconds // 60} min' if seconds < 7200 else f'{seconds / 3600:.1f} h'
+
+
+def _cot_db_size_for_dump(tak_cfg, edb=None):
+    """Bytes in the cot database the snapshot is about to dump, or None. Asks the same
+    server the dump reads: managed DB over TCP, Server One over SSH, else local."""
+    try:
+        if edb and edb.get('host'):
+            r = subprocess.run(
+                ['psql', '-h', edb['host'], '-p', str(int(edb.get('port') or 5432)),
+                 '-U', edb.get('user') or 'martiuser', '-d', edb.get('name') or 'cot',
+                 '--no-password', '-tAc', 'SELECT pg_database_size(current_database());'],
+                capture_output=True, text=True, timeout=20,
+                env=dict(os.environ, PGPASSWORD=edb.get('password') or ''))
+            ok, out = r.returncode == 0, (r.stdout or '').strip()
+        else:
+            ok, out = _cotdb_psql(tak_cfg, "SELECT pg_database_size('cot');", timeout=20)
+        return int(out) if ok and out.isdigit() else None
+    except Exception:
+        return None
+
+# The cot sessions that can stall a dump: everything waiting on a lock and whatever it is
+# waiting behind, anything holding an exclusive table lock, transactions left idle for over
+# 30 s, and statements running for over a minute. A pg_dump shows up only when it is one of
+# those for lock reasons — a dump still in a long COPY is working, not stalled, and listing
+# it read as if the backup had blocked itself (infra-TAK #126). One text column per row
+# (chr(31)-separated) so a stray character in a query can't shift the fields.
 _COT_STALL_SQL = (
     "SELECT concat_ws(chr(31), a.pid,"
     " coalesce(nullif(a.application_name, ''), a.backend_type, '-'),"
@@ -73644,9 +73802,10 @@ _COT_STALL_SQL = (
     " left(regexp_replace(coalesce(a.query, ''), '\\s+', ' ', 'g'), 100))"
     " FROM pg_stat_activity a"
     " WHERE a.datname = 'cot' AND a.pid <> pg_backend_pid() AND ("
-    "  a.application_name = 'pg_dump' OR a.wait_event_type = 'Lock'"
-    "  OR (a.state LIKE 'idle in transaction%' AND a.state_change < now() - interval '30 seconds')"
-    "  OR (a.state = 'active' AND a.query_start < now() - interval '60 seconds')"
+    "  a.wait_event_type = 'Lock'"
+    "  OR (a.application_name IS DISTINCT FROM 'pg_dump' AND ("
+    "   (a.state LIKE 'idle in transaction%' AND a.state_change < now() - interval '30 seconds')"
+    "   OR (a.state = 'active' AND a.query_start < now() - interval '60 seconds')))"
     "  OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.granted"
     "             AND l.locktype = 'relation' AND l.mode = 'AccessExclusiveLock')"
     "  OR a.pid IN (SELECT unnest(pg_blocking_pids(b.pid)) FROM pg_stat_activity b"
@@ -73807,7 +73966,6 @@ def _tak_snapshot(label, plog=None):
     # In a two-server deployment the database lives on Server One — stream via SSH.
     # In a single-server deployment it runs locally as the postgres OS user.
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
-    plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
     meta['db_dump'] = False   # set True only when a non-empty cot dump actually lands
     try:
         _snap_settings = load_settings()
@@ -73815,6 +73973,11 @@ def _tak_snapshot(label, plog=None):
         _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
         _snap_s1 = _snap_tak_cfg.get('server_one', {})
         _snap_edb = _snap_tak_cfg.get('external_db', {}) if _snap_tak_cfg.get('mode') == 'external_db' else {}
+        _db_size = _cot_db_size_for_dump(_snap_tak_cfg, _snap_edb)
+        _dump_to = _cot_dump_timeout(_db_size)
+        _dump_win = _cot_dump_window_text(_dump_to)
+        plog("  snapshot: pg_dump starting — cot database %s, allowing up to %s…"
+             % (_cotdb_fmt_bytes(_db_size) if _db_size is not None else '(size unknown)', _dump_win))
         if _snap_edb.get('host'):
             # external_db / RDS: the DB is managed (no SSH, no local postgres) — dump over
             # TCP with the client pg_dump. Stream to a console-writable temp, then broker-cp
@@ -73849,8 +74012,9 @@ def _tak_snapshot(label, plog=None):
                     _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
                     with open(_tmp_dump, 'wb') as _f:
                         r2 = subprocess.run(
-                            [_pgdump, '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
-                            stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
+                            [_pgdump, '--lock-wait-timeout=' + _COT_DUMP_LOCK_WAIT, '-Fc',
+                             '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            stdout=_f, stderr=subprocess.PIPE, timeout=_dump_to, env=_pg_env)
                     if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
                         # Prove the archive READS, here, while the console still owns the
                         # file. The broker cannot vouch for this one: its pg_restore op
@@ -73897,7 +74061,9 @@ def _tak_snapshot(label, plog=None):
                     except Exception: pass
         elif _snap_two_server and _snap_s1.get('host'):
             plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
-            _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
+            # Same lock-wait as the local dumps: with a size-based window, a dump stuck
+            # behind a table lock would otherwise sit there for hours.
+            _ssh_dump_cmd = 'sudo -u postgres pg_dump --lock-wait-timeout=%s -Fc cot' % _COT_DUMP_LOCK_WAIT
             _host = (_snap_s1.get('host') or '').strip()
             _user = (_snap_s1.get('ssh_user') or 'root').strip() or 'root'
             _port = int(_snap_s1.get('ssh_port') or 22)
@@ -73920,7 +74086,7 @@ def _tak_snapshot(label, plog=None):
             os.close(_fd)
             try:
                 with open(_tmp_dump, 'wb') as _f:
-                    r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
+                    r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=_dump_to)
                 if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
                     _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
                     if _cp.returncode == 0:
@@ -73938,7 +74104,7 @@ def _tak_snapshot(label, plog=None):
             # itself (broker pg_dump op), so the 32MB socket cap that forced the v10.0.5
             # "DB dump deferred" skip no longer applies. Honest warning path on failure.
             try:
-                _sz = _pg_dump_priv(pg_dump_path, db='cot', timeout=600,
+                _sz = _pg_dump_priv(pg_dump_path, db='cot', timeout=_dump_to,
                                     container=(TAK_DB_CONTAINER if _tak_is_container() else None))
                 if _sz > 0:
                     meta['db_dump'] = True
@@ -73963,6 +74129,8 @@ def _tak_snapshot(label, plog=None):
             # runuser left pg_dump orphaned, still holding its locks and snapshot, until
             # the console restarted. A stuck or failed dump reports what the cot database
             # was doing (_cot_stall_report) instead of guessing.
+            # v10.2.12: the window scales with the database (_cot_dump_timeout), as the
+            # broker's does — 600 s flat killed a healthy 14 GB dump mid-COPY (#126).
             import signal as _signal
             r2 = None
             with open(pg_dump_path, 'wb') as _f:
@@ -73971,12 +74139,12 @@ def _tak_snapshot(label, plog=None):
                                       stdout=_f, stderr=subprocess.PIPE, cwd='/',
                                       start_new_session=True)
                 try:
-                    _err = _p.communicate(timeout=600)[1]
+                    _err = _p.communicate(timeout=_dump_to)[1]
                     r2 = subprocess.CompletedProcess(_p.args, _p.returncode, None, _err)
                 except subprocess.TimeoutExpired:
                     try: _wrote = os.path.getsize(pg_dump_path)
                     except OSError: _wrote = 0
-                    plog(f"  snapshot: pg_dump did not finish within 10 min — it had written "
+                    plog(f"  snapshot: pg_dump did not finish within {_dump_win} — it had written "
                          f"{_wrote // 1024} KB. db_dump=False.")
                     for _l in _cot_stall_report():   # before the kill: shows what pg_dump was doing
                         plog('  ' + _l)
@@ -75274,6 +75442,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
                 upgrade_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
             ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+        _tak_repair_container_healthchecks(ulog)
         # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
         # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
@@ -76985,6 +77154,108 @@ def _tak_container_running(name):
         return False
 
 
+# The hardened 5.8 images' Docker HEALTHCHECKs, and the container each one runs in.
+_TAK_HEALTH_DIRS = ((TAK_CONTAINER, '/opt/tak/health/takserver'),
+                    (TAK_DB_CONTAINER, '/opt/tak/health/takserver-db'))
+# The stock takserver check's client-cert args (takserver-docker-hardened-5.8-RELEASE-75),
+# and what replaces them.
+_TAK_HEALTH_P12_ARGS = '--cert-type P12 --cert /opt/tak/certs/files/"$ADMIN_CERT_NAME".p12:"$ADMIN_CERT_PASS"'
+_TAK_HEALTH_PEM_ARGS = ('--cert /opt/tak/certs/files/"$ADMIN_CERT_NAME".pem '
+                        '--key /opt/tak/certs/files/"$ADMIN_CERT_NAME".key --pass "$ADMIN_CERT_PASS"')
+_TAK_HEALTH_CERT_DEFAULTS = (
+    '# infra-TAK: nothing sets ADMIN_CERT_NAME / ADMIN_CERT_PASS, so default them to the\n'
+    '# admin cert the deploy creates and the cert password from cert-metadata.sh.\n'
+    'ADMIN_CERT_NAME=${ADMIN_CERT_NAME:-admin}\n'
+    'if [ -z "$ADMIN_CERT_PASS" ]; then\n'
+    '    ADMIN_CERT_PASS=$(. /opt/tak/certs/cert-metadata.sh >/dev/null 2>&1; echo "$PASS")\n'
+    'fi\n\n')
+
+
+def _tak_repair_container_healthchecks(log=None):
+    """Make the hardened 5.8 containers' own HEALTHCHECKs able to pass. Idempotent.
+
+    UPSTREAM PACKAGING BUGS (5.8 hardened, measured on ARM64 2026-10-11): both
+    containers report (unhealthy) forever while TAK serves normally.
+
+      takserver     health_check.sh curls 8443 with "$ADMIN_CERT_NAME".p12:"$ADMIN_CERT_PASS",
+                    but nothing sets either variable (TAK's own README `docker run` doesn't
+                    either), so it asks for `/opt/tak/certs/files/.p12` -> HTTPS state 000.
+                    Setting them is not enough: makeCert.sh writes legacy RC2 .p12 files
+                    (ATAK needs them) that the image's OpenSSL 3 refuses -
+                    `RC2-40-CBC ... unsupported`. The admin PEM cert + key return 200.
+      both          critical_file_list.txt names /usr/share/crypto-policies/back-ends/*/
+                    openssl.config, which the UBI 10 base does not ship. The integrity
+                    script fails on the first unreadable file, deletes its baseline and
+                    exits 1, so no file was ever integrity-checked at all.
+
+    The fix lives in the health files on the shared /opt/tak mount, NOT in the container's
+    run flags, so an installed box is repaired on the next console update without
+    recreating (and restarting) TAK. Missing entries are commented out, not deleted, and
+    existence is judged INSIDE each container as its own user, which is exactly the check
+    the integrity script makes - every file that exists is still baselined and verified.
+    A new bundle (upgrade) brings fresh copies, so the upgrade path runs this again.
+    Pre-hardened bundles have no health dir and no-op.
+    """
+    def _say(msg):
+        if log:
+            log(msg)
+
+    def _cx(name, args, timeout=30):
+        return subprocess.run(_sudo_wrap(['docker', 'exec', name] + args),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _cread(name, path):
+        r = _cx(name, ['cat', path])
+        return r.stdout if r.returncode == 0 else None
+
+    def _cwrite(name, path, body):
+        # `>` truncates in place, so the file keeps the owner/mode the container needs.
+        r = _cx(name, ['bash', '-c', 'printf "%s" "$1" > "$2"', '_', body, path])
+        if r.returncode != 0:
+            _say(f"  ⚠ could not update {path} in {name}: {(r.stderr or r.stdout or '').strip()[:160]}")
+        return r.returncode == 0
+
+    changed = False
+    for name, hdir in _TAK_HEALTH_DIRS:
+        try:
+            if not _tak_container_running(name):
+                _say(f"  {name} not running — healthcheck repair skipped")
+                continue
+            if name == TAK_CONTAINER:
+                script = f'{hdir}/health_check.sh'
+                body = _cread(name, script)
+                if body and _TAK_HEALTH_P12_ARGS in body:
+                    anchor = 'takserver_https_response='
+                    new = body.replace(_TAK_HEALTH_P12_ARGS, _TAK_HEALTH_PEM_ARGS)
+                    new = new.replace(anchor, _TAK_HEALTH_CERT_DEFAULTS + anchor, 1)
+                    if _cwrite(name, script, new):
+                        changed = True
+                        _say(f"  ✓ {name} healthcheck: admin cert named, PEM cert/key instead of legacy .p12")
+            lst = f'{hdir}/critical_file_list.txt'
+            body = _cread(name, lst)
+            if not body:
+                continue
+            paths = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith('#')]
+            if not paths:
+                continue
+            r = _cx(name, ['bash', '-c', 'for f; do [ -r "$f" ] || echo "$f"; done', '_'] + paths)
+            if r.returncode != 0:
+                continue
+            missing = {l for l in r.stdout.splitlines() if l}
+            if not missing:
+                continue
+            new = ''.join(
+                f'# not in this image, skipped by infra-TAK: {l.strip()}\n' if l.strip() in missing else l
+                for l in body.splitlines(keepends=True))
+            if _cwrite(name, lst, new):
+                changed = True
+                _say(f"  ✓ {name} integrity list: {len(missing)} file(s) the image does not ship skipped "
+                     f"({', '.join(sorted(missing))[:200]})")
+        except Exception as e:
+            _say(f"  ⚠ {name} healthcheck repair failed: {str(e)[:160]}")
+    return changed
+
+
 @_with_authentik_deploy_guard
 def _tak_bundle_repair_exec_bits(root, log=None):
     """Make every .sh under an unpacked TAK docker bundle executable.
@@ -77334,6 +77605,7 @@ def _deploy_takserver_container(config):
                 deploy_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
             log_step("⚠ Did not see 'messaging Microservice started' within 10 min — admin promote may need a retry. Check `docker logs takserver`.")
+        _tak_repair_container_healthchecks(log_step)
 
         # ── Step 9/9: Promote admin ─────────────────────────────────────────
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
@@ -77499,6 +77771,102 @@ def _deploy_takserver_container(config):
     except Exception as e:
         log_step(f"✗ Container deploy error: {str(e)[:300]}")
         deploy_status.update({'running': False, 'complete': False, 'error': True})
+
+
+def _tak_deploy_local_db_state():
+    """(server major, martiuser exists, cot exists) from the local cluster on the default
+    port, or None when it cannot be asked. Console-authored SQL only."""
+    r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
+                  "select current_setting('server_version_num')::int / 10000"
+                  " || ',' || (select count(*) from pg_roles where rolname='martiuser')"
+                  " || ',' || (select count(*) from pg_database where datname='cot')"],
+                 timeout=60)
+    parts = ((r.stdout or '').strip().split(',') if r and r.returncode == 0 else [])
+    if len(parts) != 3 or not all(p.strip().isdigit() for p in parts):
+        return None
+    major, role, db = (int(p) for p in parts)
+    return major, role > 0, db > 0
+
+
+def _tak_deploy_ensure_local_db(pkg_path, say, log):
+    """Single-server native deploy, after the package is installed: make sure TAK Server
+    has its database — a `martiuser` role, a `cot` database, and a schema at least as new
+    as the package needs. Returns True when it does; False means the deploy must stop.
+
+    Field: lutak2.net, 2026-10-07. The console's Remove (which drops cot and martiuser)
+    then a Deploy of 5.8 onto a box whose only PostgreSQL cluster was the 15 one. TAK's
+    5.8 package checks for PG15 binaries and, when it finds them, skips its database step
+    entirely ("A pg15 install has been detected. Please manually run sudo
+    /opt/tak/db-utils/upgrade-db.sh") — no PG18 cluster, no role, no database. Step 4 only
+    checked that some cluster mentioning 15 existed, so the deploy carried on and reported
+    success. Five days later the box had TAK Server running against nothing: every
+    certificate call timed out and Guard Dog's CoT database check was red.
+
+    Same remedy TAK prints and the 5.8 migration already runs: upgrade-db.sh, which
+    pg_upgradeclusters 15 → 18 (the 15 cluster is kept, stopped, as a copy) and then runs
+    takserver-setup-db.sh. takserver-setup-db.sh alone is NOT safe there: it rewrites
+    the config of whatever cluster answers on the default port with PG18 paths. The split
+    deploy has the matching check for Server One (_setup_server_one_rhel, Step 5b).
+    """
+    ver = _tak_artifact_version(pkg_path)
+    is58 = bool(ver and ver >= TAK_GATE_BLOCK_FROM)
+    want_major = TAK_PG_MAJOR if is58 else 15
+    min_sv = _TAK58_MIN_SCHEMA_VERSION if is58 else 1
+    tak_label = 'TAK Server %d.%d' % ver if ver else 'TAK Server'
+
+    def _ready():
+        st = _tak_deploy_local_db_state()
+        if not st or not st[1] or not st[2]:
+            return st, None
+        return st, _tak58_schema_version()
+
+    say("Checking TAK Server's database (martiuser, cot, schema)...")
+    st, sv = _ready()
+    if st is None:
+        say("✗ Could not ask the local PostgreSQL about TAK Server's database "
+            "(is a PostgreSQL cluster running on port 5432?).")
+        return False
+    major, has_role, has_db = st
+    if has_role and has_db and sv is not None and sv >= min_sv:
+        say("✓ Database ready (PostgreSQL %d, schema_version %d)" % (major, sv))
+        return True
+
+    missing = [n for n, ok in (('martiuser role', has_role), ('cot database', has_db)) if not ok]
+    say("  Found: PostgreSQL %d, %s." % (major, ', '.join(missing) + ' missing' if missing else
+                                         'schema_version %s' % (sv if sv is not None else 'unreadable')))
+    if is58 and major == 15:
+        say("  %s needs PostgreSQL %d, but this server's only database is the PostgreSQL 15 "
+            "cluster, so the package skipped its database setup. Running TAK's own "
+            "upgrade-db.sh (PostgreSQL 15 → %d, then takserver-setup-db.sh). The 15 cluster "
+            "is kept, stopped, as a copy." % (tak_label, TAK_PG_MAJOR, TAK_PG_MAJOR))
+        rc = _tak58_run_upgrade_db(log=log)
+        if rc != 0:
+            say("✗ upgrade-db.sh failed (exit %d). See the output above." % rc)
+            return False
+    elif major == want_major:
+        say("  Running TAK's takserver-setup-db.sh to create what is missing...")
+        rc = _tak58_run_setup_db()
+        if rc != 0:
+            say("  ⚠ takserver-setup-db.sh exited %d — checking the database anyway." % rc)
+    else:
+        say("✗ %s expects PostgreSQL %d but port 5432 is PostgreSQL %d. Not running TAK's "
+            "database setup against the wrong cluster." % (tak_label, want_major, major))
+        return False
+
+    st, sv = _ready()
+    if st and st[1] and st[2] and sv is not None and sv < min_sv:
+        # The script exits 0 even when SchemaManager could not log in (md5 vs scram).
+        _tak58_heal_md5_scram(say)
+        st, sv = _ready()
+    if st and st[1] and st[2] and sv is not None and sv >= min_sv:
+        say("✓ Database ready (PostgreSQL %d, martiuser and cot present, schema_version %d)"
+            % (st[0], sv))
+        return True
+    say("✗ TAK Server still has no usable database (PostgreSQL %s, martiuser %s, cot %s, "
+        "schema_version %s, needs >= %d)."
+        % (st[0] if st else '?', 'present' if st and st[1] else 'MISSING',
+           'present' if st and st[2] else 'MISSING', sv if sv is not None else 'unreadable', min_sv))
+    return False
 
 
 @_with_authentik_deploy_guard
@@ -77804,6 +78172,16 @@ def run_takserver_deploy(config):
                              "and retry." % (_pkg_state or 'not registered'))
                 deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
+
+        # Single-server: the package can install cleanly and still leave TAK with no
+        # database (lutak2, 2026-10-07 — see _tak_deploy_ensure_local_db). Check before
+        # the first start; never report a deploy complete over a missing cot database.
+        if not config.get('two_server') and not config.get('external_db'):
+            if not _tak_deploy_ensure_local_db(pkg, log_step, deploy_log):
+                log_step("✗ FATAL: TAK Server is installed but has no working database, so the "
+                         "deploy stops here rather than starting a server that cannot log in "
+                         "to it. See the database messages above.")
+                deploy_status.update({'error': True, 'running': False}); return
 
         # For external_db: patch CoreConfig JDBC URL NOW, before first start,
         # so TAKServer's own SchemaManager (triggered by systemd) targets the right DB.
@@ -86743,6 +87121,11 @@ def _post_update_auto_deploy():
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
 
+            # The hardened 5.8 containers' own healthchecks can never pass as shipped.
+            # Repaired on the shared mount, so no TAK restart.
+            if _tak_is_container():
+                _tak_repair_container_healthchecks(lambda m: print(f"Post-update:{m}", flush=True))
+
             # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
             # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
@@ -87347,9 +87730,16 @@ def _post_update_auto_deploy():
                                     subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
                                     print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
                         if _ak != _ak_orig:
-                            print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
+                            print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
+                            # ops #30: LDAP after the server is healthy, never in the same
+                            # `up` (an outpost that starts against the old server panics
+                            # when that server goes away mid start-up).
                             subprocess.run(
-                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
+                            )
+                            _wait_for_authentik_stack_healthy(lambda m: print(f"Post-update: {m}"), timeout=180)
+                            subprocess.run(
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
                             )
                             # Verify CapDrop was applied to server and ldap (worker is intentionally excluded)
                             import time as _harden_t

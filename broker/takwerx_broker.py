@@ -1659,6 +1659,10 @@ _PG_DUMP_CONTAINER = 'takserver-db'
 # window (lutak.net 2026-10-02). Fail after this and let the console name the holder.
 # Same value as the console's _COT_DUMP_LOCK_WAIT.
 _PG_DUMP_LOCK_WAIT = '120s'
+# v10.2.12: the console sizes the dump window from the cot database (10 min + 15 min/GB);
+# clamping it to DEFAULT_TIMEOUT killed a healthy 14 GB dump mid-COPY (infra-TAK #126).
+# Capped at the 6 h the tak58 migration op allows. Same value as the console's _COT_DUMP_MAX_S.
+_PG_DUMP_MAX_TIMEOUT = 6 * 3600
 # Dump-authenticity key (SECURITY, v10.0.8): the snapshot dir lives under the
 # console-writable /opt/tak/ prefix, so the console CAN write arbitrary bytes to
 # a *.pgdump path. Restoring an attacker-crafted pg custom archive would run its
@@ -1933,7 +1937,7 @@ def _do_pg_dump(req):
         argv = [runuser, '-u', 'postgres', '--', pg_dump,
                 '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
     # applies, and postgres needs no write access to the snapshot dir.
     # Own session: a timeout kills pg_dump itself, not just runuser — an orphaned

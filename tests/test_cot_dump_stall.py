@@ -125,7 +125,7 @@ def test_root_console_dump_gives_up_on_locks_kills_its_group_and_reports():
     root = root[:root.index('Certificates') if 'Certificates' in root else 3000]
     assert "'--lock-wait-timeout=' + _COT_DUMP_LOCK_WAIT, '-Fc', 'cot']" in root
     assert 'start_new_session=True' in root and "cwd='/'" in root and 'shell=True' not in root
-    assert 'communicate(timeout=600)' in root
+    assert 'communicate(timeout=_dump_to)' in root
     to = root[root.index('except subprocess.TimeoutExpired'):]
     # the report runs BEFORE the kill — afterwards pg_dump's own session is gone
     assert to.index('_cot_stall_report()') < to.index('os.killpg(_p.pid, _signal.SIGKILL)')
