@@ -77773,6 +77773,102 @@ def _deploy_takserver_container(config):
         deploy_status.update({'running': False, 'complete': False, 'error': True})
 
 
+def _tak_deploy_local_db_state():
+    """(server major, martiuser exists, cot exists) from the local cluster on the default
+    port, or None when it cannot be asked. Console-authored SQL only."""
+    r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
+                  "select current_setting('server_version_num')::int / 10000"
+                  " || ',' || (select count(*) from pg_roles where rolname='martiuser')"
+                  " || ',' || (select count(*) from pg_database where datname='cot')"],
+                 timeout=60)
+    parts = ((r.stdout or '').strip().split(',') if r and r.returncode == 0 else [])
+    if len(parts) != 3 or not all(p.strip().isdigit() for p in parts):
+        return None
+    major, role, db = (int(p) for p in parts)
+    return major, role > 0, db > 0
+
+
+def _tak_deploy_ensure_local_db(pkg_path, say, log):
+    """Single-server native deploy, after the package is installed: make sure TAK Server
+    has its database — a `martiuser` role, a `cot` database, and a schema at least as new
+    as the package needs. Returns True when it does; False means the deploy must stop.
+
+    Field: lutak2.net, 2026-10-07. The console's Remove (which drops cot and martiuser)
+    then a Deploy of 5.8 onto a box whose only PostgreSQL cluster was the 15 one. TAK's
+    5.8 package checks for PG15 binaries and, when it finds them, skips its database step
+    entirely ("A pg15 install has been detected. Please manually run sudo
+    /opt/tak/db-utils/upgrade-db.sh") — no PG18 cluster, no role, no database. Step 4 only
+    checked that some cluster mentioning 15 existed, so the deploy carried on and reported
+    success. Five days later the box had TAK Server running against nothing: every
+    certificate call timed out and Guard Dog's CoT database check was red.
+
+    Same remedy TAK prints and the 5.8 migration already runs: upgrade-db.sh, which
+    pg_upgradeclusters 15 → 18 (the 15 cluster is kept, stopped, as a copy) and then runs
+    takserver-setup-db.sh. takserver-setup-db.sh alone is NOT safe there: it rewrites
+    the config of whatever cluster answers on the default port with PG18 paths. The split
+    deploy has the matching check for Server One (_setup_server_one_rhel, Step 5b).
+    """
+    ver = _tak_artifact_version(pkg_path)
+    is58 = bool(ver and ver >= TAK_GATE_BLOCK_FROM)
+    want_major = TAK_PG_MAJOR if is58 else 15
+    min_sv = _TAK58_MIN_SCHEMA_VERSION if is58 else 1
+    tak_label = 'TAK Server %d.%d' % ver if ver else 'TAK Server'
+
+    def _ready():
+        st = _tak_deploy_local_db_state()
+        if not st or not st[1] or not st[2]:
+            return st, None
+        return st, _tak58_schema_version()
+
+    say("Checking TAK Server's database (martiuser, cot, schema)...")
+    st, sv = _ready()
+    if st is None:
+        say("✗ Could not ask the local PostgreSQL about TAK Server's database "
+            "(is a PostgreSQL cluster running on port 5432?).")
+        return False
+    major, has_role, has_db = st
+    if has_role and has_db and sv is not None and sv >= min_sv:
+        say("✓ Database ready (PostgreSQL %d, schema_version %d)" % (major, sv))
+        return True
+
+    missing = [n for n, ok in (('martiuser role', has_role), ('cot database', has_db)) if not ok]
+    say("  Found: PostgreSQL %d, %s." % (major, ', '.join(missing) + ' missing' if missing else
+                                         'schema_version %s' % (sv if sv is not None else 'unreadable')))
+    if is58 and major == 15:
+        say("  %s needs PostgreSQL %d, but this server's only database is the PostgreSQL 15 "
+            "cluster, so the package skipped its database setup. Running TAK's own "
+            "upgrade-db.sh (PostgreSQL 15 → %d, then takserver-setup-db.sh). The 15 cluster "
+            "is kept, stopped, as a copy." % (tak_label, TAK_PG_MAJOR, TAK_PG_MAJOR))
+        rc = _tak58_run_upgrade_db(log=log)
+        if rc != 0:
+            say("✗ upgrade-db.sh failed (exit %d). See the output above." % rc)
+            return False
+    elif major == want_major:
+        say("  Running TAK's takserver-setup-db.sh to create what is missing...")
+        rc = _tak58_run_setup_db()
+        if rc != 0:
+            say("  ⚠ takserver-setup-db.sh exited %d — checking the database anyway." % rc)
+    else:
+        say("✗ %s expects PostgreSQL %d but port 5432 is PostgreSQL %d. Not running TAK's "
+            "database setup against the wrong cluster." % (tak_label, want_major, major))
+        return False
+
+    st, sv = _ready()
+    if st and st[1] and st[2] and sv is not None and sv < min_sv:
+        # The script exits 0 even when SchemaManager could not log in (md5 vs scram).
+        _tak58_heal_md5_scram(say)
+        st, sv = _ready()
+    if st and st[1] and st[2] and sv is not None and sv >= min_sv:
+        say("✓ Database ready (PostgreSQL %d, martiuser and cot present, schema_version %d)"
+            % (st[0], sv))
+        return True
+    say("✗ TAK Server still has no usable database (PostgreSQL %s, martiuser %s, cot %s, "
+        "schema_version %s, needs >= %d)."
+        % (st[0] if st else '?', 'present' if st and st[1] else 'MISSING',
+           'present' if st and st[2] else 'MISSING', sv if sv is not None else 'unreadable', min_sv))
+    return False
+
+
 @_with_authentik_deploy_guard
 def run_takserver_deploy(config):
     # v10.0.1 dispatch: arm64 (or operator-selected) container deploys route to
@@ -78076,6 +78172,16 @@ def run_takserver_deploy(config):
                              "and retry." % (_pkg_state or 'not registered'))
                 deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
+
+        # Single-server: the package can install cleanly and still leave TAK with no
+        # database (lutak2, 2026-10-07 — see _tak_deploy_ensure_local_db). Check before
+        # the first start; never report a deploy complete over a missing cot database.
+        if not config.get('two_server') and not config.get('external_db'):
+            if not _tak_deploy_ensure_local_db(pkg, log_step, deploy_log):
+                log_step("✗ FATAL: TAK Server is installed but has no working database, so the "
+                         "deploy stops here rather than starting a server that cannot log in "
+                         "to it. See the database messages above.")
+                deploy_status.update({'error': True, 'running': False}); return
 
         # For external_db: patch CoreConfig JDBC URL NOW, before first start,
         # so TAKServer's own SchemaManager (triggered by systemd) targets the right DB.
