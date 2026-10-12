@@ -50845,7 +50845,7 @@ window.doCloudtakResetConfig = function() {
 
 # Authentik module
 authentik_deploy_log = []
-authentik_deploy_status = {'running': False, 'complete': False, 'error': False}
+authentik_deploy_status = {'running': False, 'complete': False, 'error': False, 'partial': False, 'issues': []}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v10.0.1: serialize Authentik `docker compose` operations against the deploy.
@@ -51413,7 +51413,9 @@ def authentik_deploy_log_api():
     idx = request.args.get('index', 0, type=int)
     return jsonify({'entries': authentik_deploy_log[idx:], 'total': len(authentik_deploy_log),
         'running': authentik_deploy_status['running'], 'complete': authentik_deploy_status['complete'],
-        'error': authentik_deploy_status['error']})
+        'error': authentik_deploy_status['error'],
+        'partial': authentik_deploy_status.get('partial', False),
+        'issues': authentik_deploy_status.get('issues', [])})
 
 @app.route('/api/authentik/remote-metrics')
 @login_required
@@ -53821,7 +53823,7 @@ networks:
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
 
-def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
+def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None):
     """Reconfigure Authentik on remote host: ensure up, then run API steps (cookie domain, apps, outpost, policies)."""
     remote = deploy_cfg.get('remote', {})
     host = (remote.get('host') or '').strip()
@@ -53877,8 +53879,27 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     _authentik_enable_show_password(ak_url, ak_headers, plog)
     _sync_webadmin_after_authentik_reconfigure(plog)
     plog("")
-    plog("\u2713 Reconfigure complete (remote).")
-    authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)")
+
+
+def _authentik_reconfigure_finish(plog, issues, label):
+    """End a reconfigure run. "\u2713 complete" only when no step logged \u26a0/\u2717; otherwise list
+    the steps that did not finish and mark the run partial. Under load each Authentik
+    API step times out on its own and logs a \u26a0, and the run used to end on "\u2713 complete"
+    after a dozen of them (v10.2.12 T&E)."""
+    found = list(issues or [])
+    if not found:
+        plog(f"\u2713 {label} complete.")
+        authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
+                                        'partial': False, 'issues': []})
+        return True
+    plog(f"\u26a0 {label} finished, but {len(found)} step(s) did not complete:")
+    for msg in found:
+        plog("    - " + msg.lstrip(' ⚠✗'))
+    plog("  Nothing was removed. Fix what is listed (timeouts usually clear on a retry), then run Update config & reconnect again.")
+    authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
+                                    'partial': True, 'issues': found})
+    return False
 
 
 def _ak_live_compose_dir():
@@ -62358,10 +62379,16 @@ def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
 
 
 def run_authentik_deploy(reconfigure=False):
+    # Every ⚠/✗ line is a step that did not finish. Reconfigure collects them so it can
+    # say so at the end instead of always printing "✓ Reconfigure complete."
+    issues = []
+    authentik_deploy_status.update({'partial': False, 'issues': []})
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         authentik_deploy_log.append(entry)
         print(entry, flush=True)
+        if '⚠' in msg or '✗' in msg:
+            issues.append(msg.strip())
     try:
         ak_dir = os.path.expanduser('~/authentik')
         settings = load_settings()
@@ -62373,7 +62400,7 @@ def run_authentik_deploy(reconfigure=False):
         deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if deploy_cfg.get('target_mode') == 'remote':
             if reconfigure:
-                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog)
+                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues)
                 return
             _run_authentik_deploy_remote(settings, deploy_cfg, plog)
             return
@@ -62580,10 +62607,9 @@ def run_authentik_deploy(reconfigure=False):
             # password?" missing) on their next console update.
             plog("  Ensuring password-recovery flow...")
             _ensure_recovery_flow_standalone(env_path, plog)
-            plog("")
-            plog("\u2713 Reconfigure complete.")
             _sync_webadmin_after_authentik_reconfigure(plog)
-            authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            plog("")
+            _authentik_reconfigure_finish(plog, issues, "Reconfigure")
             return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
@@ -87326,6 +87352,9 @@ def _post_update_auto_deploy():
                         authentik_deploy_status.update({'running': True, 'complete': False, 'error': False})
                         try:
                             run_authentik_deploy(reconfigure=True)
+                            if authentik_deploy_status.get('partial'):
+                                print(f"Post-update: Authentik reconfigure PARTIAL — "
+                                      f"{len(authentik_deploy_status.get('issues') or [])} step(s) did not complete (see above)")
                         except Exception as e:
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
