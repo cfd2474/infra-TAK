@@ -57,12 +57,15 @@ def test_root_snapshot_dump_matches_the_broker_path():
     assert not re.search(r"'sudo -u postgres pg_dump -Fc cot',\s*shell=True", body)
     root = body[body.index("['runuser', '-u', 'postgres', '--', 'pg_dump',"):]
     root = root[:root.index('# 5. Certificates') if '# 5. Certificates' in root else 600]
-    assert "cwd='/'" in root and 'timeout=600' in root and 'shell=True' not in root
+    assert "cwd='/'" in root and 'timeout=_dump_to' in root and 'shell=True' not in root
     assert 'TimeoutExpired' in body                  # a timeout is reported, not swallowed
 
 
-def test_broker_pg_dump_window_is_the_same_600_seconds():
+def test_broker_pg_dump_window_matches_the_console_cap():
+    # Was a flat 600 s on both sides; now the console sizes it and the broker caps it at
+    # the same 6 h (infra-TAK #126). See test_cot_dump_window.py.
     broker = (REPO / 'broker' / 'takwerx_broker.py').read_text()
     do = broker[broker.index('def _do_pg_dump('):]
-    assert "min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)" in do
-    assert re.search(r'^DEFAULT_TIMEOUT = 600\b', broker, re.M)
+    assert "min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)" in do
+    assert re.search(r'^_PG_DUMP_MAX_TIMEOUT = 6 \* 3600\b', broker, re.M)
+    assert re.search(r'^_COT_DUMP_MAX_S = 6 \* 3600\b', APP, re.M)
