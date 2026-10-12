@@ -73739,10 +73739,53 @@ def _validate_snapshot_label(label):
 # _do_pg_dump uses the same value.
 _COT_DUMP_LOCK_WAIT = '120s'
 
-# The cot sessions that can stall a dump: every pg_dump, everything waiting on a lock and
-# whatever it is waiting behind, anything holding an exclusive table lock, transactions
-# left idle for over 30 s, and statements running for over a minute. One text column per
-# row (chr(31)-separated) so a stray character in a query can't shift the fields.
+# How long a cot pg_dump may run, from the database's size. A fixed 600 s killed a
+# HEALTHY dump of a 14 GB cot database (6.3 GB `resource`, 71 M `data_feed_cot` rows) still
+# in COPY with 1.2 GB written, so the 5.8 upgrade refused to start (infra-TAK #126). A dump
+# that cannot get its locks already gives up after _COT_DUMP_LOCK_WAIT, so this window only
+# bounds a dump that is making progress: 10 min, plus 15 min per GB, capped at the 6 h
+# upgrade-db.sh itself is allowed. Unknown size gets the cap — failing a good backup is
+# what this exists to stop. The broker clamps to the same cap (_PG_DUMP_MAX_TIMEOUT).
+_COT_DUMP_MIN_S = 600
+_COT_DUMP_S_PER_GB = 900
+_COT_DUMP_MAX_S = 6 * 3600
+
+
+def _cot_dump_timeout(size_bytes):
+    """Seconds a cot pg_dump may run for a database of size_bytes (None = unknown)."""
+    if size_bytes is None:
+        return _COT_DUMP_MAX_S
+    return min(_COT_DUMP_MIN_S + int(size_bytes) * _COT_DUMP_S_PER_GB // (1 << 30), _COT_DUMP_MAX_S)
+
+
+def _cot_dump_window_text(seconds):
+    return f'{seconds // 60} min' if seconds < 7200 else f'{seconds / 3600:.1f} h'
+
+
+def _cot_db_size_for_dump(tak_cfg, edb=None):
+    """Bytes in the cot database the snapshot is about to dump, or None. Asks the same
+    server the dump reads: managed DB over TCP, Server One over SSH, else local."""
+    try:
+        if edb and edb.get('host'):
+            r = subprocess.run(
+                ['psql', '-h', edb['host'], '-p', str(int(edb.get('port') or 5432)),
+                 '-U', edb.get('user') or 'martiuser', '-d', edb.get('name') or 'cot',
+                 '--no-password', '-tAc', 'SELECT pg_database_size(current_database());'],
+                capture_output=True, text=True, timeout=20,
+                env=dict(os.environ, PGPASSWORD=edb.get('password') or ''))
+            ok, out = r.returncode == 0, (r.stdout or '').strip()
+        else:
+            ok, out = _cotdb_psql(tak_cfg, "SELECT pg_database_size('cot');", timeout=20)
+        return int(out) if ok and out.isdigit() else None
+    except Exception:
+        return None
+
+# The cot sessions that can stall a dump: everything waiting on a lock and whatever it is
+# waiting behind, anything holding an exclusive table lock, transactions left idle for over
+# 30 s, and statements running for over a minute. A pg_dump shows up only when it is one of
+# those for lock reasons — a dump still in a long COPY is working, not stalled, and listing
+# it read as if the backup had blocked itself (infra-TAK #126). One text column per row
+# (chr(31)-separated) so a stray character in a query can't shift the fields.
 _COT_STALL_SQL = (
     "SELECT concat_ws(chr(31), a.pid,"
     " coalesce(nullif(a.application_name, ''), a.backend_type, '-'),"
@@ -73759,9 +73802,10 @@ _COT_STALL_SQL = (
     " left(regexp_replace(coalesce(a.query, ''), '\\s+', ' ', 'g'), 100))"
     " FROM pg_stat_activity a"
     " WHERE a.datname = 'cot' AND a.pid <> pg_backend_pid() AND ("
-    "  a.application_name = 'pg_dump' OR a.wait_event_type = 'Lock'"
-    "  OR (a.state LIKE 'idle in transaction%' AND a.state_change < now() - interval '30 seconds')"
-    "  OR (a.state = 'active' AND a.query_start < now() - interval '60 seconds')"
+    "  a.wait_event_type = 'Lock'"
+    "  OR (a.application_name IS DISTINCT FROM 'pg_dump' AND ("
+    "   (a.state LIKE 'idle in transaction%' AND a.state_change < now() - interval '30 seconds')"
+    "   OR (a.state = 'active' AND a.query_start < now() - interval '60 seconds')))"
     "  OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND l.granted"
     "             AND l.locktype = 'relation' AND l.mode = 'AccessExclusiveLock')"
     "  OR a.pid IN (SELECT unnest(pg_blocking_pids(b.pid)) FROM pg_stat_activity b"
@@ -73922,7 +73966,6 @@ def _tak_snapshot(label, plog=None):
     # In a two-server deployment the database lives on Server One — stream via SSH.
     # In a single-server deployment it runs locally as the postgres OS user.
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
-    plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
     meta['db_dump'] = False   # set True only when a non-empty cot dump actually lands
     try:
         _snap_settings = load_settings()
@@ -73930,6 +73973,11 @@ def _tak_snapshot(label, plog=None):
         _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
         _snap_s1 = _snap_tak_cfg.get('server_one', {})
         _snap_edb = _snap_tak_cfg.get('external_db', {}) if _snap_tak_cfg.get('mode') == 'external_db' else {}
+        _db_size = _cot_db_size_for_dump(_snap_tak_cfg, _snap_edb)
+        _dump_to = _cot_dump_timeout(_db_size)
+        _dump_win = _cot_dump_window_text(_dump_to)
+        plog("  snapshot: pg_dump starting — cot database %s, allowing up to %s…"
+             % (_cotdb_fmt_bytes(_db_size) if _db_size is not None else '(size unknown)', _dump_win))
         if _snap_edb.get('host'):
             # external_db / RDS: the DB is managed (no SSH, no local postgres) — dump over
             # TCP with the client pg_dump. Stream to a console-writable temp, then broker-cp
@@ -73964,8 +74012,9 @@ def _tak_snapshot(label, plog=None):
                     _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
                     with open(_tmp_dump, 'wb') as _f:
                         r2 = subprocess.run(
-                            [_pgdump, '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
-                            stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
+                            [_pgdump, '--lock-wait-timeout=' + _COT_DUMP_LOCK_WAIT, '-Fc',
+                             '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            stdout=_f, stderr=subprocess.PIPE, timeout=_dump_to, env=_pg_env)
                     if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
                         # Prove the archive READS, here, while the console still owns the
                         # file. The broker cannot vouch for this one: its pg_restore op
@@ -74012,7 +74061,9 @@ def _tak_snapshot(label, plog=None):
                     except Exception: pass
         elif _snap_two_server and _snap_s1.get('host'):
             plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
-            _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
+            # Same lock-wait as the local dumps: with a size-based window, a dump stuck
+            # behind a table lock would otherwise sit there for hours.
+            _ssh_dump_cmd = 'sudo -u postgres pg_dump --lock-wait-timeout=%s -Fc cot' % _COT_DUMP_LOCK_WAIT
             _host = (_snap_s1.get('host') or '').strip()
             _user = (_snap_s1.get('ssh_user') or 'root').strip() or 'root'
             _port = int(_snap_s1.get('ssh_port') or 22)
@@ -74035,7 +74086,7 @@ def _tak_snapshot(label, plog=None):
             os.close(_fd)
             try:
                 with open(_tmp_dump, 'wb') as _f:
-                    r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
+                    r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=_dump_to)
                 if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
                     _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
                     if _cp.returncode == 0:
@@ -74053,7 +74104,7 @@ def _tak_snapshot(label, plog=None):
             # itself (broker pg_dump op), so the 32MB socket cap that forced the v10.0.5
             # "DB dump deferred" skip no longer applies. Honest warning path on failure.
             try:
-                _sz = _pg_dump_priv(pg_dump_path, db='cot', timeout=600,
+                _sz = _pg_dump_priv(pg_dump_path, db='cot', timeout=_dump_to,
                                     container=(TAK_DB_CONTAINER if _tak_is_container() else None))
                 if _sz > 0:
                     meta['db_dump'] = True
@@ -74078,6 +74129,8 @@ def _tak_snapshot(label, plog=None):
             # runuser left pg_dump orphaned, still holding its locks and snapshot, until
             # the console restarted. A stuck or failed dump reports what the cot database
             # was doing (_cot_stall_report) instead of guessing.
+            # v10.2.12: the window scales with the database (_cot_dump_timeout), as the
+            # broker's does — 600 s flat killed a healthy 14 GB dump mid-COPY (#126).
             import signal as _signal
             r2 = None
             with open(pg_dump_path, 'wb') as _f:
@@ -74086,12 +74139,12 @@ def _tak_snapshot(label, plog=None):
                                       stdout=_f, stderr=subprocess.PIPE, cwd='/',
                                       start_new_session=True)
                 try:
-                    _err = _p.communicate(timeout=600)[1]
+                    _err = _p.communicate(timeout=_dump_to)[1]
                     r2 = subprocess.CompletedProcess(_p.args, _p.returncode, None, _err)
                 except subprocess.TimeoutExpired:
                     try: _wrote = os.path.getsize(pg_dump_path)
                     except OSError: _wrote = 0
-                    plog(f"  snapshot: pg_dump did not finish within 10 min — it had written "
+                    plog(f"  snapshot: pg_dump did not finish within {_dump_win} — it had written "
                          f"{_wrote // 1024} KB. db_dump=False.")
                     for _l in _cot_stall_report():   # before the kill: shows what pg_dump was doing
                         plog('  ' + _l)
