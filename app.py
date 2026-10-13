@@ -42738,7 +42738,14 @@ def run_cloudtak_deploy(cfg=None):
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
+                # Stop a stack that is already there before deleting its tree. The Garage store
+                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+                # it came back during the rm -rf, Docker re-created the folder, and Garage
+                # initialized it with the OLD key; the new stack then crash-looped on a key
+                # mismatch (ops #33 box test, redeploy over an existing remote install).
                 prep_cmd = (
+                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
                     f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
                 )

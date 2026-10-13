@@ -311,3 +311,13 @@ def test_remote_deploy_sets_media_kernel_buffers_before_starting_containers():
     body = re.search(r'^def run_cloudtak_deploy\(.*?(?=^def )', APP, re.S | re.M).group(0)
     remote = body[:body.index('# Step 1: Check Docker')]
     assert remote.index('_cloudtak_remote_media_bufs(remote_cfg, plog)') < remote.index('docker compose up -d')
+
+
+def test_remote_deploy_stops_the_old_stack_before_deleting_its_tree():
+    """A running Garage store (restart: always) re-created ~/CloudTAK/.docker-garage during the
+    rm -rf and initialized it with the old key, so the new stack crash-looped on a key mismatch."""
+    body = re.search(r'^def run_cloudtak_deploy\(.*?(?=^def )', APP, re.S | re.M).group(0)
+    remote = re.sub(r'#.*', '', body[:body.index('# Step 1: Check Docker')])
+    tagged = remote[remote.index('if remote_release_tag:'):remote.index('else:', remote.index('if remote_release_tag:'))]
+    assert tagged.index('docker compose down --remove-orphans') < tagged.index('rm -rf ~/CloudTAK')
+    assert 'down -v' not in tagged          # the postgis volume (and its password) survives a redeploy
