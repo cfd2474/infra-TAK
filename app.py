@@ -28438,6 +28438,19 @@ def _get_cloudtak_deployment_config(settings):
     return _normalize_cloudtak_deployment_config(settings.get('cloudtak_deployment', {}))
 
 
+def _cloudtak_cfg_for_installed_action(saved, incoming):
+    """Target for an action on an existing CloudTAK (Update config, Remove).
+
+    A deployed CloudTAK stays where it was deployed: the request cannot move it. The page
+    has no target form once CloudTAK is installed, and the old JS filled the gap with
+    target_mode "local", so Update config on a remote CloudTAK saved it as local and the
+    page went to "not installed" (ops #33). A page cached from before the fix still sends
+    that. Not deployed (a failed first install): the form is on the page, so it counts."""
+    if saved.get('deployed') or not isinstance(incoming, dict) or not incoming:
+        return saved
+    return _normalize_cloudtak_deployment_config(_deep_merge_dict(saved, incoming))
+
+
 # ---------------------------------------------------------------------------
 # Generic module deployment config (reused by TAK Portal, Authentik,
 # MediaMTX, Node-RED — anything that supports local/remote deploy)
@@ -39115,8 +39128,12 @@ def cloudtak_get_deployment_config():
 def cloudtak_save_deployment_config():
     data = request.get_json() or {}
     incoming = data.get('config', data)
-    cfg = _normalize_cloudtak_deployment_config(incoming)
     settings = load_settings()
+    # Merge onto what is saved, like every other CloudTAK config route: the form never
+    # sends `deployed`, so replacing the whole dict reset it to False (ops #33).
+    cfg = _normalize_cloudtak_deployment_config(
+        _deep_merge_dict(_get_cloudtak_deployment_config(settings),
+                         incoming if isinstance(incoming, dict) else {}))
     settings['cloudtak_deployment'] = cfg
     save_settings(settings)
     return jsonify({'success': True, 'config': cfg})
@@ -40059,9 +40076,9 @@ def cloudtak_redeploy_api():
     """Update .env and override, restart containers, re-apply nginx patch. Use when CloudTAK is already installed."""
     data = request.get_json() or {}
     settings = load_settings()
-    cfg = _get_cloudtak_deployment_config(settings)
-    if isinstance(data.get('config'), dict):
-        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    saved = _get_cloudtak_deployment_config(settings)
+    cfg = _cloudtak_cfg_for_installed_action(saved, data.get('config'))
+    if cfg != saved:
         settings['cloudtak_deployment'] = cfg
         save_settings(settings)
     with _cloudtak_deploy_lock:
@@ -40185,13 +40202,16 @@ def cloudtak_uninstall():
     if cloudtak_uninstall_status.get('running'):
         return jsonify({'error': 'Uninstall already in progress'}), 409
     # If UI sent an explicit target config, persist it first so uninstall uses
-    # the same target the user currently selected.
+    # the same target the user currently selected — unless CloudTAK is deployed, in
+    # which case it is removed from where it actually runs (ops #33).
     if req_cfg is not None:
         try:
             settings = load_settings()
-            merged = _normalize_cloudtak_deployment_config(req_cfg)
-            settings['cloudtak_deployment'] = merged
-            save_settings(settings)
+            saved = _get_cloudtak_deployment_config(settings)
+            merged = _cloudtak_cfg_for_installed_action(saved, req_cfg)
+            if merged != saved:
+                settings['cloudtak_deployment'] = merged
+                save_settings(settings)
         except Exception as e:
             return jsonify({'error': f'Could not save deployment target: {e}'}), 400
     cloudtak_uninstall_status.update({'running': True, 'done': False, 'error': None})
@@ -42777,6 +42797,17 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog("✓ Containers built and restarted.")
+            # Persist deployed=True BEFORE the Caddyfile is generated (same as the local path):
+            # generate_caddyfile() only writes the map./tiles./video. sites when detect_modules()
+            # says CloudTAK is installed, and for a remote target that is this flag. Saving it
+            # after Caddy left a fresh remote install with no site at all — no certificate, so
+            # https://map.<fqdn> failed to connect even though the deploy said it worked (ops #33).
+            try:
+                cfg['deployed'] = True
+                settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+                save_settings(settings)
+            except Exception as _e:
+                plog(f"  ⚠ Could not persist deployment flag: {_e}")
             fw_cmd = (
                 "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
                 "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
@@ -42823,9 +42854,6 @@ def run_cloudtak_deploy(cfg=None):
                     plog(f"⚠ Caddy reload issue: {_d.strip()[:140]}")
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
-            cfg['deployed'] = True
-            settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
-            save_settings(settings)
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
@@ -50176,7 +50204,11 @@ window.logInterval = null;
 
 window.collectDeployConfig = function() {
   var modeEl = document.getElementById("cloudtak-target-mode");
-  var mode = modeEl ? modeEl.value : "local";
+  // The target form is only on the page before install. Once installed it is gone, and
+  // defaulting to "local" here made Update config / Remove flip a remote CloudTAK to
+  // local: the page then said "not installed" (ops #33). No form = keep the saved target.
+  if (!modeEl) return {};
+  var mode = modeEl.value;
   var cfg = { target_mode: mode };
   if (mode === "remote") {
     var host = (document.getElementById("cloudtak-remote-host") || {}).value || "";
