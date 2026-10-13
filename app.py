@@ -28438,6 +28438,19 @@ def _get_cloudtak_deployment_config(settings):
     return _normalize_cloudtak_deployment_config(settings.get('cloudtak_deployment', {}))
 
 
+def _cloudtak_cfg_for_installed_action(saved, incoming):
+    """Target for an action on an existing CloudTAK (Update config, Remove).
+
+    A deployed CloudTAK stays where it was deployed: the request cannot move it. The page
+    has no target form once CloudTAK is installed, and the old JS filled the gap with
+    target_mode "local", so Update config on a remote CloudTAK saved it as local and the
+    page went to "not installed" (ops #33). A page cached from before the fix still sends
+    that. Not deployed (a failed first install): the form is on the page, so it counts."""
+    if saved.get('deployed') or not isinstance(incoming, dict) or not incoming:
+        return saved
+    return _normalize_cloudtak_deployment_config(_deep_merge_dict(saved, incoming))
+
+
 # ---------------------------------------------------------------------------
 # Generic module deployment config (reused by TAK Portal, Authentik,
 # MediaMTX, Node-RED — anything that supports local/remote deploy)
@@ -39115,8 +39128,12 @@ def cloudtak_get_deployment_config():
 def cloudtak_save_deployment_config():
     data = request.get_json() or {}
     incoming = data.get('config', data)
-    cfg = _normalize_cloudtak_deployment_config(incoming)
     settings = load_settings()
+    # Merge onto what is saved, like every other CloudTAK config route: the form never
+    # sends `deployed`, so replacing the whole dict reset it to False (ops #33).
+    cfg = _normalize_cloudtak_deployment_config(
+        _deep_merge_dict(_get_cloudtak_deployment_config(settings),
+                         incoming if isinstance(incoming, dict) else {}))
     settings['cloudtak_deployment'] = cfg
     save_settings(settings)
     return jsonify({'success': True, 'config': cfg})
@@ -40059,9 +40076,9 @@ def cloudtak_redeploy_api():
     """Update .env and override, restart containers, re-apply nginx patch. Use when CloudTAK is already installed."""
     data = request.get_json() or {}
     settings = load_settings()
-    cfg = _get_cloudtak_deployment_config(settings)
-    if isinstance(data.get('config'), dict):
-        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    saved = _get_cloudtak_deployment_config(settings)
+    cfg = _cloudtak_cfg_for_installed_action(saved, data.get('config'))
+    if cfg != saved:
         settings['cloudtak_deployment'] = cfg
         save_settings(settings)
     with _cloudtak_deploy_lock:
@@ -40185,13 +40202,16 @@ def cloudtak_uninstall():
     if cloudtak_uninstall_status.get('running'):
         return jsonify({'error': 'Uninstall already in progress'}), 409
     # If UI sent an explicit target config, persist it first so uninstall uses
-    # the same target the user currently selected.
+    # the same target the user currently selected — unless CloudTAK is deployed, in
+    # which case it is removed from where it actually runs (ops #33).
     if req_cfg is not None:
         try:
             settings = load_settings()
-            merged = _normalize_cloudtak_deployment_config(req_cfg)
-            settings['cloudtak_deployment'] = merged
-            save_settings(settings)
+            saved = _get_cloudtak_deployment_config(settings)
+            merged = _cloudtak_cfg_for_installed_action(saved, req_cfg)
+            if merged != saved:
+                settings['cloudtak_deployment'] = merged
+                save_settings(settings)
         except Exception as e:
             return jsonify({'error': f'Could not save deployment target: {e}'}), 400
     cloudtak_uninstall_status.update({'running': True, 'done': False, 'error': None})
@@ -41909,6 +41929,23 @@ def _cloudtak_remote_garage_sh(legacy_image=''):
         f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
 
 
+def _cloudtak_remote_media_bufs(remote_cfg, plog):
+    """`_startup_media_kernel_bufs()` for a remote CloudTAK host. MediaMTX >= 1.19 needs a 4MB
+    kernel UDP read buffer, and net.core is a HOST sysctl: the startup migration only ever set
+    it on the console box, so cloudtak-media crash-looped on every fresh remote host ("unable to
+    set read buffer size to 4194304", ops #33 box test). Never raises."""
+    cmd = ("S=; [ \"$(id -u)\" -ne 0 ] && S=sudo; "
+           "printf 'net.core.rmem_max = 4194304\\nnet.core.wmem_max = 4194304\\n' "
+           "| $S tee /etc/sysctl.d/99-takwerx-media-bufs.conf >/dev/null && "
+           "$S sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304 >/dev/null")
+    try:
+        ok, out = _ssh_probe(remote_cfg, cmd, timeout=30)
+    except Exception as e:
+        ok, out = False, str(e)
+    plog("✓ Media kernel buffers set on remote (4 MB)" if ok
+         else f"  ⚠ Could not set media kernel buffers on remote: {(out or '')[:160]}")
+
+
 def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
     """`_cloudtak_garage_rollback()` over SSH. Never raises."""
     try:
@@ -41926,6 +41963,21 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
              else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
+def _cloudtak_env_secrets(env_text):
+    """(SigningSecret, store secret, POSTGRES_PASSWORD) from an existing CloudTAK .env; '' when absent.
+
+    The store secret is MINIO_ROOT_PASSWORD, else AWS_S3_SecretAccessKey: we write both with
+    the same value, and the Garage store reads the second (GARAGE_DEFAULT_SECRET_KEY)."""
+    vals = {}
+    for line in (env_text or '').splitlines():
+        key, sep, val = line.strip().partition('=')
+        if sep and key.strip() not in vals:
+            vals[key.strip()] = val.strip()
+    return (vals.get('SigningSecret', ''),
+            vals.get('MINIO_ROOT_PASSWORD') or vals.get('AWS_S3_SecretAccessKey', ''),
+            vals.get('POSTGRES_PASSWORD', ''))
 
 
 def _cloudtak_env_preserve_unknown(generated, existing_text):
@@ -42679,13 +42731,21 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Docker log limits (remote) ━━━")
             _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
+                # Stop a stack that is already there before deleting its tree. The Garage store
+                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+                # it came back during the rm -rf, Docker re-created the folder, and Garage
+                # initialized it with the OLD key; the new stack then crash-looped on a key
+                # mismatch (ops #33 box test, redeploy over an existing remote install).
                 prep_cmd = (
+                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
                     f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
                 )
@@ -42777,6 +42837,17 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog("✓ Containers built and restarted.")
+            # Persist deployed=True BEFORE the Caddyfile is generated (same as the local path):
+            # generate_caddyfile() only writes the map./tiles./video. sites when detect_modules()
+            # says CloudTAK is installed, and for a remote target that is this flag. Saving it
+            # after Caddy left a fresh remote install with no site at all — no certificate, so
+            # https://map.<fqdn> failed to connect even though the deploy said it worked (ops #33).
+            try:
+                cfg['deployed'] = True
+                settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+                save_settings(settings)
+            except Exception as _e:
+                plog(f"  ⚠ Could not persist deployment flag: {_e}")
             fw_cmd = (
                 "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
                 "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
@@ -42823,9 +42894,6 @@ def run_cloudtak_deploy(cfg=None):
                     plog(f"⚠ Caddy reload issue: {_d.strip()[:140]}")
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
-            cfg['deployed'] = True
-            settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
-            save_settings(settings)
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
@@ -43571,25 +43639,27 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             plog(f"  Updating remote CloudTAK config on {remote_host}...")
             domain = (settings.get('fqdn') or '').strip() or None
+            # Keep the secrets the remote .env already has, same as the local reconfig. Fresh
+            # ones every Update config broke a running install (ops #33, test on a fresh remote):
+            # the Garage store keeps the key it was first started with and refuses to start on a
+            # new AWS_S3_SecretAccessKey, and a new SigningSecret logs every user out. Read the
+            # whole .env (also for the unmanaged keys below); if it cannot be read, stop rather
+            # than write new secrets over a working install.
+            _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null; true', timeout=20)
+            if not _ok_env:
+                plog(f"✗ Could not read the remote CloudTAK .env: {(_rem_env or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            _rem_env = _rem_env or ''
+            signing_secret, minio_pass, postgres_pass = _cloudtak_env_secrets(_rem_env)
+            if signing_secret or minio_pass or postgres_pass:
+                plog("  Preserving existing secrets from the remote .env")
             import secrets as _secrets
-            signing_secret = _secrets.token_hex(32)
-            minio_pass = _secrets.token_hex(16)
-            # Preserve existing postgres password from remote .env so we don't break the
-            # DB connection on an existing install. If the remote .env doesn't have one
-            # (pre-v0.9.11), fall back to 'docker' (the upstream literal). New strong
-            # passwords are only generated on first install or full Remove+Reinstall.
-            postgres_pass = 'docker'
-            try:
-                _ok_pw, _pw_out = _ssh_probe(
-                    remote_cfg,
-                    "grep -E '^POSTGRES_PASSWORD=' ~/CloudTAK/.env 2>/dev/null | head -1 | cut -d= -f2-",
-                    timeout=15
-                )
-                if _ok_pw and (_pw_out or '').strip():
-                    postgres_pass = (_pw_out or '').strip()
-                    plog("  Preserving existing postgis password from remote .env")
-            except Exception:
-                pass
+            signing_secret = signing_secret or _secrets.token_hex(32)
+            minio_pass = minio_pass or _secrets.token_hex(16)
+            # No POSTGRES_PASSWORD (pre-v0.9.11): 'docker', the upstream literal the volume was
+            # initialized with. Strong passwords only land on first install or Remove+Reinstall.
+            postgres_pass = postgres_pass or 'docker'
             env_content = _cloudtak_build_env_content(
                 settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
                 remote_host=remote_host,
@@ -43597,16 +43667,12 @@ def run_cloudtak_redeploy(cfg=None):
             # Same rule as the local reconfig: keep any key we do not manage. Read the whole
             # remote .env rather than grepping one name at a time — we cannot grep for a key
             # whose name we do not know yet, which is the entire point.
-            try:
-                _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null', timeout=20)
-                if _ok_env and (_rem_env or '').strip():
-                    _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
-                    if _merged != env_content:
-                        plog("  Preserving %d unmanaged key(s) from the remote .env"
-                             % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
-                    env_content = _merged
-            except Exception:
-                pass
+            if _rem_env.strip():
+                _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
+                if _merged != env_content:
+                    plog("  Preserving %d unmanaged key(s) from the remote .env"
+                         % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
+                env_content = _merged
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
@@ -43624,6 +43690,7 @@ def run_cloudtak_redeploy(cfg=None):
                     return
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -50176,7 +50243,11 @@ window.logInterval = null;
 
 window.collectDeployConfig = function() {
   var modeEl = document.getElementById("cloudtak-target-mode");
-  var mode = modeEl ? modeEl.value : "local";
+  // The target form is only on the page before install. Once installed it is gone, and
+  // defaulting to "local" here made Update config / Remove flip a remote CloudTAK to
+  // local: the page then said "not installed" (ops #33). No form = keep the saved target.
+  if (!modeEl) return {};
+  var mode = modeEl.value;
   var cfg = { target_mode: mode };
   if (mode === "remote") {
     var host = (document.getElementById("cloudtak-remote-host") || {}).value || "";
