@@ -33467,7 +33467,31 @@ def _selfheal_takserver_le_cert(plog=None):
                 shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
             tak_fp = ''
             tak_expired = True
-            if os.path.exists(jks):
+            if _tak_is_container():
+                # v10.2.13: container hosts have no Java — keytool lives only in the TAK
+                # image — so the host-side keytool below always came back empty, the
+                # keystore always looked stale, and every console start re-imported the
+                # same cert and restarted TAK (seen on arm64). Read it the way the
+                # container renewal script does: keytool via docker exec on the shared mount.
+                _run = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
+                    capture_output=True, text=True, timeout=20)
+                if (_run.stdout or '').strip() != 'true':
+                    _log('takserver LE-cert self-heal: TAK container not running — '
+                         'skipping keystore check (the daily renewal timer re-checks)')
+                    return
+                _kr = subprocess.run(
+                    _sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'keytool', '-list', '-rfc',
+                                '-keystore', jks, '-storepass', cert_pass]),
+                    capture_output=True, text=True, timeout=30)
+                if _kr.returncode == 0 and _kr.stdout:
+                    tak_fp = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).stdout.strip()
+                    tak_expired = subprocess.run(
+                        ['openssl', 'x509', '-checkend', '0', '-noout'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
+            elif os.path.exists(jks):
                 kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
                 tak_fp = subprocess.run(
                     f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
