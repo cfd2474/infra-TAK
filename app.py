@@ -44820,6 +44820,14 @@ def _webodm_deploy_log(msg, status=None):
         _webodm_deploy_status.update(status)
 
 
+# A ⚠ log line carrying this tag is an action item for the operator to do separately
+# (e.g. redeploy WebODM), not a step that failed: a retry can't clear it, so an Authentik
+# reconfigure lists it as a note and still ends complete (v10.2.13 T&E, ops #41).
+AK_ACTION_NEEDED = 'Action needed:'
+WEBODM_REDEPLOY_NOTE = ('  ⚠ ' + AK_ACTION_NEEDED + ' redeploy WebODM to activate one-click login '
+                        '(OIDC creds are written, but the running compose predates the local_settings mount)')
+
+
 WEBODM_LOCAL_SETTINGS_STUB = (
     '# Managed by infra-TAK. OIDC login config is written here after the\n'
     '# Authentik step of a WebODM deploy (GH #50). Do not edit by hand.\n'
@@ -44874,7 +44882,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
                 if mount_present:
                     log('  ✓ WebODM OIDC login already configured')
                 else:
-                    log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                    log(WEBODM_REDEPLOY_NOTE)
                 return True
             import tempfile as _tf
             with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tf:
@@ -44892,7 +44900,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
                 return False
             _module_run(deploy_cfg, f'chmod 600 {wo_dir}/local_settings.py', timeout=15)
             if not mount_present:
-                log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                log(WEBODM_REDEPLOY_NOTE)
                 return True
             _module_run(deploy_cfg, 'docker restart webapp wo_worker 2>&1', timeout=120)
             log('  ✓ WebODM native OIDC login configured (webapp restarted)')
@@ -44915,7 +44923,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
             return True
         _write_priv(ls_path, content, perm=0o600)
         if not mount_present:
-            log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+            log(WEBODM_REDEPLOY_NOTE)
             return True
         subprocess.run(_sudo_wrap(['docker', 'restart', 'webapp', 'wo_worker']),
                        capture_output=True, timeout=120)
@@ -50953,7 +50961,7 @@ window.doCloudtakResetConfig = function() {
 
 # Authentik module
 authentik_deploy_log = []
-authentik_deploy_status = {'running': False, 'complete': False, 'error': False, 'partial': False, 'issues': []}
+authentik_deploy_status = {'running': False, 'complete': False, 'error': False, 'partial': False, 'issues': [], 'notes': []}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v10.0.1: serialize Authentik `docker compose` operations against the deploy.
@@ -51523,7 +51531,8 @@ def authentik_deploy_log_api():
         'running': authentik_deploy_status['running'], 'complete': authentik_deploy_status['complete'],
         'error': authentik_deploy_status['error'],
         'partial': authentik_deploy_status.get('partial', False),
-        'issues': authentik_deploy_status.get('issues', [])})
+        'issues': authentik_deploy_status.get('issues', []),
+        'notes': authentik_deploy_status.get('notes', [])})
 
 @app.route('/api/authentik/remote-metrics')
 @login_required
@@ -53931,7 +53940,7 @@ networks:
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
 
-def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None):
+def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, notes=None):
     """Reconfigure Authentik on remote host: ensure up, then run API steps (cookie domain, apps, outpost, policies)."""
     remote = deploy_cfg.get('remote', {})
     host = (remote.get('host') or '').strip()
@@ -53987,27 +53996,32 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None):
     _authentik_enable_show_password(ak_url, ak_headers, plog)
     _sync_webadmin_after_authentik_reconfigure(plog)
     plog("")
-    _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)")
+    _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)", notes)
 
 
-def _authentik_reconfigure_finish(plog, issues, label):
+def _authentik_reconfigure_finish(plog, issues, label, notes=None):
     """End a reconfigure run. "\u2713 complete" only when no step logged \u26a0/\u2717; otherwise list
     the steps that did not finish and mark the run partial. Under load each Authentik
     API step times out on its own and logs a \u26a0, and the run used to end on "\u2713 complete"
-    after a dozen of them (v10.2.12 T&E)."""
+    after a dozen of them (v10.2.12 T&E). Notes (⚠ lines tagged AK_ACTION_NEEDED, e.g.
+    "redeploy WebODM") are for the operator to do separately: they are listed after the
+    verdict but never make the run partial, since no retry can clear them (v10.2.13 T&E)."""
     found = list(issues or [])
+    todo = list(notes or [])
     if not found:
         plog(f"\u2713 {label} complete.")
-        authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
-                                        'partial': False, 'issues': []})
-        return True
-    plog(f"\u26a0 {label} finished, but {len(found)} step(s) did not complete:")
-    for msg in found:
-        plog("    - " + msg.lstrip(' ⚠✗'))
-    plog("  Nothing was removed. Fix what is listed (timeouts usually clear on a retry), then run Update config & reconnect again.")
+    else:
+        plog(f"\u26a0 {label} finished, but {len(found)} step(s) did not complete:")
+        for msg in found:
+            plog("    - " + msg.lstrip(' ⚠✗'))
+        plog("  Nothing was removed. Fix what is listed (timeouts usually clear on a retry), then run Update config & reconnect again.")
+    if todo:
+        plog(f"  {AK_ACTION_NEEDED} {len(todo)} item(s) to do separately (not part of this run):")
+        for msg in todo:
+            plog("    - " + msg.lstrip(' ⚠').replace(AK_ACTION_NEEDED, '', 1).strip())
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
-                                    'partial': True, 'issues': found})
-    return False
+                                    'partial': bool(found), 'issues': found, 'notes': todo})
+    return not found
 
 
 def _ak_live_compose_dir():
@@ -62494,14 +62508,18 @@ def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
 def run_authentik_deploy(reconfigure=False):
     # Every ⚠/✗ line is a step that did not finish. Reconfigure collects them so it can
     # say so at the end instead of always printing "✓ Reconfigure complete."
+    # A ⚠ tagged AK_ACTION_NEEDED is a note for the operator, not a failed step.
     issues = []
-    authentik_deploy_status.update({'partial': False, 'issues': []})
+    notes = []
+    authentik_deploy_status.update({'partial': False, 'issues': [], 'notes': []})
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         authentik_deploy_log.append(entry)
         print(entry, flush=True)
-        if '⚠' in msg or '✗' in msg:
+        if '✗' in msg or ('⚠' in msg and AK_ACTION_NEEDED not in msg):
             issues.append(msg.strip())
+        elif '⚠' in msg and msg.strip() not in notes:
+            notes.append(msg.strip())
     try:
         ak_dir = os.path.expanduser('~/authentik')
         settings = load_settings()
@@ -62513,7 +62531,7 @@ def run_authentik_deploy(reconfigure=False):
         deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if deploy_cfg.get('target_mode') == 'remote':
             if reconfigure:
-                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues)
+                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues, notes)
                 return
             _run_authentik_deploy_remote(settings, deploy_cfg, plog)
             return
@@ -62722,7 +62740,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_recovery_flow_standalone(env_path, plog)
             _sync_webadmin_after_authentik_reconfigure(plog)
             plog("")
-            _authentik_reconfigure_finish(plog, issues, "Reconfigure")
+            _authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)
             return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
@@ -87468,6 +87486,9 @@ def _post_update_auto_deploy():
                             if authentik_deploy_status.get('partial'):
                                 print(f"Post-update: Authentik reconfigure PARTIAL — "
                                       f"{len(authentik_deploy_status.get('issues') or [])} step(s) did not complete (see above)")
+                            if authentik_deploy_status.get('notes'):
+                                print(f"Post-update: Authentik reconfigure — "
+                                      f"{len(authentik_deploy_status['notes'])} action item(s) for the operator (see above)")
                         except Exception as e:
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
