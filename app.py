@@ -48159,12 +48159,25 @@ def _netbird_finalize_account_store(plog=None):
     input, so there is no injection surface. The residual is schema-coupling to NetBird's
     internal `store.db` (account_onboardings / accounts / users), tolerated because the image
     is PINNED (NETBIRD_SERVER_IMAGE) — RE-VERIFY these tables/columns on any pin bump. Failure
-    is soft (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash."""
+    is soft (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash.
+
+    Non-root: the NetBird container runs as root and creates store.db root:root 644
+    inside the console-owned ~/netbird/data, so a takwerx console opened it read-only and every
+    finalize failed with "attempt to write a readonly database" — the gates were never cleared.
+    Hand the store (and any rollback journal) to the console user through the broker first. No
+    new privilege: the console already owns the directory (it could replace the file outright),
+    and root in the container still writes a takwerx-owned file."""
     import sqlite3
     _log = plog or (lambda m: None)
     db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
     if not os.path.isfile(db_path):
         return False
+    if os.getuid() != 0 and not os.access(db_path, os.W_OK):
+        _owner = f'{os.getuid()}:{os.getgid()}'
+        for _f in (db_path, db_path + '-journal', db_path + '-wal', db_path + '-shm'):
+            if os.path.exists(_f):
+                subprocess.run(_sudo_wrap(['chown', _owner, _f]),
+                               capture_output=True, text=True, timeout=30)
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         conn.execute(
