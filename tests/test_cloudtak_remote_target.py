@@ -200,3 +200,97 @@ def test_collect_deploy_config_in_the_browser(elements, expected):
     out = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == expected
+
+
+# --- Update config on a remote CloudTAK keeps the secrets the remote .env already has ---------
+# Found on the box test for this fix: once Update config really ran on the remote (above), it
+# wrote a fresh AWS_S3_SecretAccessKey and SigningSecret every time. The Garage store keeps the
+# key it first started with, so it crash-looped ("Access key cloudtakminioadmin is associated
+# with a secret key different than the one given in GARAGE_DEFAULT_SECRET_KEY").
+
+REMOTE_ENV = """CLOUDTAK_Mode=docker-compose
+SigningSecret=sig-original
+AWS_S3_Endpoint=http://store:3900
+AWS_S3_AccessKeyId=cloudtakminioadmin
+AWS_S3_SecretAccessKey=store-original
+MINIO_ROOT_USER=cloudtakminioadmin
+MINIO_ROOT_PASSWORD=store-original
+POSTGRES_PASSWORD=pg-original
+GARAGE_RPC_SECRET=%s
+""" % ('ab' * 32)
+
+
+def _redeploy_ns(remote_env, env_read_ok=True):
+    tree = ast.parse(APP)
+    names = ('run_cloudtak_redeploy', '_cloudtak_build_env_content', '_cloudtak_env_secrets',
+             '_cloudtak_env_preserve_unknown')
+    src = '\n\n'.join(ast.get_source_segment(APP, n) for n in tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name in names)
+    sent = {}
+
+    def _ssh_probe(cfg, cmd, timeout=15):
+        if cmd.startswith('cat ~/CloudTAK/.env'):
+            return (True, remote_env) if env_read_ok else (False, 'ssh: connect timed out')
+        return True, ''
+
+    def _scp_to_host(cfg, local, remote):
+        sent[remote] = pathlib.Path(local).read_text()
+        return True, ''
+
+    status = {'running': True}
+    ns = {
+        'os': __import__('os'), 'shutil': shutil, 'tempfile': __import__('tempfile'),
+        'datetime': __import__('datetime').datetime, 'subprocess': subprocess,
+        'load_settings': lambda: {'fqdn': 'example.com',
+                                  'cloudtak_deployment': copy.deepcopy(REMOTE_DEPLOYED)},
+        '_get_cloudtak_deployment_config': lambda s: copy.deepcopy(REMOTE_DEPLOYED),
+        '_get_service_domain': lambda s, k: '',
+        '_cloudtak_remote_store_endpoint': lambda cfg: 'http://store:3900',
+        '_cloudtak_build_override_yml': lambda s: 'services: {}\n',
+        '_cloudtak_remote_compose_is_garage': lambda cfg: False,
+        '_ssh_probe': _ssh_probe, '_scp_to_host': _scp_to_host,
+        'generate_caddyfile': lambda s=None: None, '_caddy_reload': lambda: None,
+        '_cloudtak_media_hls_heal': lambda **k: None,
+        'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
+    }
+    exec(compile(src, 'app.py', 'exec'), ns)
+    return ns, sent, status
+
+
+def _env(text):
+    return dict(l.split('=', 1) for l in text.splitlines() if '=' in l and not l.startswith('#'))
+
+
+def test_env_secrets_reads_the_three_secrets():
+    secrets_of = _redeploy_ns('')[0]['_cloudtak_env_secrets']
+    assert secrets_of(REMOTE_ENV) == ('sig-original', 'store-original', 'pg-original')
+    # the Garage key alone (MINIO_ROOT_PASSWORD gone) still counts as the store secret
+    assert secrets_of('AWS_S3_SecretAccessKey=k\n')[1] == 'k'
+    assert secrets_of('') == ('', '', '')
+
+
+def test_remote_update_config_keeps_store_and_signing_secrets():
+    ns, sent, status = _redeploy_ns(REMOTE_ENV)
+    ns['run_cloudtak_redeploy']()
+    assert status.get('complete') is True, ns['cloudtak_deploy_log']
+    env = _env(sent['/tmp/.env'])
+    assert env['SigningSecret'] == 'sig-original'
+    assert env['AWS_S3_SecretAccessKey'] == 'store-original'
+    assert env['MINIO_ROOT_PASSWORD'] == 'store-original'
+    assert env['POSTGRES_PASSWORD'] == 'pg-original'
+    assert env['GARAGE_RPC_SECRET'] == 'ab' * 32
+
+
+def test_remote_update_config_stops_when_the_remote_env_cannot_be_read():
+    ns, sent, status = _redeploy_ns(REMOTE_ENV, env_read_ok=False)
+    ns['run_cloudtak_redeploy']()
+    assert status.get('error') is True
+    assert '/tmp/.env' not in sent       # never write new secrets over a working install
+
+
+def test_remote_update_config_without_env_generates_secrets():
+    ns, sent, status = _redeploy_ns('')
+    ns['run_cloudtak_redeploy']()
+    env = _env(sent['/tmp/.env'])
+    assert len(env['SigningSecret']) == 64 and len(env['AWS_S3_SecretAccessKey']) == 32
+    assert env['POSTGRES_PASSWORD'] == 'docker'

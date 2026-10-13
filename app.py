@@ -41948,6 +41948,21 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
 
 
+def _cloudtak_env_secrets(env_text):
+    """(SigningSecret, store secret, POSTGRES_PASSWORD) from an existing CloudTAK .env; '' when absent.
+
+    The store secret is MINIO_ROOT_PASSWORD, else AWS_S3_SecretAccessKey: we write both with
+    the same value, and the Garage store reads the second (GARAGE_DEFAULT_SECRET_KEY)."""
+    vals = {}
+    for line in (env_text or '').splitlines():
+        key, sep, val = line.strip().partition('=')
+        if sep and key.strip() not in vals:
+            vals[key.strip()] = val.strip()
+    return (vals.get('SigningSecret', ''),
+            vals.get('MINIO_ROOT_PASSWORD') or vals.get('AWS_S3_SecretAccessKey', ''),
+            vals.get('POSTGRES_PASSWORD', ''))
+
+
 def _cloudtak_env_preserve_unknown(generated, existing_text):
     """Keep every KEY= line CloudTAK's .env already had that we do not write ourselves.
 
@@ -43599,25 +43614,27 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             plog(f"  Updating remote CloudTAK config on {remote_host}...")
             domain = (settings.get('fqdn') or '').strip() or None
+            # Keep the secrets the remote .env already has, same as the local reconfig. Fresh
+            # ones every Update config broke a running install (ops #33, test on a fresh remote):
+            # the Garage store keeps the key it was first started with and refuses to start on a
+            # new AWS_S3_SecretAccessKey, and a new SigningSecret logs every user out. Read the
+            # whole .env (also for the unmanaged keys below); if it cannot be read, stop rather
+            # than write new secrets over a working install.
+            _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null; true', timeout=20)
+            if not _ok_env:
+                plog(f"✗ Could not read the remote CloudTAK .env: {(_rem_env or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            _rem_env = _rem_env or ''
+            signing_secret, minio_pass, postgres_pass = _cloudtak_env_secrets(_rem_env)
+            if signing_secret or minio_pass or postgres_pass:
+                plog("  Preserving existing secrets from the remote .env")
             import secrets as _secrets
-            signing_secret = _secrets.token_hex(32)
-            minio_pass = _secrets.token_hex(16)
-            # Preserve existing postgres password from remote .env so we don't break the
-            # DB connection on an existing install. If the remote .env doesn't have one
-            # (pre-v0.9.11), fall back to 'docker' (the upstream literal). New strong
-            # passwords are only generated on first install or full Remove+Reinstall.
-            postgres_pass = 'docker'
-            try:
-                _ok_pw, _pw_out = _ssh_probe(
-                    remote_cfg,
-                    "grep -E '^POSTGRES_PASSWORD=' ~/CloudTAK/.env 2>/dev/null | head -1 | cut -d= -f2-",
-                    timeout=15
-                )
-                if _ok_pw and (_pw_out or '').strip():
-                    postgres_pass = (_pw_out or '').strip()
-                    plog("  Preserving existing postgis password from remote .env")
-            except Exception:
-                pass
+            signing_secret = signing_secret or _secrets.token_hex(32)
+            minio_pass = minio_pass or _secrets.token_hex(16)
+            # No POSTGRES_PASSWORD (pre-v0.9.11): 'docker', the upstream literal the volume was
+            # initialized with. Strong passwords only land on first install or Remove+Reinstall.
+            postgres_pass = postgres_pass or 'docker'
             env_content = _cloudtak_build_env_content(
                 settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
                 remote_host=remote_host,
@@ -43625,16 +43642,12 @@ def run_cloudtak_redeploy(cfg=None):
             # Same rule as the local reconfig: keep any key we do not manage. Read the whole
             # remote .env rather than grepping one name at a time — we cannot grep for a key
             # whose name we do not know yet, which is the entire point.
-            try:
-                _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null', timeout=20)
-                if _ok_env and (_rem_env or '').strip():
-                    _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
-                    if _merged != env_content:
-                        plog("  Preserving %d unmanaged key(s) from the remote .env"
-                             % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
-                    env_content = _merged
-            except Exception:
-                pass
+            if _rem_env.strip():
+                _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
+                if _merged != env_content:
+                    plog("  Preserving %d unmanaged key(s) from the remote .env"
+                         % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
+                env_content = _merged
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
