@@ -223,12 +223,13 @@ GARAGE_RPC_SECRET=%s
 def _redeploy_ns(remote_env, env_read_ok=True):
     tree = ast.parse(APP)
     names = ('run_cloudtak_redeploy', '_cloudtak_build_env_content', '_cloudtak_env_secrets',
-             '_cloudtak_env_preserve_unknown')
+             '_cloudtak_env_preserve_unknown', '_cloudtak_remote_media_bufs')
     src = '\n\n'.join(ast.get_source_segment(APP, n) for n in tree.body
                       if isinstance(n, ast.FunctionDef) and n.name in names)
-    sent = {}
+    sent = {'cmds': []}
 
     def _ssh_probe(cfg, cmd, timeout=15):
+        sent['cmds'].append(cmd)
         if cmd.startswith('cat ~/CloudTAK/.env'):
             return (True, remote_env) if env_read_ok else (False, 'ssh: connect timed out')
         return True, ''
@@ -294,3 +295,19 @@ def test_remote_update_config_without_env_generates_secrets():
     env = _env(sent['/tmp/.env'])
     assert len(env['SigningSecret']) == 64 and len(env['AWS_S3_SecretAccessKey']) == 32
     assert env['POSTGRES_PASSWORD'] == 'docker'
+
+
+def test_remote_update_config_sets_media_kernel_buffers():
+    """cloudtak-media crash-looped on a fresh remote: the 4MB UDP buffer was only set on the console box."""
+    ns, sent, status = _redeploy_ns(REMOTE_ENV)
+    ns['run_cloudtak_redeploy']()
+    bufs = [c for c in sent['cmds'] if 'net.core.rmem_max=4194304' in c]
+    assert bufs and '/etc/sysctl.d/99-takwerx-media-bufs.conf' in bufs[0]
+    up = next(i for i, c in enumerate(sent['cmds']) if 'docker compose up -d' in c)
+    assert sent['cmds'].index(bufs[0]) < up
+
+
+def test_remote_deploy_sets_media_kernel_buffers_before_starting_containers():
+    body = re.search(r'^def run_cloudtak_deploy\(.*?(?=^def )', APP, re.S | re.M).group(0)
+    remote = body[:body.index('# Step 1: Check Docker')]
+    assert remote.index('_cloudtak_remote_media_bufs(remote_cfg, plog)') < remote.index('docker compose up -d')

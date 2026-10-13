@@ -41929,6 +41929,23 @@ def _cloudtak_remote_garage_sh(legacy_image=''):
         f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
 
 
+def _cloudtak_remote_media_bufs(remote_cfg, plog):
+    """`_startup_media_kernel_bufs()` for a remote CloudTAK host. MediaMTX >= 1.19 needs a 4MB
+    kernel UDP read buffer, and net.core is a HOST sysctl: the startup migration only ever set
+    it on the console box, so cloudtak-media crash-looped on every fresh remote host ("unable to
+    set read buffer size to 4194304", ops #33 box test). Never raises."""
+    cmd = ("S=; [ \"$(id -u)\" -ne 0 ] && S=sudo; "
+           "printf 'net.core.rmem_max = 4194304\\nnet.core.wmem_max = 4194304\\n' "
+           "| $S tee /etc/sysctl.d/99-takwerx-media-bufs.conf >/dev/null && "
+           "$S sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304 >/dev/null")
+    try:
+        ok, out = _ssh_probe(remote_cfg, cmd, timeout=30)
+    except Exception as e:
+        ok, out = False, str(e)
+    plog("✓ Media kernel buffers set on remote (4 MB)" if ok
+         else f"  ⚠ Could not set media kernel buffers on remote: {(out or '')[:160]}")
+
+
 def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
     """`_cloudtak_garage_rollback()` over SSH. Never raises."""
     try:
@@ -42714,6 +42731,7 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Docker log limits (remote) ━━━")
             _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
@@ -43665,6 +43683,7 @@ def run_cloudtak_redeploy(cfg=None):
                     return
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
