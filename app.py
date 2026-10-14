@@ -1069,7 +1069,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.13-alpha"
+VERSION = "10.2.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -31365,6 +31365,13 @@ def _get_service_alias(settings, service_key):
 _CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
 _CADDY_MIN_STREAM_CLOSE_DELAY = (2, 7)  # reverse_proxy `stream_close_delay` landed here
 _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
+# GH #137 — `client_auth { trust_pool file {…} }` landed in Caddy 2.8.0. On 2.7.x the whole
+# Caddyfile is rejected ("unknown subdirective for client_auth: trust_pool"), so one ATLAS
+# device site took every regeneration on the box down with it. Measured with the official
+# 2.7.6 and 2.8.4 builds, 2026-10-14. 2.7's `trusted_ca_cert_file` is no substitute: it
+# loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
+# fails the handshake (same measurement).
+_CADDY_MIN_TRUST_POOL = (2, 8)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31401,6 +31408,17 @@ def _caddy_supports_heredoc():
     """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
     v = _caddy_version_tuple()
     return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_supports_trust_pool():
+    """True unless the installed Caddy is KNOWN to be older than 2.8 (GH #137).
+
+    ⚠️ Fails OPEN, unlike the heredoc gate, because here the safe directions are reversed:
+    omitting the block silently removes ATLAS's device channel from a working box whenever
+    `caddy version` has a bad moment, while emitting it onto a too-old Caddy is caught by
+    _caddy_validate_or_restore() and the previous file is kept."""
+    v = _caddy_version_tuple()
+    return not v or v >= _CADDY_MIN_TRUST_POOL
 
 
 def _caddy_stream_close_delay_lines(indent):
@@ -31495,9 +31513,29 @@ def _caddy_validate_clean(out):
     actual error, so a naive tail of the combined output reports a truncated fragment of a
     log line instead of the parse error. Field-observed on aws-arm 2026-08-18, where the
     message read `... does NOT parse: ided configuration","config_file":...`. Drop the JSON,
-    keep the diagnosis."""
-    keep = [ln.strip() for ln in (out or '').splitlines()
-            if ln.strip() and not ln.strip().startswith('{"level"')]
+    keep the diagnosis.
+
+    ⚠️ **Except an error-level JSON line, whose `msg` IS the diagnosis (GH #137).** Caddy
+    2.11.4 follows its JSON log with a plain `Error: …` line; 2.11.7 reports a log-writer
+    `permission denied` ONLY as `{"level":"error","msg":…}` and exits 1. Dropping that left
+    an empty string, so _caddy_validate_config() missed its own permission-denied carve-out,
+    judged a good config 'bad', and _caddy_validate_or_restore() reverted EVERY Caddyfile
+    regeneration on non-root boxes ("caddy validate failed with no output"). Measured on
+    non-root boxes running 2.11.7 and 2.11.4, 2026-10-14."""
+    keep = []
+    for ln in (out or '').splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith('{"level"'):
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if rec.get('level') in ('error', 'fatal', 'panic') and rec.get('msg'):
+                keep.append(str(rec['msg']))
+            continue
+        keep.append(ln)
     return ' '.join(keep).strip()
 
 
@@ -31930,6 +31968,53 @@ def _inject_custom_cert_tls(lines, cert_path, key_path):
         out.append(f"    tls {cert_path} {key_path} {{")
         i = own_tls + 1
     return out
+
+
+# GH #137 follow-up: registry-resident modules (ATLAS MDM, TVR, Email Relay, Client Feed,
+# Simulator) only read as installed once mod_registry.load_all() has run at the bottom of
+# app.py, ~90 s into a console start. Every regen before that — the Hardened-posture
+# re-assert, the startup migrations, the post-update regen — wrote a Caddyfile WITHOUT those
+# modules' sites and reloaded Caddy. On test8 that dropped ATLAS's vhost and its :8449 device
+# listener on every console start (pull, restart, update). Until the registry is up,
+# generate_caddyfile() still builds and returns the file (the migrations check its content
+# before stamping their flags) but does not write it; ONE catch-up regen runs right after
+# the registry loads (_caddy_registry_loaded(), next to init_registry()).
+_CADDY_REGISTRY_READY = threading.Event()
+_CADDY_REGEN_DEFER_LOCK = threading.Lock()
+_CADDY_REGEN_DEFERRED = []   # who asked for a regen before the registry loaded
+
+
+def _caddy_defer_until_registry(who):
+    """True, and queue the post-registry catch-up regen, when the module registry has not
+    loaded yet. Check and queue under one lock so a daemon thread cannot slip a request in
+    after _caddy_registry_loaded() has taken the queue."""
+    with _CADDY_REGEN_DEFER_LOCK:
+        if _CADDY_REGISTRY_READY.is_set():
+            return False
+        _CADDY_REGEN_DEFERRED.append(who)
+        return True
+
+
+def _caddy_registry_loaded():
+    """Called once, right after init_registry(): from here on generate_caddyfile() writes.
+    If anything asked for a regen during import, do it now — once, with every module known —
+    and reload only if Caddy is not already running the result (GH #90)."""
+    with _CADDY_REGEN_DEFER_LOCK:
+        _CADDY_REGISTRY_READY.set()
+        who = list(_CADDY_REGEN_DEFERRED)
+        del _CADDY_REGEN_DEFERRED[:]
+    if not who:
+        return
+    try:
+        if generate_caddyfile() is None:
+            return   # no FQDN — nothing to write
+        ok, detail = _caddy_reload_if_changed()
+        print('[startup] Caddyfile regenerated now that the module registry is loaded '
+              '(%d early request(s): %s)%s' % (len(who), ', '.join(sorted(set(who))),
+                                               '' if ok else ' — reload issue: %s' % str(detail)[:160]),
+              flush=True)
+    except Exception as _e:
+        print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
 
 
 def generate_caddyfile(settings=None):
@@ -32641,7 +32726,16 @@ def generate_caddyfile(settings=None):
         lines.append("")
 
         # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
-        if at_ca:
+        # GH #137: never on a Caddy that cannot parse `trust_pool` — it would make the
+        # whole file unloadable and every regeneration on this box would be restored away.
+        # The ATLAS deploy refuses up front on such a box and names the fix.
+        if at_ca and not _caddy_supports_trust_pool():
+            print(f'Caddy: ATLAS device channel for {at_host}:8449 NOT emitted — Caddy '
+                  f'{".".join(map(str, _caddy_version_tuple()))} is older than 2.8 and has no '
+                  f'client_auth trust_pool. Update Caddy from the Caddy page.', flush=True)
+            lines.append(f"# ATLAS MDM — device channel :8449 omitted: needs Caddy 2.8+ (GH #137)")
+            lines.append("")
+        elif at_ca:
             lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
             lines.append(f"{at_host}:8449 {{")
             lines.append(f"    tls {{")
@@ -32749,6 +32843,12 @@ def generate_caddyfile(settings=None):
                  + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
         caddyfile += '\n' + user_blocks + '\n'
+    # GH #137 follow-up: before the module registry loads, registry modules read as not
+    # installed — writing now would drop their sites. Return what was built; the
+    # post-registry catch-up writes the real file.
+    if _caddy_defer_until_registry('generate_caddyfile'):
+        print('[caddy] module registry not loaded yet — Caddyfile write deferred until it is', flush=True)
+        return caddyfile
     # v10.0.5 non-root: /etc/caddy may not exist yet (RHEL copr caddy doesn't
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
@@ -82238,6 +82338,13 @@ def _startup_ensure_hardening_posture():
             print('[startup-posture] hardened: re-closed public :%s (%s)' % (
                 port, 'STILL OPEN — check firewall/broker' if still else 'now localhost-only'), flush=True)
         if w1.get('caddy_login_locked'):
+            # GH #137 follow-up: this runs at import, before the module registry loads, so a
+            # regen here would drop ATLAS's sites and :8449. Queue it for the post-registry
+            # catch-up instead (the regen emits the /login lock from hardening.json either way).
+            if _caddy_defer_until_registry('hardening posture'):
+                print('[startup-posture] hardened: Caddy /login SSO-lock re-assert queued '
+                      'until the module registry loads', flush=True)
+                return
             try:
                 generate_caddyfile()
                 # GH #90: only when Caddy is not already running this file. An unconditional
@@ -89534,6 +89641,11 @@ _MODULE_CTX = {
     # own except-handler turns it into a failed deploy. /redteam-selfaudit fails the build
     # on a raw reload anywhere outside _caddy_reload_checked().
     '_caddy_reload': _caddy_reload,
+    # GH #137: ATLAS refuses to deploy onto a Caddy that cannot parse its device site,
+    # and names the real reason when generate_caddyfile's backstop restored the old file.
+    '_caddy_version_tuple': _caddy_version_tuple,
+    '_caddy_supports_trust_pool': _caddy_supports_trust_pool,
+    '_caddy_last_validate_error': _caddy_last_validate_error,
     'detect_modules': detect_modules,
     'probe_run': _probe_run,        # never-raise status probe (broker-shimmed)
     # emailrelay seams — these helpers stay in app.py this release (the Authentik
@@ -89581,6 +89693,7 @@ _MODULE_CTX = {
 _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
+_caddy_registry_loaded()
 
 
 # ── TAK Client Feed — the ONE public, token-authed route family (v10.1.76) ──
