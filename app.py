@@ -31365,6 +31365,13 @@ def _get_service_alias(settings, service_key):
 _CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
 _CADDY_MIN_STREAM_CLOSE_DELAY = (2, 7)  # reverse_proxy `stream_close_delay` landed here
 _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
+# GH #137 — `client_auth { trust_pool file {…} }` landed in Caddy 2.8.0. On 2.7.x the whole
+# Caddyfile is rejected ("unknown subdirective for client_auth: trust_pool"), so one ATLAS
+# device site took every regeneration on the box down with it. Measured with the official
+# 2.7.6 and 2.8.4 builds, 2026-10-14. 2.7's `trusted_ca_cert_file` is no substitute: it
+# loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
+# fails the handshake (same measurement).
+_CADDY_MIN_TRUST_POOL = (2, 8)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31401,6 +31408,17 @@ def _caddy_supports_heredoc():
     """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
     v = _caddy_version_tuple()
     return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_supports_trust_pool():
+    """True unless the installed Caddy is KNOWN to be older than 2.8 (GH #137).
+
+    ⚠️ Fails OPEN, unlike the heredoc gate, because here the safe directions are reversed:
+    omitting the block silently removes ATLAS's device channel from a working box whenever
+    `caddy version` has a bad moment, while emitting it onto a too-old Caddy is caught by
+    _caddy_validate_or_restore() and the previous file is kept."""
+    v = _caddy_version_tuple()
+    return not v or v >= _CADDY_MIN_TRUST_POOL
 
 
 def _caddy_stream_close_delay_lines(indent):
@@ -31495,9 +31513,29 @@ def _caddy_validate_clean(out):
     actual error, so a naive tail of the combined output reports a truncated fragment of a
     log line instead of the parse error. Field-observed on aws-arm 2026-08-18, where the
     message read `... does NOT parse: ided configuration","config_file":...`. Drop the JSON,
-    keep the diagnosis."""
-    keep = [ln.strip() for ln in (out or '').splitlines()
-            if ln.strip() and not ln.strip().startswith('{"level"')]
+    keep the diagnosis.
+
+    ⚠️ **Except an error-level JSON line, whose `msg` IS the diagnosis (GH #137).** Caddy
+    2.11.4 follows its JSON log with a plain `Error: …` line; 2.11.7 reports a log-writer
+    `permission denied` ONLY as `{"level":"error","msg":…}` and exits 1. Dropping that left
+    an empty string, so _caddy_validate_config() missed its own permission-denied carve-out,
+    judged a good config 'bad', and _caddy_validate_or_restore() reverted EVERY Caddyfile
+    regeneration on non-root boxes ("caddy validate failed with no output"). Measured on
+    non-root boxes running 2.11.7 and 2.11.4, 2026-10-14."""
+    keep = []
+    for ln in (out or '').splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith('{"level"'):
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if rec.get('level') in ('error', 'fatal', 'panic') and rec.get('msg'):
+                keep.append(str(rec['msg']))
+            continue
+        keep.append(ln)
     return ' '.join(keep).strip()
 
 
@@ -32641,7 +32679,16 @@ def generate_caddyfile(settings=None):
         lines.append("")
 
         # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
-        if at_ca:
+        # GH #137: never on a Caddy that cannot parse `trust_pool` — it would make the
+        # whole file unloadable and every regeneration on this box would be restored away.
+        # The ATLAS deploy refuses up front on such a box and names the fix.
+        if at_ca and not _caddy_supports_trust_pool():
+            print(f'Caddy: ATLAS device channel for {at_host}:8449 NOT emitted — Caddy '
+                  f'{".".join(map(str, _caddy_version_tuple()))} is older than 2.8 and has no '
+                  f'client_auth trust_pool. Update Caddy from the Caddy page.', flush=True)
+            lines.append(f"# ATLAS MDM — device channel :8449 omitted: needs Caddy 2.8+ (GH #137)")
+            lines.append("")
+        elif at_ca:
             lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
             lines.append(f"{at_host}:8449 {{")
             lines.append(f"    tls {{")
@@ -89534,6 +89581,11 @@ _MODULE_CTX = {
     # own except-handler turns it into a failed deploy. /redteam-selfaudit fails the build
     # on a raw reload anywhere outside _caddy_reload_checked().
     '_caddy_reload': _caddy_reload,
+    # GH #137: ATLAS refuses to deploy onto a Caddy that cannot parse its device site,
+    # and names the real reason when generate_caddyfile's backstop restored the old file.
+    '_caddy_version_tuple': _caddy_version_tuple,
+    '_caddy_supports_trust_pool': _caddy_supports_trust_pool,
+    '_caddy_last_validate_error': _caddy_last_validate_error,
     'detect_modules': detect_modules,
     'probe_run': _probe_run,        # never-raise status probe (broker-shimmed)
     # emailrelay seams — these helpers stay in app.py this release (the Authentik
