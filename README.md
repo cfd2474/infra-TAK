@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.14-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.14-alpha)**
+**Current release: [v10.2.15-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.15-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -428,6 +428,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.15-alpha — 2026-10-15 — TAK Server stops restarting on every console start; console logins work on FIPS boxes; Docker TAK builds again
+
+**Headline: on native TAK with a non-root console, a console start no longer restarts TAK Server, and the 8446 enrollment port gets its Let's Encrypt certificate even when Let's Encrypt is slow; console logins and admin-password checks work on FIPS boxes ([#137](https://github.com/takwerx/infra-TAK/issues/137)); managed-database installs keep TAK able to read its own `CoreConfig.xml`; and Docker TAK builds again and recovers from stale database lock files.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.15-alpha))
+
+**TAK Server restarts.** The 8446 certificate check read TAK's keystore as the console user, couldn't open it, and so re-imported the same certificate and restarted TAK Server on every console start, including every boot and the daily restart. It now reads the keystore as `tak`, and TAK only restarts when the certificate really changed.
+
+**8446 certificate.** When Let's Encrypt was slow to issue the TAK Server certificate during deploy, 8446 kept TAK's own certificate for good and phones couldn't enroll by QR. The deploy now retries in the background for up to 30 minutes, and the daily repair picks up any box the deploy skipped.
+
+**Console logins on FIPS boxes.** On a box where OpenSSL doesn't offer scrypt (FIPS mode), login and every admin-password check crashed with a 500. Any error in a password check is now a refusal with a clear message. New password hashes use PBKDF2-SHA256, which works in FIPS mode, and an old hash is upgraded the next time you log in. ATLAS uninstall shows the real error instead of `JSON.parse: unexpected character`.
+
+**Managed-database installs.** On an External / Managed DB install with a non-root console, `CoreConfig.xml` was owned by root, so TAK Server couldn't read it and wouldn't start after its next restart. New installs set the right owner, and the console fixes existing boxes on start without restarting TAK.
+
+**Docker TAK.** The hardened TAK 5.8 image build no longer fails on a `microdnf` depsolve error. A database container left with stale PostgreSQL lock files after an unclean stop is healed automatically, and TAK Server reconnects. The TAK Portal deploy log names the extras that aren't available on Docker TAK yet instead of "SSH auto-setup failed".
+
+**Upgrade note.** Update the console. If your login page says the stored password hash can't be checked on this box, run `sudo ./reset-console-password.sh` once from the install folder.
 
 ### v10.2.14-alpha — 2026-10-14 — ATLAS deploys again; Caddyfile changes stick on non-root boxes
 

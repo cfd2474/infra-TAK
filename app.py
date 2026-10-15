@@ -71,7 +71,11 @@ if __name__ == '__main__':
 
 from flask import (Flask, render_template, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
-from werkzeug.security import check_password_hash, generate_password_hash
+# GH #137: the werkzeug pair is wrapped below (verify_password / hash_password, next to
+# load_auth) and the plain names re-bound to the wrappers, so every existing
+# check_password_hash() call site gets the fail-closed check without being touched.
+from werkzeug.security import (check_password_hash as _werkzeug_check_password_hash,
+                               generate_password_hash as _werkzeug_generate_password_hash)
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib, socket
@@ -1069,7 +1073,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.14-alpha"
+VERSION = "10.2.15-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -2176,6 +2180,91 @@ def save_auth(auth_dict):
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
 
+
+# GH #137: werkzeug's default hash is scrypt, and an OpenSSL without scrypt (FIPS mode
+# drops it) makes check_password_hash RAISE "[digital envelope routines] unsupported"
+# instead of answering — a 500 on login and on every admin-password gate. New hashes use
+# PBKDF2-HMAC-SHA256 (FIPS-approved, in every OpenSSL build; werkzeug's default
+# iterations). start.sh and reset-console-password.sh pass the same method.
+PASSWORD_HASH_METHOD = 'pbkdf2:sha256'
+
+
+def verify_password(pwhash, password):
+    """True only when `password` matches `pwhash`. Fails CLOSED: a hash this box cannot
+    compute (scrypt without OpenSSL scrypt), a malformed hash, or any other error is a
+    deny, never an allow and never a 500. stored_hash_unusable() explains the deny."""
+    if not pwhash:
+        return False
+    try:
+        return bool(_werkzeug_check_password_hash(pwhash, password or ''))
+    except Exception as e:
+        print(f"[auth] password check denied: stored hash cannot be checked on this box "
+              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
+        return False
+
+
+def hash_password(password):
+    return _werkzeug_generate_password_hash(password, method=PASSWORD_HASH_METHOD)
+
+
+# Every existing call site keeps its name and gets the wrappers (see the import).
+check_password_hash = verify_password
+generate_password_hash = hash_password
+
+
+def _hash_method_error(method_spec):
+    """'' if this box can compute hashes of `method_spec` (the part of a werkzeug hash
+    before the first '$', e.g. 'scrypt:32768:8:1'), else the error it raises."""
+    try:
+        parts = method_spec.split(':')
+        if parts[0] == 'scrypt':
+            n, r, p = (int(x) for x in parts[1:4]) if len(parts) >= 4 else (2 ** 15, 8, 1)
+            hashlib.scrypt(b'x', salt=b'saltsaltsaltsalt', n=n, r=r, p=p,
+                           maxmem=132 * n * r * p, dklen=64)
+        elif parts[0] == 'pbkdf2':
+            hashlib.pbkdf2_hmac(parts[1] if len(parts) > 1 else 'sha256',
+                                b'x', b'saltsaltsaltsalt', 1000)
+        else:
+            return f'unknown hash method {parts[0]!r}'
+    except Exception as e:
+        return f'{type(e).__name__}: {str(e)[:120]}'
+    return ''
+
+
+_HASH_METHOD_ERRORS = {}
+
+
+def stored_hash_unusable(pwhash):
+    """Operator-facing reason when the stored console password hash cannot be checked on
+    this box at all (so typing the right password can never work), else None. Shown in
+    place of "Invalid password" so the operator resets instead of retyping."""
+    spec = (pwhash or '').split('$', 1)[0]
+    if not spec:
+        return None
+    if spec not in _HASH_METHOD_ERRORS:
+        _HASH_METHOD_ERRORS[spec] = _hash_method_error(spec)
+    err = _HASH_METHOD_ERRORS[spec]
+    if not err:
+        return None
+    return (f"This server cannot check the stored console password: its {spec.split(':')[0]} "
+            f"hash is not supported by this system's OpenSSL ({err}; FIPS mode removes scrypt). "
+            "Reset it on the server: cd to the infra-TAK install folder and run "
+            "sudo ./reset-console-password.sh")
+
+
+def _upgrade_password_hash(auth, password):
+    """Called right after a successful password login: re-hash a pre-#137 (scrypt) hash
+    with PASSWORD_HASH_METHOD so the box keeps working if scrypt later goes away (e.g.
+    FIPS enabled). Best-effort — a failed upgrade never affects the login."""
+    try:
+        if not (auth.get('password_hash') or '').startswith(PASSWORD_HASH_METHOD + ':'):
+            auth = dict(auth)
+            auth['password_hash'] = hash_password(password)
+            save_auth(auth)
+            print(f"[auth] console password hash upgraded to {PASSWORD_HASH_METHOD}", flush=True)
+    except Exception as e:
+        print(f"[auth] password hash upgrade skipped: {str(e)[:120]}", flush=True)
+
 # ==========================================================================
 # v10.0.1 — Platform detection (arch × distro × install-method)
 # ==========================================================================
@@ -2424,6 +2513,62 @@ _TAK_DOCKERFILES = (
     ('docker/Dockerfile.hardened-takserver', 'docker/Dockerfile.hardened-takserver-db'),
     ('docker/Dockerfile.takserver',          'docker/Dockerfile.takserver-db'),
 )
+
+
+def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
+    """Make TAK's hardened (UBI 10) images buildable while Red Hat's OpenSSL moves on. Idempotent.
+
+    Field 2026-10-14 (v10.3.0 W13, aws-noble — and NOT host-specific: it happens inside the image
+    build, so it breaks every new Docker TAK install on any host). TAK's
+    Dockerfile.hardened-takserver pins the base image's OpenSSL for the duration of its update:
+
+        RUN echo -e "\nexclude=openssl* openssl-fips-provider*" >> /etc/dnf/dnf.conf
+        RUN microdnf update -y --disableplugin=subscription-manager --nodocs && microdnf install …
+
+    Red Hat then published curl/libcurl-minimal 8.12.1-4.el10_2.7, which requires
+    openssl-libs >= 1:3.5.8 — excluded — so `microdnf update` refuses the whole transaction
+    ("Could not depsolve transaction … cannot install the best update candidate for package curl")
+    and `docker build` exits 1 at step 8/12.
+
+    Fix: `--nobest` on that update. Measured in TAK's exact base image
+    (eclipse-temurin:17.0.19_10-jdk-ubi10-minimal) and then in a full build of the RELEASE-75
+    bundle: the update completes, OpenSSL stays at the base image's 3.5.5 (TAK's intent is kept),
+    curl stays at el10_2.4 until a compatible one exists, every listed package installs, and the
+    image keeps tak uid 1001 / gid 0. Build 90 s. `--setopt=best=0` and a curl exclusion are both
+    rejected by this microdnf ("Unable to handle") — `--nobest` is the form it accepts.
+
+    Conservative like _patch_tak_db_dockerfile: only a `RUN microdnf update -y` line is touched,
+    nothing is removed, a Dockerfile without that line is left exactly as shipped, and a file we
+    cannot read or write is built as shipped rather than failing the deploy here.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    patched = []
+    for rel in dockerfiles or ():
+        if not rel:
+            continue
+        df = os.path.join(build_ctx, rel)
+        if not os.path.isfile(df):
+            continue
+        try:
+            with open(df) as f:
+                src = f.read()
+        except Exception as e:
+            _log(f"  (could not read {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        new = re.sub(r'(?m)^(RUN\s+microdnf\s+update\s+-y)(?![^\n]*--nobest)', r'\1 --nobest', src)
+        if new == src:
+            continue
+        try:
+            with open(df, 'w') as f:
+                f.write(new)
+        except Exception as e:
+            _log(f"  (could not patch {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        patched.append(os.path.basename(rel))
+    if patched:
+        _log(f"  Patched {', '.join(patched)}: `microdnf update --nobest` — Red Hat's newer curl needs an "
+             "OpenSSL that TAK's Dockerfile pins out; without this the image build fails on every host.")
+    return bool(patched)
 
 
 def _tak_bundle_dockerfiles(ctx):
@@ -3364,7 +3509,8 @@ def _require_admin_password(data=None):
     password = (data or {}).get('password', '')
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return jsonify({'success': False, 'error': 'Invalid admin password'}), 403
+        return jsonify({'success': False,
+                        'error': stored_hash_unusable(auth.get('password_hash')) or 'Invalid admin password'}), 403
     return None
 
 
@@ -5575,12 +5721,14 @@ def login():
                 error='Password not set or wrong install path. Use backdoor: https://YOUR_SERVER_IP:5001 and run ./reset-console-password.sh from the install directory.',
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            _upgrade_password_hash(auth, request.form.get('password', ''))
             session.clear()
             session['authenticated'] = True
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
-        return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
+        return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
+                               version=VERSION, login_logo_url=logo_url)
     return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
 
 @app.route('/logout', methods=['POST'])
@@ -5603,11 +5751,13 @@ def index():
                 error='Password not set or wrong install path. Use backdoor: https://YOUR_SERVER_IP:5001 and run ./reset-console-password.sh from the install directory.',
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            _upgrade_password_hash(auth, request.form.get('password', ''))
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
-        return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
+        return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
+                               version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
         return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
     return redirect(url_for('console_page'))
@@ -33509,6 +33659,57 @@ WantedBy=timers.target
     return True
 
 
+def _tak_coreconfig_give_to_tak():
+    """chown tak:tak /opt/tak/CoreConfig.xml. True on success. Never raises."""
+    try:
+        r = subprocess.run(_sudo_wrap(['chown', 'tak:tak', CORECONFIG_PATH]),
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _startup_heal_coreconfig_owner(plog=None, stat=None, getpwnam=None, chown=None):
+    """v10.2.15: give a root-owned /opt/tak/CoreConfig.xml back to `tak` on a native TAK box.
+
+    The external-database deploy seeds CoreConfig.xml from the example before TAK's first
+    start. On a non-root console the broker writes it, so the NEW file is owned by root — and
+    once it is 640 (TAK's normal mode) TAK, which runs as `tak`, cannot read its own config:
+        DistributedConfiguration - CoreConfig.xml (Permission denied)
+        Failed to find deployed service: distributed-configuration
+    TAK keeps running on what it loaded until the next restart, then cannot start at all.
+    Field 2026-10-15, two fresh managed-database installs (RDS), both broken the same way.
+
+    Native only: a container TAK's /opt/tak is the bundle, owned differently by design.
+    Never restarts TAK — a running TAK keeps working, and the next start reads it fine.
+    Returns True when it changed the owner."""
+    log = plog or (lambda m: print(m, flush=True))
+    stat = stat or os.stat
+    chown = chown or _tak_coreconfig_give_to_tak
+    if getpwnam is None:
+        import pwd
+        getpwnam = pwd.getpwnam
+    try:
+        if _tak_is_container():
+            return False
+        st = stat(CORECONFIG_PATH)
+    except OSError:
+        return False
+    try:
+        tak = getpwnam('tak')
+    except KeyError:
+        return False
+    if st.st_uid == tak.pw_uid:
+        return False
+    if not chown():
+        log("CoreConfig.xml is not owned by tak — could not chown it (TAK Server cannot read its "
+            "config on its next start)")
+        return False
+    log(f"CoreConfig.xml was owned by uid {st.st_uid}, not tak — gave it back to tak:tak so TAK Server "
+        f"can read its own config")
+    return True
+
+
 def _selfheal_takserver_le_cert(plog=None):
     """v0.9.44: re-sync TAK Server's 8446 Let's Encrypt cert when it has drifted from
     Caddy's current cert.
@@ -33523,7 +33724,10 @@ def _selfheal_takserver_le_cert(plog=None):
     Here we compare the cert in TAK's keystore against Caddy's current cert and, if they
     differ or the keystore cert is expired/missing, re-run install_le_cert_on_8446() to
     repair. Runs daily via the console-restart timer; a no-op (no TAK restart) when the
-    keystore already matches Caddy."""
+    keystore already matches Caddy.
+
+    Returns True when 8446 ends up serving Caddy's current cert (already did, or was just
+    installed), falsy otherwise — _le8446_install_when_issued() polls on that."""
     def _log(m):
         if plog:
             plog(m)
@@ -33535,7 +33739,15 @@ def _selfheal_takserver_le_cert(plog=None):
         script_present = os.path.exists(_renew_script)
         unit_present   = os.path.exists(_renew_unit)
         if not script_present and not unit_present:
-            return  # box never had the LE-on-8446 setup
+            # v10.2.15: "no renewal script/unit" used to mean "box never had LE on 8446" and
+            # returned here. But install_le_cert_on_8446() is what WRITES them — so a TAK deploy
+            # that finished while Let's Encrypt was still issuing (it waits 120 s, then skips)
+            # left a box this heal would never touch: 8446 kept TAK's own cert for good and
+            # phones could not enroll by QR. Field 2026-10-15, two fresh installs at once while
+            # Let's Encrypt answered "503 Service busy". TAK installed + a domain is the setup the
+            # deploy meant to do; fall through, and the Caddy-cert / keystore checks below decide.
+            if not os.path.exists('/opt/tak/CoreConfig.xml') or not load_settings().get('fqdn'):
+                return  # no TAK Server, or no domain: there is no LE-on-8446 to set up
         settings = load_settings()
         host = _get_service_domain(settings, 'takserver')
         if not host:
@@ -33551,8 +33763,7 @@ def _selfheal_takserver_le_cert(plog=None):
             _log('takserver LE-cert self-heal: renewal script missing (a container '
                  'redeploy likely re-extracted /opt/tak) but box is LE-on-8446 — '
                  're-establishing renewal script + timer...')
-            install_le_cert_on_8446(host, _log, wait_for_cert=False)
-            return
+            return install_le_cert_on_8446(host, _log, wait_for_cert=False)
         # v0.9.51 — source cert is the uploaded PEM in custom mode, else Caddy's ACME store.
         # v10.0.5 non-root: the takwerx console can't stat/read Caddy's 0750 store, so stage a
         # readable copy via the broker (cat as root) before os.path.exists/openssl — otherwise
@@ -33605,18 +33816,29 @@ def _selfheal_takserver_le_cert(plog=None):
                         ['openssl', 'x509', '-checkend', '0', '-noout'],
                         input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             elif os.path.exists(jks):
-                kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
-                tak_fp = subprocess.run(
-                    f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
-                tak_expired = subprocess.run(
-                    f'{kt} | openssl x509 -checkend 0 -noout',
-                    shell=True, capture_output=True, timeout=20).returncode != 0
+                # v10.2.15: read the keystore AS `tak`, through the broker. It is tak:tak 640, so a
+                # bare `keytool` run by the non-root console (takwerx) could not open it: the
+                # fingerprint came back empty, the keystore always looked stale, and EVERY console
+                # start — boot and the daily console restart — re-imported the same cert and
+                # restarted TAK. On a reboot that restart lands mid-boot: field 2026-10-15 (Ubuntu
+                # 24.04 + RDS) TAK messaging died with Ignite "node left topology" and 8089 took
+                # 16 min instead of ~4. Same shape as the container branch above.
+                _kr = subprocess.run(
+                    _sudo_wrap(['runuser', '-u', 'tak', '--', 'keytool', '-list', '-rfc',
+                                '-keystore', jks, '-storepass', cert_pass]),
+                    capture_output=True, text=True, timeout=30)
+                if _kr.returncode == 0 and _kr.stdout:
+                    tak_fp = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).stdout.strip()
+                    tak_expired = subprocess.run(
+                        ['openssl', 'x509', '-checkend', '0', '-noout'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
-                return  # keystore already matches Caddy and is valid — nothing to do
+                return True  # keystore already matches Caddy and is valid — nothing to do
             _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
                  '— re-syncing and restarting TAK Server...')
-            install_le_cert_on_8446(host, _log, wait_for_cert=False)
+            return install_le_cert_on_8446(host, _log, wait_for_cert=False)
         finally:
             if _heal_tmp:
                 try:
@@ -33625,6 +33847,47 @@ def _selfheal_takserver_le_cert(plog=None):
                     pass
     except Exception as e:
         _log(f'takserver LE-cert self-heal error (non-fatal): {e}')
+
+
+def _le8446_install_when_issued(log_fn=None, interval=60, max_s=1800, sleep=None, heal=None):
+    """The TAK deploy waits 120 s for Caddy's takserver.<domain> cert, then skips 8446. When
+    Let's Encrypt is slow (rate limits, "503 Service busy"), that left 8446 on TAK's own cert
+    until the next console restart. This finishes the job in the background: every `interval`
+    seconds, for up to `max_s`, run the 8446 self-heal; stop as soon as 8446 serves Caddy's
+    cert. Past `max_s` the daily console-restart heal still covers it. One TAK restart, at
+    the moment the cert arrives."""
+    sleep = sleep or time.sleep
+    heal = heal or _selfheal_takserver_le_cert
+    log = log_fn or (lambda m: print(m, flush=True))
+
+    def _run():
+        waited = 0
+        while waited < max_s:
+            sleep(interval)
+            waited += interval
+            try:
+                if heal(log):
+                    log(f"8446: trusted certificate installed once it was issued ({waited // 60} min after deploy)")
+                    return True
+            except Exception as e:
+                log(f"8446: late-certificate retry error (non-fatal): {e}")
+        log("8446: certificate still not issued after 30 min — the daily console heal will install it")
+        return False
+
+    threading.Thread(target=_run, daemon=True, name='le8446-when-issued').start()
+    return _run
+
+
+def _install_le_cert_on_8446_at_deploy(host, log_step):
+    """Deploy-time 8446 install. If the cert is not issued yet, hand off to
+    _le8446_install_when_issued() instead of leaving 8446 on TAK's own cert."""
+    ok = install_le_cert_on_8446(host, log_step, wait_for_cert=True)
+    if not ok and (load_settings().get('ssl_mode') or '') != 'custom':
+        log_step(f"  ↻ Let's Encrypt has not issued {host} yet — the console will put it on 8446 "
+                 f"automatically as soon as it arrives (checks every minute for 30 min). "
+                 f"Until then phones cannot enroll by QR.")
+        _le8446_install_when_issued(lambda m: print(m, flush=True))
+    return ok
 
 
 def run_caddy_deploy(domain):
@@ -36025,6 +36288,18 @@ def _takportal_ssh_probe(timeout=20):
     return 'unreachable', ((r.stderr or r.stdout or 'no answer from sshd').strip()[:200])
 
 
+# GH #142: on containerized TAK, TAK Portal's privileged extras run host commands
+# (`sudo -u tak makeCert.sh`, `systemctl restart takserver`) that only exist with a
+# native install, so no grant from infra-TAK can make them work. Say which features
+# are missing instead of "SSH auto-setup failed — configure manually", which sent
+# operators to configure by hand something that cannot work.
+TAKPORTAL_CONTAINER_TAK_NOTE = (
+    "TAK Server runs in Docker, so TAK Portal can't issue integration-user certs, "
+    "restart TAK Server or sync plugins to the Update Server yet. Users and QR "
+    "enrollment work. Requested upstream: "
+    "https://github.com/AdventureSeeker423/TAK-Portal/issues/61")
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -36114,6 +36389,15 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # GH #142: containerized TAK. Whatever the probe says (a root console
+        # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
+        # tak user and takserver.service that do not exist. Not verified, and not
+        # a failure either: the caller reports it as a known limitation.
+        if _tak_is_container():
+            if log_fn:
+                log_fn(f"  ⏭ Privileged TAK Portal extras unavailable — {TAKPORTAL_CONTAINER_TAK_NOTE}")
+            return False
 
         # v10.1.53 (W6): prove it. This function used to return True here having
         # verified NOTHING beyond "docker cp did not error" — so a portal that
@@ -36550,9 +36834,7 @@ def takportal_ssh_status():
             'SSH from TAK Portal is configured by hand in the portal UI for a remote TAK Server.')
         return jsonify(out)
     if tak_container:
-        row('TAK Server', 'na', 'containerized install',
-            'No host `tak` user and no takserver.service — the portal SSH privilege grant '
-            'does not apply to a containerized TAK Server.')
+        row('TAK Server', 'na', 'containerized install', TAKPORTAL_CONTAINER_TAK_NOTE)
         return jsonify(out)
 
     portal = _takportal_get_existing_settings()
@@ -36662,8 +36944,10 @@ def takportal_ssh_repair():
     try:
         ok = _takportal_setup_ssh(log_fn=lambda m: log.append(m))
         verdict, detail = _takportal_ssh_probe()
+        note = TAKPORTAL_CONTAINER_TAK_NOTE if (not ok and os.path.isdir('/opt/tak')
+                                                and _tak_is_container()) else ''
         return jsonify({'success': True, 'verified': ok, 'probe': verdict,
-                        'detail': detail, 'log': log})
+                        'detail': detail, 'note': note, 'log': log})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300], 'log': log}), 500
 
@@ -37044,6 +37328,8 @@ def run_takportal_deploy():
         if _takportal_setup_ssh(log_fn=plog):
             plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:{portal_settings.get('TAK_SSH_PORT', '22')} as {portal_settings.get('TAK_SSH_USER', 'root')}")
             plog("\u2713 SSH ready (no handshake needed)")
+        elif os.path.isdir('/opt/tak') and _tak_is_container():
+            plog("\u2139 SSH key installed; privileged extras not available with Docker TAK Server (see above)")
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
@@ -69518,7 +69804,8 @@ def guarddog_cotdb_purge():
 
     # The one-copy admin-password gate (modules/__init__.py, allowlisted in
     # smoke.py AUTH_FUNCS) rather than a 19th inline check_password_hash.
-    if mod_registry._check_admin_password({'load_auth': load_auth}, data):
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
         return jsonify({'success': False, 'error': 'Incorrect console password.',
                         'need_password': True}), 403
 
@@ -75656,6 +75943,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
+        _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -77647,6 +77935,7 @@ def _deploy_takserver_container(config):
         log_step("  (first build pulls the bundle's base images — minutes on arm64)")
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
+        _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
@@ -77922,7 +78211,7 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             log_step(""); log_step("━━━ Installing trusted cert on 8446 (enrollment) ━━━")
             try:
-                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+                _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
             except Exception as _le:
                 log_step(f"  ⚠ LE cert on 8446 failed (non-fatal): {str(_le)[:120]}")
 
@@ -78461,6 +78750,10 @@ def run_takserver_deploy(config):
                                            capture_output=True, text=True, timeout=5).stdout or ''
                     if _seed.strip():
                         _write_priv('/opt/tak/CoreConfig.xml', _seed)
+                        # The broker creates a new file as root — TAK (user `tak`) could then
+                        # not read its own config once it is 640. The rpm and container seeds
+                        # chown it; this one did not (see _tak_coreconfig_give_to_tak).
+                        _tak_coreconfig_give_to_tak()
                         log_step("External DB: seeded CoreConfig.xml from CoreConfig.example.xml "
                                  "(TAK has not written one yet)")
                 except Exception as _e:
@@ -79048,7 +79341,7 @@ def run_takserver_deploy(config):
             if caddy_active.stdout.strip() == 'active':
                 log_step("")
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
-                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+                _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
 
         log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
         log_step(f"  WebGUI (cert):     https://{ip}:8443")
@@ -85311,6 +85604,110 @@ def _mediamtx_editor_grant_journal_access():
         return False
 
 
+# Docker TAK: PostgreSQL's lock files outlive the container's PostgreSQL. TAK's db entrypoint
+# (configureInDocker.sh) is PID 1 and does not pass a stop signal on, so every `docker stop` /
+# reboot / dockerd restart SIGKILLs PostgreSQL and it never removes its locks. There are THREE,
+# all naming the old postmaster's PID: $PGDATA/postmaster.pid (on the data volume) and one per
+# socket directory — /run/postgresql AND /tmp (the image's unix_socket_directories default).
+# On the next start PostgreSQL refuses whenever that PID belongs to some other live process:
+#     FATAL: lock file "/run/postgresql/.s.PGSQL.5432.lock" already exists
+#     HINT: Is another postmaster (PID 9) using socket file "/run/postgresql/.s.PGSQL.5432"?
+# The container stays up with no database, and TAK refuses every client. Intermittent — the
+# postmaster usually gets the same PID, which PostgreSQL ignores. Field 2026-10-14; the /tmp lock
+# was found when a heal that cleared only /run/postgresql hit the same refusal on /tmp.
+#
+# The probe runs inside takserver-db. With NO postgres process alive every one of those files is
+# stale by definition (PostgreSQL removes them on any clean exit), so it removes them; with any
+# postgres process alive it touches nothing. /proc is read directly — the image has no ps/pgrep.
+_TAK_DB_STALE_LOCK_PROBE = (
+    'alive=0; for p in /proc/[0-9]*; do c=$(cat "$p/comm" 2>/dev/null); '
+    'if [ "$c" = postgres ]; then alive=1; break; fi; done; '
+    'if [ "$alive" = 1 ]; then echo alive=1; exit 0; fi; '
+    'n=0; for f in "${PGDATA:-/var/lib/postgresql/data}/postmaster.pid" '
+    '/run/postgresql/.s.PGSQL.5432.lock /tmp/.s.PGSQL.5432.lock; do '
+    'if [ -e "$f" ]; then rm -f "$f" && n=$((n+1)); fi; done; '
+    'rm -f /run/postgresql/.s.PGSQL.5432 /tmp/.s.PGSQL.5432; '
+    'if [ "$n" -gt 0 ]; then echo "REMOVED $n"; else echo alive=0; fi'
+)
+
+
+_TAK_DB_STALE_LOCK_MIN_UP_S = 90
+
+
+def _tak_db_stale_lock_heal(run=None, sleep=None, log=None, now=None):
+    """One check: heal a Docker TAK database container that cannot start because of a stale
+    PostgreSQL lock (see _TAK_DB_STALE_LOCK_PROBE). Looks only at a container that is running, not
+    healthy, and was started at least _TAK_DB_STALE_LOCK_MIN_UP_S ago (so a container someone just
+    started is left alone). Acts only when the probe finds no PostgreSQL process AND at least one
+    lock file present. Then: restart takserver-db, wait until it is healthy, restart takserver (its
+    JVM gave up on the database). Returns 'healed', 'healed-db-not-healthy', or None."""
+    run = run or subprocess.run
+    sleep = sleep or time.sleep
+    log = log or (lambda m: print(m, flush=True))
+    now = now or time.time
+    try:
+        r = run(_sudo_wrap(['docker', 'inspect', '-f',
+                            '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.StartedAt}}',
+                            TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    f = (r.stdout or '').split()
+    if r.returncode != 0 or len(f) != 3 or f[0] != 'true' or f[1] not in ('starting', 'unhealthy'):
+        return None
+    try:
+        from datetime import timezone as _tz
+        started = datetime.strptime(f[2][:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc).timestamp()
+    except ValueError:
+        return None
+    if now() - started < _TAK_DB_STALE_LOCK_MIN_UP_S:
+        return None
+    try:
+        p = run(_sudo_wrap(['docker', 'exec', TAK_DB_CONTAINER, 'sh', '-c', _TAK_DB_STALE_LOCK_PROBE]),
+                capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if 'REMOVED' not in (p.stdout or ''):
+        return None
+    log("TAK database: PostgreSQL could not start because of stale lock files left by an unclean stop — "
+        "removed them, restarting takserver-db")
+    run(_sudo_wrap(['docker', 'restart', TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=120)
+    healthy = False
+    for _ in range(60):                       # up to ~5 min (crash recovery on a big database)
+        sleep(5)
+        try:
+            h = run(_sudo_wrap(['docker', 'inspect', '-f', '{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=20)
+            if (h.stdout or '').strip() == 'healthy':
+                healthy = True
+                break
+        except Exception:
+            pass
+    if not healthy:
+        log("TAK database: ✗ takserver-db still not healthy after removing the stale lock — leaving TAK as it is")
+        return 'healed-db-not-healthy'
+    run(_sudo_wrap(['docker', 'restart', TAK_CONTAINER]), capture_output=True, text=True, timeout=180)
+    log("TAK database: ✓ takserver-db healthy again; restarted takserver so it reconnects to its database")
+    try:
+        audit('takdb:stale-lock-heal', 'removed stale PostgreSQL lock files; restarted takserver-db + takserver')
+    except Exception:
+        pass
+    return 'healed'
+
+
+def _watch_tak_db_stale_lock(interval=120, cooldown=600):
+    """Background watcher for Docker TAK boxes: the stale lock appears at boot or after any Docker
+    restart (package updates restart dockerd), neither of which restarts the console on its own.
+    One cheap `docker inspect` every 2 min; a heal at most every 10 min."""
+    while True:
+        try:
+            if _tak_is_container() and _tak_db_stale_lock_heal():
+                time.sleep(cooldown)
+                continue
+        except Exception as e:
+            print(f"TAK database stale-lock watch error (non-fatal): {e}", flush=True)
+        time.sleep(interval)
+
+
 def _startup_heal_mediamtx_editor_probe():
     """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
 
@@ -86624,6 +87021,13 @@ def _startup_migrations():
         except Exception as tak_heal_err:
             print(f"Startup migration: takserver self-heal error (non-fatal): {tak_heal_err}")
 
+        # v10.2.15 — a root-owned CoreConfig.xml (external-DB seed on a non-root console)
+        # keeps TAK from reading its own config. Before the 8446 heal, which may restart TAK.
+        try:
+            _startup_heal_coreconfig_owner(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as cc_own_err:
+            print(f"Startup migration: CoreConfig owner heal error (non-fatal): {cc_own_err}")
+
         # v0.9.44 — re-sync TAK Server's 8446 Let's Encrypt cert if it drifted from
         # Caddy's current cert. Caddy auto-renews independently; the keystore used to
         # keep the OLD cert and silently expire, breaking CloudTAK login with
@@ -87018,6 +87422,16 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_probe()
         except Exception as _mx_err:
             print(f"Startup migration: MediaMTX editor heal error (non-fatal): {_mx_err}", flush=True)
+
+        # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
+        # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
+        # watcher checks for container TAK on every pass, so a Docker TAK deployed after this start
+        # is covered too.
+        try:
+            threading.Thread(target=_watch_tak_db_stale_lock, daemon=True,
+                             name='tak-db-stale-lock').start()
+        except Exception as _dl_err:
+            print(f"Startup migration: TAK database stale-lock watch start error (non-fatal): {_dl_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
@@ -89619,6 +90033,8 @@ _MODULE_CTX = {
     'load_settings': load_settings,
     'save_settings': save_settings,
     'load_auth': load_auth,
+    'verify_password': verify_password,            # GH #137: fail-closed password check
+    'stored_hash_unusable': stored_hash_unusable,
     '_read_priv': _read_priv,
     '_write_priv': _write_priv,
     '_pkg_install': _pkg_install,
