@@ -267,7 +267,20 @@ def _make_views(desc, ctx):
         job = _job(key)
         if job['running']:
             return jsonify({'success': False, 'error': 'A deployment is in progress'}), 409
-        result = desc['uninstall'](ctx, job, data)
+        # GH #137 follow-up: an exception here used to escape to Flask's HTML 500
+        # page, and every module page does `await r.json()` on this response — so
+        # the operator saw "SyntaxError: JSON.parse: unexpected character" instead
+        # of what actually failed. The traceback goes to the journal; the page gets
+        # the exception itself, in the same shape a failed uninstall already uses.
+        try:
+            result = desc['uninstall'](ctx, job, data)
+        except Exception as e:
+            import traceback
+            print(f"[{key}] uninstall crashed:\n{traceback.format_exc()}", flush=True)
+            result = {'success': False,
+                      'error': f'Uninstall stopped on an unexpected error: '
+                               f'{type(e).__name__}: {str(e)[:300]}. The full traceback is '
+                               f'in the console log (journalctl -u takwerx-console).'}
         job['log'].clear()
         job.update({'running': False, 'complete': False, 'error': False, 'action': None})
         return jsonify(result)
