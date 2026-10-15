@@ -85546,6 +85546,110 @@ def _mediamtx_editor_grant_journal_access():
         return False
 
 
+# Docker TAK: PostgreSQL's lock files outlive the container's PostgreSQL. TAK's db entrypoint
+# (configureInDocker.sh) is PID 1 and does not pass a stop signal on, so every `docker stop` /
+# reboot / dockerd restart SIGKILLs PostgreSQL and it never removes its locks. There are THREE,
+# all naming the old postmaster's PID: $PGDATA/postmaster.pid (on the data volume) and one per
+# socket directory — /run/postgresql AND /tmp (the image's unix_socket_directories default).
+# On the next start PostgreSQL refuses whenever that PID belongs to some other live process:
+#     FATAL: lock file "/run/postgresql/.s.PGSQL.5432.lock" already exists
+#     HINT: Is another postmaster (PID 9) using socket file "/run/postgresql/.s.PGSQL.5432"?
+# The container stays up with no database, and TAK refuses every client. Intermittent — the
+# postmaster usually gets the same PID, which PostgreSQL ignores. Field 2026-10-14; the /tmp lock
+# was found when a heal that cleared only /run/postgresql hit the same refusal on /tmp.
+#
+# The probe runs inside takserver-db. With NO postgres process alive every one of those files is
+# stale by definition (PostgreSQL removes them on any clean exit), so it removes them; with any
+# postgres process alive it touches nothing. /proc is read directly — the image has no ps/pgrep.
+_TAK_DB_STALE_LOCK_PROBE = (
+    'alive=0; for p in /proc/[0-9]*; do c=$(cat "$p/comm" 2>/dev/null); '
+    'if [ "$c" = postgres ]; then alive=1; break; fi; done; '
+    'if [ "$alive" = 1 ]; then echo alive=1; exit 0; fi; '
+    'n=0; for f in "${PGDATA:-/var/lib/postgresql/data}/postmaster.pid" '
+    '/run/postgresql/.s.PGSQL.5432.lock /tmp/.s.PGSQL.5432.lock; do '
+    'if [ -e "$f" ]; then rm -f "$f" && n=$((n+1)); fi; done; '
+    'rm -f /run/postgresql/.s.PGSQL.5432 /tmp/.s.PGSQL.5432; '
+    'if [ "$n" -gt 0 ]; then echo "REMOVED $n"; else echo alive=0; fi'
+)
+
+
+_TAK_DB_STALE_LOCK_MIN_UP_S = 90
+
+
+def _tak_db_stale_lock_heal(run=None, sleep=None, log=None, now=None):
+    """One check: heal a Docker TAK database container that cannot start because of a stale
+    PostgreSQL lock (see _TAK_DB_STALE_LOCK_PROBE). Looks only at a container that is running, not
+    healthy, and was started at least _TAK_DB_STALE_LOCK_MIN_UP_S ago (so a container someone just
+    started is left alone). Acts only when the probe finds no PostgreSQL process AND at least one
+    lock file present. Then: restart takserver-db, wait until it is healthy, restart takserver (its
+    JVM gave up on the database). Returns 'healed', 'healed-db-not-healthy', or None."""
+    run = run or subprocess.run
+    sleep = sleep or time.sleep
+    log = log or (lambda m: print(m, flush=True))
+    now = now or time.time
+    try:
+        r = run(_sudo_wrap(['docker', 'inspect', '-f',
+                            '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.StartedAt}}',
+                            TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    f = (r.stdout or '').split()
+    if r.returncode != 0 or len(f) != 3 or f[0] != 'true' or f[1] not in ('starting', 'unhealthy'):
+        return None
+    try:
+        from datetime import timezone as _tz
+        started = datetime.strptime(f[2][:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc).timestamp()
+    except ValueError:
+        return None
+    if now() - started < _TAK_DB_STALE_LOCK_MIN_UP_S:
+        return None
+    try:
+        p = run(_sudo_wrap(['docker', 'exec', TAK_DB_CONTAINER, 'sh', '-c', _TAK_DB_STALE_LOCK_PROBE]),
+                capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if 'REMOVED' not in (p.stdout or ''):
+        return None
+    log("TAK database: PostgreSQL could not start because of stale lock files left by an unclean stop — "
+        "removed them, restarting takserver-db")
+    run(_sudo_wrap(['docker', 'restart', TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=120)
+    healthy = False
+    for _ in range(60):                       # up to ~5 min (crash recovery on a big database)
+        sleep(5)
+        try:
+            h = run(_sudo_wrap(['docker', 'inspect', '-f', '{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                TAK_DB_CONTAINER]), capture_output=True, text=True, timeout=20)
+            if (h.stdout or '').strip() == 'healthy':
+                healthy = True
+                break
+        except Exception:
+            pass
+    if not healthy:
+        log("TAK database: ✗ takserver-db still not healthy after removing the stale lock — leaving TAK as it is")
+        return 'healed-db-not-healthy'
+    run(_sudo_wrap(['docker', 'restart', TAK_CONTAINER]), capture_output=True, text=True, timeout=180)
+    log("TAK database: ✓ takserver-db healthy again; restarted takserver so it reconnects to its database")
+    try:
+        audit('takdb:stale-lock-heal', 'removed stale PostgreSQL lock files; restarted takserver-db + takserver')
+    except Exception:
+        pass
+    return 'healed'
+
+
+def _watch_tak_db_stale_lock(interval=120, cooldown=600):
+    """Background watcher for Docker TAK boxes: the stale lock appears at boot or after any Docker
+    restart (package updates restart dockerd), neither of which restarts the console on its own.
+    One cheap `docker inspect` every 2 min; a heal at most every 10 min."""
+    while True:
+        try:
+            if _tak_is_container() and _tak_db_stale_lock_heal():
+                time.sleep(cooldown)
+                continue
+        except Exception as e:
+            print(f"TAK database stale-lock watch error (non-fatal): {e}", flush=True)
+        time.sleep(interval)
+
+
 def _startup_heal_mediamtx_editor_probe():
     """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
 
@@ -87260,6 +87364,16 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_probe()
         except Exception as _mx_err:
             print(f"Startup migration: MediaMTX editor heal error (non-fatal): {_mx_err}", flush=True)
+
+        # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
+        # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
+        # watcher checks for container TAK on every pass, so a Docker TAK deployed after this start
+        # is covered too.
+        try:
+            threading.Thread(target=_watch_tak_db_stale_lock, daemon=True,
+                             name='tak-db-stale-lock').start()
+        except Exception as _dl_err:
+            print(f"Startup migration: TAK database stale-lock watch start error (non-fatal): {_dl_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
