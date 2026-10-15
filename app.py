@@ -2515,6 +2515,62 @@ _TAK_DOCKERFILES = (
 )
 
 
+def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
+    """Make TAK's hardened (UBI 10) images buildable while Red Hat's OpenSSL moves on. Idempotent.
+
+    Field 2026-10-14 (v10.3.0 W13, aws-noble — and NOT host-specific: it happens inside the image
+    build, so it breaks every new Docker TAK install on any host). TAK's
+    Dockerfile.hardened-takserver pins the base image's OpenSSL for the duration of its update:
+
+        RUN echo -e "\nexclude=openssl* openssl-fips-provider*" >> /etc/dnf/dnf.conf
+        RUN microdnf update -y --disableplugin=subscription-manager --nodocs && microdnf install …
+
+    Red Hat then published curl/libcurl-minimal 8.12.1-4.el10_2.7, which requires
+    openssl-libs >= 1:3.5.8 — excluded — so `microdnf update` refuses the whole transaction
+    ("Could not depsolve transaction … cannot install the best update candidate for package curl")
+    and `docker build` exits 1 at step 8/12.
+
+    Fix: `--nobest` on that update. Measured in TAK's exact base image
+    (eclipse-temurin:17.0.19_10-jdk-ubi10-minimal) and then in a full build of the RELEASE-75
+    bundle: the update completes, OpenSSL stays at the base image's 3.5.5 (TAK's intent is kept),
+    curl stays at el10_2.4 until a compatible one exists, every listed package installs, and the
+    image keeps tak uid 1001 / gid 0. Build 90 s. `--setopt=best=0` and a curl exclusion are both
+    rejected by this microdnf ("Unable to handle") — `--nobest` is the form it accepts.
+
+    Conservative like _patch_tak_db_dockerfile: only a `RUN microdnf update -y` line is touched,
+    nothing is removed, a Dockerfile without that line is left exactly as shipped, and a file we
+    cannot read or write is built as shipped rather than failing the deploy here.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    patched = []
+    for rel in dockerfiles or ():
+        if not rel:
+            continue
+        df = os.path.join(build_ctx, rel)
+        if not os.path.isfile(df):
+            continue
+        try:
+            with open(df) as f:
+                src = f.read()
+        except Exception as e:
+            _log(f"  (could not read {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        new = re.sub(r'(?m)^(RUN\s+microdnf\s+update\s+-y)(?![^\n]*--nobest)', r'\1 --nobest', src)
+        if new == src:
+            continue
+        try:
+            with open(df, 'w') as f:
+                f.write(new)
+        except Exception as e:
+            _log(f"  (could not patch {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        patched.append(os.path.basename(rel))
+    if patched:
+        _log(f"  Patched {', '.join(patched)}: `microdnf update --nobest` — Red Hat's newer curl needs an "
+             "OpenSSL that TAK's Dockerfile pins out; without this the image build fails on every host.")
+    return bool(patched)
+
+
 def _tak_bundle_dockerfiles(ctx):
     """(app_dockerfile, db_dockerfile) relative to `ctx`, newest naming first.
 
@@ -75887,6 +75943,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
+        _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -77878,6 +77935,7 @@ def _deploy_takserver_container(config):
         log_step("  (first build pulls the bundle's base images — minutes on arm64)")
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
+        _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
