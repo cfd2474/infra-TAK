@@ -126,6 +126,28 @@ def test_hung_hook_is_killed(tmp_path):
     assert any('timed out' in l for l in log)
 
 
+def test_background_child_of_a_passing_hook_does_not_outlive_it(tmp_path):
+    cfg, hooks, ct = _setup(tmp_path)
+    _hook(hooks, '10-bg', '(sleep 2; touch late) > /dev/null 2>&1 &\nexit 0')
+    assert _run(_load(cfg), ct)[0]
+    time.sleep(3)
+    assert not (ct / 'late').exists()
+
+
+def test_unreadable_folder_fails_closed_instead_of_raising(tmp_path):
+    cfg, hooks, ct = _setup(tmp_path)
+    _hook(hooks, '10-ok', 'touch ran')
+    hooks.chmod(0o000)
+    try:
+        if os.access(hooks, os.R_OK):   # root ignores the mode
+            return
+        ok, name, log = _run(_load(cfg), ct)
+    finally:
+        hooks.chmod(0o700)
+    assert ok is False
+    assert not (ct / 'ran').exists()
+
+
 def test_group_writable_hook_is_refused_not_run(tmp_path):
     cfg, hooks, ct = _setup(tmp_path)
     _hook(hooks, '10-open', 'touch ran', mode=0o772)
@@ -188,5 +210,14 @@ def test_plugin_rebuild_runs_hooks_before_the_api_build_and_rolls_back_on_failur
 
 def test_revert_reapplies_hooks_locally_only():
     body = _body('_cloudtak_revert_checkout')
-    i = body.index("_run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert'")
-    assert 'if remote_cfg is None:' in body[:i]
+    i = body.index('_cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)')
+    assert 'if remote_cfg is None and run_hooks:' in body[:i]
+    assert "_run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert'" in _body('_cloudtak_revert_hooks')
+
+
+def test_garage_rollback_runs_hooks_only_after_cloudtak_is_restarted():
+    # The migration stopped the app containers; a 5-minute hook must not extend that outage.
+    body = _body('_cloudtak_garage_rollback')
+    assert 'run_hooks=False' in body
+    assert body.index("['start', 'api', 'events', 'tiles', 'retention']") < \
+        body.index('_cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)')
