@@ -36119,6 +36119,18 @@ def _takportal_ssh_probe(timeout=20):
     return 'unreachable', ((r.stderr or r.stdout or 'no answer from sshd').strip()[:200])
 
 
+# GH #142: on containerized TAK, TAK Portal's privileged extras run host commands
+# (`sudo -u tak makeCert.sh`, `systemctl restart takserver`) that only exist with a
+# native install, so no grant from infra-TAK can make them work. Say which features
+# are missing instead of "SSH auto-setup failed — configure manually", which sent
+# operators to configure by hand something that cannot work.
+TAKPORTAL_CONTAINER_TAK_NOTE = (
+    "TAK Server runs in Docker, so TAK Portal can't issue integration-user certs, "
+    "restart TAK Server or sync plugins to the Update Server yet. Users and QR "
+    "enrollment work. Requested upstream: "
+    "https://github.com/AdventureSeeker423/TAK-Portal/issues/61")
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -36208,6 +36220,15 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # GH #142: containerized TAK. Whatever the probe says (a root console
+        # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
+        # tak user and takserver.service that do not exist. Not verified, and not
+        # a failure either: the caller reports it as a known limitation.
+        if _tak_is_container():
+            if log_fn:
+                log_fn(f"  ⏭ Privileged TAK Portal extras unavailable — {TAKPORTAL_CONTAINER_TAK_NOTE}")
+            return False
 
         # v10.1.53 (W6): prove it. This function used to return True here having
         # verified NOTHING beyond "docker cp did not error" — so a portal that
@@ -36644,9 +36665,7 @@ def takportal_ssh_status():
             'SSH from TAK Portal is configured by hand in the portal UI for a remote TAK Server.')
         return jsonify(out)
     if tak_container:
-        row('TAK Server', 'na', 'containerized install',
-            'No host `tak` user and no takserver.service — the portal SSH privilege grant '
-            'does not apply to a containerized TAK Server.')
+        row('TAK Server', 'na', 'containerized install', TAKPORTAL_CONTAINER_TAK_NOTE)
         return jsonify(out)
 
     portal = _takportal_get_existing_settings()
@@ -36756,8 +36775,10 @@ def takportal_ssh_repair():
     try:
         ok = _takportal_setup_ssh(log_fn=lambda m: log.append(m))
         verdict, detail = _takportal_ssh_probe()
+        note = TAKPORTAL_CONTAINER_TAK_NOTE if (not ok and os.path.isdir('/opt/tak')
+                                                and _tak_is_container()) else ''
         return jsonify({'success': True, 'verified': ok, 'probe': verdict,
-                        'detail': detail, 'log': log})
+                        'detail': detail, 'note': note, 'log': log})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300], 'log': log}), 500
 
@@ -37138,6 +37159,8 @@ def run_takportal_deploy():
         if _takportal_setup_ssh(log_fn=plog):
             plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:{portal_settings.get('TAK_SSH_PORT', '22')} as {portal_settings.get('TAK_SSH_USER', 'root')}")
             plog("\u2713 SSH ready (no handshake needed)")
+        elif os.path.isdir('/opt/tak') and _tak_is_container():
+            plog("\u2139 SSH key installed; privileged extras not available with Docker TAK Server (see above)")
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
