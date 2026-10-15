@@ -139,12 +139,25 @@ def job_start(key, action, target, args=()):
 def _check_admin_password(ctx, data):
     """Admin-password gate for destructive actions. ALWAYS enforced by the
     generic uninstall view — there is deliberately no opt-out descriptor field.
-    (Allowlisted by name in smoke.py AUTH_FUNCS.)"""
-    from werkzeug.security import check_password_hash
+    (Allowlisted by name in smoke.py AUTH_FUNCS.)
+
+    GH #137: checks through app.py's fail-closed verify_password seam — the raw
+    werkzeug call raised (scrypt hash, OpenSSL without scrypt) and 500'd the route.
+    Any error here is a deny, and an uncheckable stored hash says so instead of
+    "Invalid admin password"."""
     password = (data or {}).get('password', '')
     auth = ctx['load_auth']()
-    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return 'Invalid admin password'
+    pwhash = auth.get('password_hash')
+    check = ctx.get('verify_password')
+    if check is None:
+        from werkzeug.security import check_password_hash as check
+    try:
+        ok = bool(pwhash) and bool(check(pwhash, password))
+    except Exception:
+        ok = False
+    if not ok:
+        unusable = ctx.get('stored_hash_unusable')
+        return (unusable(pwhash) if unusable and pwhash else None) or 'Invalid admin password'
     return None
 
 
