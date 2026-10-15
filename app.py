@@ -33699,13 +33699,24 @@ def _selfheal_takserver_le_cert(plog=None):
                         ['openssl', 'x509', '-checkend', '0', '-noout'],
                         input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             elif os.path.exists(jks):
-                kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
-                tak_fp = subprocess.run(
-                    f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
-                tak_expired = subprocess.run(
-                    f'{kt} | openssl x509 -checkend 0 -noout',
-                    shell=True, capture_output=True, timeout=20).returncode != 0
+                # v10.2.15: read the keystore AS `tak`, through the broker. It is tak:tak 640, so a
+                # bare `keytool` run by the non-root console (takwerx) could not open it: the
+                # fingerprint came back empty, the keystore always looked stale, and EVERY console
+                # start — boot and the daily console restart — re-imported the same cert and
+                # restarted TAK. On a reboot that restart lands mid-boot: field 2026-10-15 (Ubuntu
+                # 24.04 + RDS) TAK messaging died with Ignite "node left topology" and 8089 took
+                # 16 min instead of ~4. Same shape as the container branch above.
+                _kr = subprocess.run(
+                    _sudo_wrap(['runuser', '-u', 'tak', '--', 'keytool', '-list', '-rfc',
+                                '-keystore', jks, '-storepass', cert_pass]),
+                    capture_output=True, text=True, timeout=30)
+                if _kr.returncode == 0 and _kr.stdout:
+                    tak_fp = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).stdout.strip()
+                    tak_expired = subprocess.run(
+                        ['openssl', 'x509', '-checkend', '0', '-noout'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
                 return  # keystore already matches Caddy and is valid — nothing to do
             _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
