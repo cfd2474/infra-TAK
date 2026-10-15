@@ -41187,6 +41187,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
         # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
+        _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
+        if not _hok:
+            plog(f'✗ Pre-build hook {_hname} failed — rolling back without rebuilding...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
         if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=5400):
             plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
             _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
@@ -42224,7 +42232,7 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
     aside so the next attempt starts clean. Never raises."""
     try:
         _cloudtak_compose_run(cloudtak_dir, ['--profile', 'migrate', 'rm', '-sf', 'minio-legacy', 'store'], timeout=120)
-        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        _reverted = _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir, run_hooks=False)
         if not _cloudtak_compose_is_garage(cloudtak_dir):
             env_path = os.path.join(cloudtak_dir, '.env')
             if os.path.isfile(env_path):
@@ -42246,6 +42254,9 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
             rc, out = _cloudtak_compose_run(cloudtak_dir, ['start', 'api', 'events', 'tiles', 'retention'], timeout=300)
         plog("↩ CloudTAK restarted on the previous version and its MinIO store" if rc == 0
              else f"  ⚠ Could not restart the previous CloudTAK: {out.strip()[-300:]}")
+        # #150: re-patch the reverted tree only now — CloudTAK is down until the start above.
+        if _reverted:
+            _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
 
@@ -44334,7 +44345,127 @@ _CLOUDTAK_REMOTE_MEDIA_PERL = (
 )
 
 
-def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None):
+# v10.2.15 (#150): operator pre-build hooks. Update's `checkout -f` wipes any local edit to
+# CloudTAK's source, so an operator who carries one (a video-service.ts fix, say) lost it on
+# every Update. Scripts in this folder run right before every CloudTAK build and put it back.
+# The folder is in the console's own config dir, NOT in ~/CloudTAK: hooks run as the console
+# user (root on a root box), and a folder inside the upstream checkout is one a future
+# CloudTAK release could ship files into.
+_CLOUDTAK_HOOK_TIMEOUT = 300
+_CLOUDTAK_HOOK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_hooks_dir():
+    return os.path.join(CONFIG_DIR, 'cloudtak-hooks', 'pre-build.d')
+
+
+def _cloudtak_hook_untrusted(st):
+    """Why a hook (or its folder) must not be run, or '' when it is owned by the console
+    user and writable by no one else."""
+    if st.st_uid != os.geteuid():
+        return f"owned by uid {st.st_uid}, not the console user (uid {os.geteuid()})"
+    if st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH):
+        return "writable by group or others"
+    return ''
+
+
+def _run_cloudtak_prebuild_hooks(cloudtak_dir, phase, plog, tag='', prev_sha=''):
+    """Run the operator's pre-build hooks in name order, cwd = the CloudTAK checkout.
+
+    Returns (ok, name). ok=False means do NOT build: a hook exited non-zero, timed out, or
+    is not safe to run, and `name` says which. Fail loud rather than skip — a skipped hook
+    means building stock source the operator did not want. Non-executable files are
+    skipped (run-parts semantics: chmod -x disables a hook). No folder: nothing runs."""
+    import signal as _signal
+    hooks_dir = _cloudtak_hooks_dir()
+    if not os.path.lexists(hooks_dir):
+        plog("  no pre-build hooks")
+        return True, ''
+    # The folders must be ours too, or someone else could swap a hook in.
+    for d in (os.path.dirname(hooks_dir), hooks_dir):
+        try:
+            st = os.lstat(d)
+        except OSError as e:
+            plog(f"✗ Cannot read the pre-build hooks folder {d}: {e}")
+            return False, d
+        why = _cloudtak_hook_untrusted(st) if _stat.S_ISDIR(st.st_mode) else 'not a real folder'
+        if why:
+            plog(f"✗ Refusing to run pre-build hooks: {d} is {why}")
+            return False, d
+    if not tag:
+        try:
+            _r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                                 'describe', '--tags', '--exact-match', 'HEAD'],
+                                capture_output=True, text=True, timeout=30)
+            tag = _r.stdout.strip() if _r.returncode == 0 else ''
+        except Exception:
+            tag = ''
+    env = {k: os.environ[k] for k in ('PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ')
+           if k in os.environ}
+    env.update({'INFRATAK_HOOK_PHASE': phase, 'INFRATAK_CLOUDTAK_DIR': cloudtak_dir,
+                'INFRATAK_CLOUDTAK_TAG': tag or '', 'INFRATAK_CLOUDTAK_PREV_SHA': prev_sha or ''})
+    ran, name = 0, hooks_dir
+    # Any error here (a hook removed mid-run, a full /tmp, an unreadable folder) must fail
+    # closed, not escape: the callers revert on (False, name) and would skip that on a raise.
+    try:
+        for name in sorted(os.listdir(hooks_dir)):
+            if not _CLOUDTAK_HOOK_NAME_RE.fullmatch(name):
+                continue   # dotfiles, editor backups (name~)
+            path = os.path.join(hooks_dir, name)
+            st = os.lstat(path)
+            if _stat.S_ISLNK(st.st_mode):
+                plog(f"✗ Refusing to run pre-build hook {name}: it is a symlink — put the script itself in {hooks_dir}")
+                return False, name
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            if not st.st_mode & _stat.S_IXUSR:
+                plog(f"  skipped pre-build hook {name} (not executable)")
+                continue
+            why = _cloudtak_hook_untrusted(st)
+            if why:
+                plog(f"✗ Refusing to run pre-build hook {name}: it is {why}")
+                return False, name
+            plog(f"  running pre-build hook {name} ({phase})…")
+            with tempfile.TemporaryFile() as out:
+                p = subprocess.Popen([path], cwd=cloudtak_dir, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    rc = p.wait(timeout=_CLOUDTAK_HOOK_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    rc = None
+                # Always: nothing a hook left in the background may keep editing during the build.
+                try: os.killpg(p.pid, _signal.SIGKILL)
+                except OSError: pass
+                if rc is None:
+                    p.wait(timeout=30)
+                out.seek(max(0, out.seek(0, os.SEEK_END) - 65536))
+                lines = out.read().decode('utf-8', 'replace').splitlines()
+            for _l in lines[-40:]:
+                plog(f"    │ {_l}")
+            if rc is None:
+                plog(f"✗ Pre-build hook {name} timed out after {_CLOUDTAK_HOOK_TIMEOUT // 60} minutes")
+                return False, name
+            if rc != 0:
+                plog(f"✗ Pre-build hook {name} failed (exit {rc})")
+                return False, name
+            ran += 1
+    except Exception as e:
+        plog(f"✗ Pre-build hook {name} could not run: {str(e)[:200]}")
+        return False, name
+    plog(f"  ran {ran} pre-build hook(s)" if ran else "  no pre-build hooks")
+    return True, ''
+
+
+def _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog):
+    """#150: a revert's checkout -f wipes the operator's patch too — put it back, or the next
+    plugin rebuild bakes stock source. Never fails the caller."""
+    _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert', plog, prev_sha=prev_sha)
+    if not _hok:
+        plog(f"  ⚠ Pre-build hook {_hname} failed on the reverted tree — the running "
+             f"containers are unchanged, but fix it before the next plugin install")
+
+
+def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None, run_hooks=True):
     """Put ~/CloudTAK back on the commit it was on before a failed update's checkout.
 
     v10.1.85 (PWC incident, 2026-09-21): a build that died on a transient GitHub 504
@@ -44365,6 +44496,8 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
                     plog(f"  ⚠ Port-hardening re-apply after revert failed (non-fatal): {_pe}")
         if ok:
             plog(f"↩ Reverted the checkout to {prev_sha[:10]} — the tree matches the images that are still running")
+            if remote_cfg is None and run_hooks:
+                _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
         else:
             plog(f"  ⚠ Could not revert the checkout: {(out or '').strip()[:200]}")
         return bool(ok)
@@ -44581,6 +44714,8 @@ def run_cloudtak_update():
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            if os.path.isdir(_cloudtak_hooks_dir()):
+                plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
             try:
                 if _patch_cloudtak_tiles_arm64(cloudtak_dir):
@@ -44593,6 +44728,18 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+            # #150: the operator's own source patches, after ours and before the build.
+            # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
+            _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
+                                                        tag=release_tag, prev_sha=prev_sha)
+            if not _hok:
+                plog(f"✗ Update stopped before the build: pre-build hook {_hname} failed (output above)")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous build — nothing was removed.")
+                plog(f"  Fix or remove {_hname} in {_cloudtak_hooks_dir()}, then run Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
