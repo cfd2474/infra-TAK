@@ -6866,10 +6866,10 @@ def _record_mfa_reset(username, user_pk, removed, sessions_killed, method='conso
         pass
 
 
-# --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
+# --- Authentik login/MFA copy (clearer than the stock "authentik" text) -------------
 # Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
-# wording on every box. Independent of hardening posture — login screens should always read
-# clearly. Idempotent; applied by a startup migration when Authentik is present.
+# wording. Independent of hardening posture. Seeded ONCE by a startup migration when
+# Authentik is present; after that the operator owns these fields (#151).
 AK_BRAND_TITLE = 'infra-TAK'
 AK_AUTH_FLOW_TITLE = 'Sign in'
 AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
@@ -6919,45 +6919,74 @@ TAK_LDAP_UPDATE_INTERVAL_MS = '30000'
 AK_TASK_EXPIRATION = 'days=3'
 
 def _ensure_authentik_login_copy(log=None):
-    """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
-    header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
-    (so it's a no-op on subsequent boots). Never raises. Returns True if anything changed."""
+    """Seed clear login/MFA wording ONCE: brand title, the authentication-flow header, and the
+    TOTP/WebAuthn enrollment button labels. Never raises. Returns True if anything changed.
+
+    #151: these are operator-owned Authentik settings (CLAUDE.md "Third-party app config is
+    operator-owned"). Through v10.2.15 this re-applied the copy on every console boot, and the
+    console restarts daily (RuntimeMaxSec=24h), so an operator's own brand title was put back
+    within a day. Now it writes once and records `authentik_login_copy_seeded`; after that the
+    fields are never touched again.
+
+    Upgrade from a release that re-applied the copy: if any field already carries our wording,
+    that release seeded this box, and anything that differs now is the operator's change since.
+    Record the marker and write nothing. The marker is only recorded once every read and write
+    succeeded, so an unreachable Authentik is retried on the next boot."""
     def _l(m):
         if log:
             log(m)
+    if load_settings().get('authentik_login_copy_seeded'):
+        return False
     ak_url, ak_headers, _ = _w1_ak_ctx()
     if not ak_url:
         return False
-    changed = False
     try:
         brands = _w1_ak_get(ak_url, 'core/brands/', ak_headers).get('results', [])
-        if brands and brands[0].get('branding_title') != AK_BRAND_TITLE:
-            bid = brands[0].get('brand_uuid') or brands[0].get('pk')
-            _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
-                         data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
-    except Exception as e:
-        _l('Authentik brand title copy: %s' % str(e)[:100])
-    try:
         flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
-        if flows and flows[0].get('title') != AK_AUTH_FLOW_TITLE:
-            _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
-                         data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
-    except Exception as e:
-        _l('Authentik flow title copy: %s' % str(e)[:100])
-    for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
-        try:
+        stages = []
+        for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
             for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
-                if s.get('friendly_name') != friendly:
-                    _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
-                                 data=json.dumps({'friendly_name': friendly}).encode(),
-                                 method='PATCH', headers=ak_headers)
-                    changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+                stages.append((kind, friendly, s))
+    except Exception as e:
+        _l('Authentik login copy: %s' % str(e)[:100])
+        return False
+    already = ((brands and brands[0].get('branding_title') == AK_BRAND_TITLE)
+               or (flows and flows[0].get('title') == AK_AUTH_FLOW_TITLE)
+               or any(s.get('friendly_name') == friendly for _k, friendly, s in stages))
+    changed = False
+    ok = True
+    if not already:
+        try:
+            if brands:
+                bid = brands[0].get('brand_uuid') or brands[0].get('pk')
+                _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
+                             data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
         except Exception as e:
-            _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+            ok = False; _l('Authentik brand title copy: %s' % str(e)[:100])
+        try:
+            if flows:
+                _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
+                             data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
+        except Exception as e:
+            ok = False; _l('Authentik flow title copy: %s' % str(e)[:100])
+        for kind, friendly, s in stages:
+            try:
+                _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
+                             data=json.dumps({'friendly_name': friendly}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+            except Exception as e:
+                ok = False; _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+    if ok and (brands or flows):
+        s_cfg = load_settings()
+        s_cfg['authentik_login_copy_seeded'] = True
+        save_settings(s_cfg)
+        _l('Authentik login copy: %s — operator-owned from here on'
+           % ('seeded' if changed else 'already seeded by an earlier release'))
     return changed
 
 def _ensure_authentik_event_retention(log=None):
@@ -59502,7 +59531,10 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
       2. Application exists with:
          - correct slug + name
          - provider link to the above
-         - open_in_new_tab per the catalog entry
+         - open_in_new_tab per the catalog entry, ON CREATE ONLY. It is a launch
+           preference the operator owns (#151): the healer runs on every console
+           boot and the console restarts daily, so asserting it reverted an
+           operator's change within a day.
       3. Provider is in the embedded outpost's providers[] list
 
     Uses `_ak_api_call` (3 retries with 5s/10s/15s backoff, 30s timeout) instead
@@ -59811,7 +59843,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                         try:
                             _ak_api_call(
                                 f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                                data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                                data=json.dumps({'provider': provider_pk}).encode(),
                                 method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                             )
                             result['app'] = 'fixed'
@@ -59826,17 +59858,17 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     result['app'] = 'failed:create-timeout'
                     _log(f"  ✗ {app_name}: app create failed ({str(ae)[:120]})")
             else:
+                # open_in_new_tab is not asserted on an existing app — operator-owned (#151).
                 cur_prov = existing_app.get('provider')
-                cur_otb = bool(existing_app.get('open_in_new_tab'))
-                if cur_prov != provider_pk or cur_otb != bool(open_new_tab):
+                if cur_prov != provider_pk:
                     try:
                         _ak_api_call(
                             f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                         )
                         result['app'] = 'fixed'
-                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk}, open_in_new_tab {cur_otb} → {bool(open_new_tab)})")
+                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk})")
                     except Exception as pe2:
                         result['app'] = 'failed:patch-timeout'
                         _log(f"  ✗ {app_name}: app PATCH failed ({str(pe2)[:120]})")
@@ -86750,9 +86782,10 @@ def _startup_migrations():
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
 
-        # v0.9.55: Fleet-uniform login/MFA copy — replace the stock "Welcome to authentik!" /
-        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Idempotent no-op
-        # once applied; gated on Authentik being present + reachable.
+        # v0.9.55: login/MFA copy — replace the stock "Welcome to authentik!" /
+        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Seeded once
+        # (#151: re-applying it every boot reverted operator edits daily); gated on
+        # Authentik being present + reachable.
         try:
             if os.path.exists(os.path.expanduser('~/authentik/.env')):
                 _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
