@@ -35486,14 +35486,24 @@ def _takportal_get_existing_settings():
     v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
     container; cp works on a created/stopped one. The deploy path seeds settings.json into a
     created-but-not-started container — without this fallback that seed read {} and rewrote
-    the whole file from our defaults, clobbering operator values on any redeploy."""
-    try:
-        r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and (r.stdout or '').strip():
-            return json.loads(r.stdout.strip())
-    except Exception:
-        pass
+    the whole file from our defaults, clobbering operator values on any redeploy.
+
+    v10.2.16 (GH #158): TAK Portal rewrites this file itself, in place, whenever it reloads it
+    (settings.service.js loadSettingsFromDisk), so a read can land on a half-written file. {}
+    makes the merge rebuild the file from our seeds alone, so a torn read is retried first."""
+    for _attempt in range(3):
+        try:
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+        except Exception:
+            break
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            break
+        try:
+            return json.loads(body)
+        except ValueError:
+            time.sleep(0.5)
     # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
     # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
     # would land root-owned and a non-root console could not read it back.
@@ -36015,6 +36025,44 @@ def _takportal_merged_settings_json(settings, adopt=()):
     return json.dumps(merged, indent=2)
 
 
+TAKPORTAL_SETTINGS_BACKUP_KEEP = 10
+
+
+def _takportal_backup_settings(plog=None):
+    """v10.2.16 (GH #158): copy TAK Portal's settings.json, as it is right now, to the host
+    before infra-TAK writes over it — the field report had no copy to go back to and re-entered
+    ~120 settings by hand. CONFIG_DIR/takportal-settings-backups, mode 600 (the file holds the
+    Authentik token and the P12 passphrase), newest TAKPORTAL_SETTINGS_BACKUP_KEEP kept. A copy
+    identical to the newest is not written again, so repeated guardrail pushes do not rotate a
+    good copy out. Returns the backup path, or '' when there was nothing to keep. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        current = _takportal_get_existing_settings()
+        if not isinstance(current, dict) or not current:
+            return ''
+        body = json.dumps(current, indent=2)
+        bdir = os.path.join(CONFIG_DIR, 'takportal-settings-backups')
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        kept = sorted(f for f in os.listdir(bdir) if f.startswith('settings-') and f.endswith('.json'))
+        if kept:
+            with open(os.path.join(bdir, kept[-1])) as f:
+                if f.read() == body:
+                    return os.path.join(bdir, kept[-1])
+        name = f"settings-{datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        fd = os.open(os.path.join(bdir, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(body)
+        for old in (kept + [name])[:-TAKPORTAL_SETTINGS_BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except OSError:
+                pass
+        return os.path.join(bdir, name)
+    except Exception as e:
+        _log(f"  takportal settings backup failed (non-fatal): {str(e)[:200]}")
+        return ''
+
+
 def _takportal_write_settings_json(settings_json, plog=None):
     """v10.1.42 (W-P2): the ONE and ONLY writer of TAK Portal's settings.json.
 
@@ -36024,13 +36072,40 @@ def _takportal_write_settings_json(settings_json, plog=None):
     own read-modify-write straight into the container and bypassed every rule. If you are about
     to add another `docker cp ... tak-portal:/usr/src/app/data/settings.json` — don't; call this.
 
+    v10.2.16 (GH #158): into a RUNNING portal the file is staged next to settings.json and
+    renamed over it. `docker cp` straight onto settings.json deletes it and rewrites it in place,
+    and TAK Portal reloads the file whenever its mtime changes (web AND worker): a read in that
+    window parses as {}, its template merge fills every key from settings.example.json, and it
+    writes that over the file — TAK_URL, the P12 and ~120 settings gone, on a 2.0.10 -> 2.0.11
+    update. A rename is atomic, so a reader sees the old file or the new one, never a torn one.
+
     Returns (ok, error_message). Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
+    _takportal_backup_settings(plog=_log)
     try:
         fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-settings-')
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(settings_json)
+            web = _takportal_web_container()
+            if web:
+                staged = '/usr/src/app/data/.settings.json.infratak'
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f"{web['id']}:{staged}"]),
+                                    capture_output=True, text=True, timeout=20)
+                if cp.returncode == 0:
+                    mv = subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'mv', '-f', staged,
+                                                    '/usr/src/app/data/settings.json']),
+                                        capture_output=True, text=True, timeout=20)
+                    if mv.returncode == 0:
+                        return True, ''
+                    subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'rm', '-f', staged]),
+                                   capture_output=True, text=True, timeout=20)
+                    why = (mv.stderr or mv.stdout or 'mv failed').strip()[:200]
+                else:
+                    why = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]
+                _log(f"  takportal settings: atomic replace failed ({why}) — writing in place")
+            # Not running (the deploy path seeds a created-but-not-started container), so nothing
+            # is reading the file — or the rename was refused and the old file is still whole.
             cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{_takportal_ref()}:/usr/src/app/data/settings.json']),
                                 capture_output=True, text=True, timeout=20)
         finally:
@@ -36686,7 +36761,11 @@ def takportal_control():
         try:
             _want = json.loads(settings_json) if settings_json else {}
             _have = _takportal_get_existing_settings() or {}
-            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
+            # v10.2.16 (GH #158): and the TAK Server connection keys. These are not ours to change,
+            # but the file was written seconds ago, so if they differ now the file was reset under
+            # us (TAK Portal's template fallback) and the write below puts the operator's file back.
+            _keys = [k for k in sorted(TAKPORTAL_AUTHORITATIVE_KEYS) + ['TAK_URL', 'TAK_API_P12_PATH',
+                     'TAK_API_P12_PASSPHRASE', 'TAK_CA_PATH'] if _want.get(k)]
             # An unreadable file after a successful pre-build write is a read failure, not
             # evidence the write was lost — do not restart a booting stack over it.
             _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
