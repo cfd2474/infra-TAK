@@ -31,6 +31,7 @@ import json
 import pathlib
 import types
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -77,8 +78,9 @@ class FakeAuthentik:
         if method != 'GET':
             if self.fail_patch:
                 raise OSError('timed out')
-            self.writes.append((method, path, body))
         out = self._route(method, path, body)
+        if method != 'GET':                        # only writes Authentik accepted
+            self.writes.append((method, path, body))
         return io.BytesIO(json.dumps(out).encode())
 
     def _route(self, method, path, body):
@@ -103,7 +105,14 @@ class FakeAuthentik:
                     return s
         if path.startswith('providers/proxy/?'):
             return {'results': self.providers}
+        for p in self.providers:
+            if path == f'providers/proxy/{p["pk"]}/':
+                if method in ('PUT', 'PATCH'):
+                    p.update(body)
+                return dict(p)
         if path == 'core/applications/' and method == 'POST':
+            if body['slug'] in self.apps:          # Authentik: slug must be unique
+                raise urllib.error.HTTPError(path, 400, 'slug exists', {}, io.BytesIO(b''))
             self.apps[body['slug']] = dict(body)
             return body
         if path.startswith('core/applications/'):
@@ -121,10 +130,11 @@ class Box:
         self.ak = ak
         self.settings = {'fqdn': 'example.com'} if settings is None else settings
         self.log = []
+        self.deployed = {'infratak'}
 
     def ns(self):
         ns = {
-            'json': json, 'urllib': urllib,
+            'json': json, 'urllib': urllib, 'time': types.SimpleNamespace(sleep=lambda s: None),
             'os': types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda p: True,
                                                                    expanduser=lambda p: p)),
             'load_settings': lambda: dict(self.settings),
@@ -134,7 +144,7 @@ class Box:
             '_get_authentik_env_value': lambda s, k: 'tok',
             '_get_authentik_api_url': lambda s: AK,
             'detect_modules': lambda fresh=False: {},
-            '_is_module_deployed': lambda s, k: k == 'infratak',
+            '_is_module_deployed': lambda s, k: k in self.deployed,
             '_get_service_domain': lambda s, k: f'{k}.example.com',
             '_outpost_add_providers_safe': lambda *a, **k: False,
             '_deregister_authentik_proxy_app': lambda *a, **k: None,
@@ -152,6 +162,21 @@ class Box:
         ns = self.ns()
         ns['_ensure_authentik_login_copy'](self.log.append)
         ns['_heal_authentik_proxy_chain_all_services'](plog=self.log.append, settings=dict(self.settings))
+
+    def update(self, monkeypatch):
+        """What a console update does to the apps: the Authentik reconfigure runs
+        _ensure_authentik_console_app, then the post-update chain healer, then the console
+        restarts onto the new code (a boot)."""
+        def urlopen(req, timeout=None):
+            return self.ak.call(req.get_full_url(), req.data, req.get_method())
+        monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+        ns = self.ns()
+        if 'def _authentik_application_open_in_new_tab(' in APP:   # pre-fix app.py
+            exec(compile(_func('_authentik_application_open_in_new_tab'), 'app.py', 'exec'), ns)
+        exec(compile(_func('_ensure_authentik_console_app'), 'app.py', 'exec'), ns)
+        assert ns['_ensure_authentik_console_app']('example.com', 'tok', self.log.append, ak_url=AK)
+        ns['_heal_authentik_proxy_chain_all_services'](plog=self.log.append, settings=dict(self.settings))
+        self.boot()
 
 
 # --- login copy: seeded once ---------------------------------------------------------
@@ -245,3 +270,68 @@ def test_healer_writes_open_in_new_tab_only_in_the_create_body():
     src = _func('_heal_authentik_proxy_chain_all_services')
     hits = [l.strip() for l in src.splitlines() if "'open_in_new_tab'" in l]
     assert hits == ["'open_in_new_tab': bool(open_new_tab)}"], hits
+
+
+# --- console update: the Authentik reconfigure step (#151 follow-up) --------------------
+#
+# A console update runs the Authentik reconfigure, which calls _ensure_authentik_console_app
+# for infra-TAK (+ MediaMTX). It PATCHed open_in_new_tab=True onto the existing apps; before
+# #153 the healer flipped infra-TAK back to False right after, so an operator who chose
+# True kept it, but one who chose False lost it on every update.
+
+def _seeded_box():
+    return Box(FakeAuthentik(stock=False), settings={'fqdn': 'example.com', 'authentik_login_copy_seeded': True})
+
+
+def test_update_creates_console_apps_with_catalog_launch_setting(monkeypatch):
+    box = _seeded_box()
+    box.deployed.add('mediamtx')
+    box.ak.providers.append({'pk': 8, 'name': 'MediaMTX', 'external_host': 'https://mediamtx.example.com',
+                             'cookie_domain': '.example.com'})
+    box.update(monkeypatch)
+    assert box.ak.apps['infratak']['open_in_new_tab'] is False
+    assert box.ak.apps['stream']['open_in_new_tab'] is True
+
+
+@pytest.mark.parametrize('choice', [True, False])
+def test_operator_launch_setting_survives_a_console_update(monkeypatch, choice):
+    box = _seeded_box()
+    box.deployed.add('mediamtx')
+    box.ak.providers.append({'pk': 8, 'name': 'MediaMTX', 'external_host': 'https://mediamtx.example.com',
+                             'cookie_domain': '.example.com'})
+    box.update(monkeypatch)
+    box.ak.apps['infratak']['open_in_new_tab'] = choice      # operator edits in Authentik
+    box.ak.apps['stream']['open_in_new_tab'] = choice
+    box.ak.writes.clear()
+    for _ in range(2):
+        box.update(monkeypatch)
+    assert box.ak.apps['infratak']['open_in_new_tab'] is choice
+    assert box.ak.apps['stream']['open_in_new_tab'] is choice
+    assert not [w for w in box.ak.writes if 'open_in_new_tab' in (w[2] or {})]
+
+
+def test_update_still_relinks_a_wrong_provider_without_touching_launch_setting(monkeypatch):
+    box = _seeded_box()
+    box.ak.apps['infratak'] = {'slug': 'infratak', 'provider': 99, 'open_in_new_tab': True}
+    box.update(monkeypatch)
+    assert box.ak.apps['infratak']['provider'] == 7
+    assert box.ak.apps['infratak']['open_in_new_tab'] is True
+
+
+def _open_in_new_tab_dicts(path):
+    src = path.read_text(encoding='utf-8')
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Dict):
+            keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+            if 'open_in_new_tab' in keys:
+                yield node.lineno, keys
+
+
+@pytest.mark.parametrize('rel', ['app.py', *sorted(str(p.relative_to(REPO))
+                                                   for p in (REPO / 'modules').glob('*.py'))])
+def test_open_in_new_tab_is_only_written_when_an_app_is_created(rel):
+    # A create body carries the slug; a PATCH onto an existing app does not. Every deploy,
+    # reconfigure and update path used to PATCH it back to True on existing apps.
+    bad = [line for line, keys in _open_in_new_tab_dicts(REPO / rel) if 'slug' not in keys]
+    assert not bad, f'{rel}: open_in_new_tab written outside a create body at lines {bad}'
+    assert '_authentik_application_open_in_new_tab' not in (REPO / rel).read_text(encoding='utf-8')
