@@ -1681,6 +1681,58 @@ def _push_email_relay(ctx, dirpath, plog):
     return True
 
 
+#: ATLAS's own setting for "Use InfraTAK's email configuration".
+RELAY_CHOICE_KEY = 'smtp.use_infratak_relay'
+
+#: Runs inside the api container, through ATLAS's own session and model.
+#: Prints one `relay-choice:` line saying what it found or did.
+_SEED_RELAY_CHOICE = '''
+from app.db.base import SessionLocal
+from app.db.models import AppSetting
+KEY = %r
+with SessionLocal() as s:
+    host = s.get(AppSetting, 'smtp.host')
+    if s.get(AppSetting, KEY) is not None:
+        print('relay-choice: kept')
+    elif host is not None and (host.value or '').strip():
+        print('relay-choice: own-smtp')
+    else:
+        s.add(AppSetting(key=KEY, value='true', updated_by='infra-TAK'))
+        s.commit()
+        print('relay-choice: ticked')
+''' % RELAY_CHOICE_KEY
+
+
+def _seed_relay_choice(ctx, plog, inst=None):
+    """Tick ATLAS's "Use InfraTAK's email configuration", once (#155).
+
+    ⚠️ **Seeded, never written.** The box is the operator's (CLAUDE.md,
+    "Third-party app config is operator-owned"). It is ticked only while no
+    row exists for it at all, and ATLAS writes that row, ticked or not, the
+    first time anyone saves its Email page. So a deliberate untick is a
+    stored `""`, and this leaves it alone on every update after.
+
+    ⚠️ An ATLAS that already holds its own SMTP host is left alone too. That
+    is an operator who saved the Email page on a release older than the box,
+    and switching them onto the relay would reroute mail they set up by hand.
+
+    Only while the relay is configured, and after `_push_email_relay` has
+    handed ATLAS the address: ticking it with nothing to inherit would make
+    ATLAS send through a relay that is not there.
+    """
+    relay = (ctx['load_settings']() or {}).get('email_relay') or {}
+    if not (relay.get('from_addr') or '').strip():
+        return
+    out = _compose_exec(ctx, ['python', '-c', _SEED_RELAY_CHOICE],
+                        timeout=60, inst=inst) or ''
+    if 'relay-choice: ticked' in out:
+        plog('✓ ATLAS set to use InfraTAK\'s Email Relay (Admin → Email)')
+    elif 'relay-choice:' not in out:
+        # Not fatal: the relay is still offered, it just starts unticked.
+        plog('⚠ Could not set ATLAS to use the Email Relay; tick "Use '
+             'InfraTAK\'s email configuration" in Admin → Email')
+
+
 def admin_groups_for(inst=None, global_group=None):
     """The groups that may administer one deployment, most specific first.
 
@@ -3596,6 +3648,7 @@ def deploy(ctx, job, params):
         restart_api = _push_email_relay(ctx, dirpath, plog) or restart_api
         if restart_api:
             _compose(ctx, 'up -d api', timeout=300, inst=_inst)
+        _seed_relay_choice(ctx, plog, inst=_inst)
 
         # ── The certificate authority is split before anyone can use it ──────
         #
@@ -4774,6 +4827,7 @@ def _run_update(ctx, inst=None):
             changed = _push_email_relay(ctx, dirpath, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            _seed_relay_choice(ctx, plog, inst=inst)
         except Exception as exc:
             # Not fatal. The containers are already rebuilt and serving; a stale
             # vhost is worse reported than turned into a failed update.
