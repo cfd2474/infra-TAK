@@ -1073,7 +1073,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.15-alpha"
+VERSION = "10.2.16-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -6866,10 +6866,10 @@ def _record_mfa_reset(username, user_pk, removed, sessions_killed, method='conso
         pass
 
 
-# --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
+# --- Authentik login/MFA copy (clearer than the stock "authentik" text) -------------
 # Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
-# wording on every box. Independent of hardening posture — login screens should always read
-# clearly. Idempotent; applied by a startup migration when Authentik is present.
+# wording. Independent of hardening posture. Seeded ONCE by a startup migration when
+# Authentik is present; after that the operator owns these fields (#151).
 AK_BRAND_TITLE = 'infra-TAK'
 AK_AUTH_FLOW_TITLE = 'Sign in'
 AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
@@ -6919,45 +6919,74 @@ TAK_LDAP_UPDATE_INTERVAL_MS = '30000'
 AK_TASK_EXPIRATION = 'days=3'
 
 def _ensure_authentik_login_copy(log=None):
-    """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
-    header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
-    (so it's a no-op on subsequent boots). Never raises. Returns True if anything changed."""
+    """Seed clear login/MFA wording ONCE: brand title, the authentication-flow header, and the
+    TOTP/WebAuthn enrollment button labels. Never raises. Returns True if anything changed.
+
+    #151: these are operator-owned Authentik settings (CLAUDE.md "Third-party app config is
+    operator-owned"). Through v10.2.15 this re-applied the copy on every console boot, and the
+    console restarts daily (RuntimeMaxSec=24h), so an operator's own brand title was put back
+    within a day. Now it writes once and records `authentik_login_copy_seeded`; after that the
+    fields are never touched again.
+
+    Upgrade from a release that re-applied the copy: if any field already carries our wording,
+    that release seeded this box, and anything that differs now is the operator's change since.
+    Record the marker and write nothing. The marker is only recorded once every read and write
+    succeeded, so an unreachable Authentik is retried on the next boot."""
     def _l(m):
         if log:
             log(m)
+    if load_settings().get('authentik_login_copy_seeded'):
+        return False
     ak_url, ak_headers, _ = _w1_ak_ctx()
     if not ak_url:
         return False
-    changed = False
     try:
         brands = _w1_ak_get(ak_url, 'core/brands/', ak_headers).get('results', [])
-        if brands and brands[0].get('branding_title') != AK_BRAND_TITLE:
-            bid = brands[0].get('brand_uuid') or brands[0].get('pk')
-            _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
-                         data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
-    except Exception as e:
-        _l('Authentik brand title copy: %s' % str(e)[:100])
-    try:
         flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
-        if flows and flows[0].get('title') != AK_AUTH_FLOW_TITLE:
-            _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
-                         data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
-    except Exception as e:
-        _l('Authentik flow title copy: %s' % str(e)[:100])
-    for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
-        try:
+        stages = []
+        for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
             for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
-                if s.get('friendly_name') != friendly:
-                    _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
-                                 data=json.dumps({'friendly_name': friendly}).encode(),
-                                 method='PATCH', headers=ak_headers)
-                    changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+                stages.append((kind, friendly, s))
+    except Exception as e:
+        _l('Authentik login copy: %s' % str(e)[:100])
+        return False
+    already = ((brands and brands[0].get('branding_title') == AK_BRAND_TITLE)
+               or (flows and flows[0].get('title') == AK_AUTH_FLOW_TITLE)
+               or any(s.get('friendly_name') == friendly for _k, friendly, s in stages))
+    changed = False
+    ok = True
+    if not already:
+        try:
+            if brands:
+                bid = brands[0].get('brand_uuid') or brands[0].get('pk')
+                _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
+                             data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
         except Exception as e:
-            _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+            ok = False; _l('Authentik brand title copy: %s' % str(e)[:100])
+        try:
+            if flows:
+                _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
+                             data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
+        except Exception as e:
+            ok = False; _l('Authentik flow title copy: %s' % str(e)[:100])
+        for kind, friendly, s in stages:
+            try:
+                _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
+                             data=json.dumps({'friendly_name': friendly}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+            except Exception as e:
+                ok = False; _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+    if ok and (brands or flows):
+        s_cfg = load_settings()
+        s_cfg['authentik_login_copy_seeded'] = True
+        save_settings(s_cfg)
+        _l('Authentik login copy: %s — operator-owned from here on'
+           % ('seeded' if changed else 'already seeded by an earlier release'))
     return changed
 
 def _ensure_authentik_event_retention(log=None):
@@ -31047,62 +31076,6 @@ def _get_authentik_env_value(settings, key):
     return None
 
 
-def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug, plog=None):
-    """PATCH Authentik application so My applications uses target=_blank for the launch URL.
-    Logs HTTP/parse failures via plog when provided (previously all errors were swallowed)."""
-    import urllib.request as _ur
-    import urllib.error as _ue
-    import urllib.parse as _uparse
-    _log = plog or (lambda _m: None)
-    if not ak_url or not ak_headers or not slug:
-        return
-    slug = str(slug).strip().strip('/')
-    if not slug:
-        return
-    enc = _uparse.quote(slug, safe='')
-    url = f'{ak_url.rstrip("/")}/api/v3/core/applications/{enc}/'
-    headers = dict(ak_headers)
-    headers.setdefault('Accept', 'application/json')
-    try:
-        req = _ur.Request(
-            url,
-            data=json.dumps({'open_in_new_tab': True}).encode(),
-            headers=headers, method='PATCH')
-        with _ur.urlopen(req, timeout=10) as resp:
-            raw = (resp.read() or b'').decode()
-        data = {}
-        if raw.strip():
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                _log(f"  ⚠ open_in_new_tab ({slug}): PATCH response not JSON ({raw[:80]!r})")
-                return
-        else:
-            try:
-                gr = _ur.Request(url, headers=headers, method='GET')
-                with _ur.urlopen(gr, timeout=10) as grsp:
-                    data = json.loads((grsp.read() or b'{}').decode())
-            except Exception as ge:
-                _log(f"  ⚠ open_in_new_tab ({slug}): empty PATCH body, GET verify failed: {str(ge)[:100]}")
-                return
-        oint = data.get('open_in_new_tab')
-        if oint is None:
-            oint = data.get('openInNewTab')
-        if oint is not True:
-            _log(
-                f"  ⚠ open_in_new_tab ({slug}): field still false after PATCH "
-                f"(got {oint!r}) — check Authentik version / API token permissions"
-            )
-    except _ue.HTTPError as e:
-        try:
-            err_body = (e.read() or b'').decode()[:400]
-        except Exception:
-            err_body = ''
-        _log(f"  ⚠ open_in_new_tab ({slug}): HTTP {e.code} {err_body}")
-    except Exception as ex:
-        _log(f"  ⚠ open_in_new_tab ({slug}): {str(ex)[:160]}")
-
-
 def _tak_deployment_defaults():
     """Default TAK deployment shape (single-server by default, optional two-server fields)."""
     return {
@@ -37478,7 +37451,6 @@ def run_takportal_deploy():
                                 time.sleep(5)
                             else:
                                 plog(f"  \u26a0 Application error: {str(e)[:80]}")
-                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
@@ -41187,6 +41159,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
         # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
+        _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
+        if not _hok:
+            plog(f'✗ Pre-build hook {_hname} failed — rolling back without rebuilding...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
         if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=5400):
             plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
             _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
@@ -42224,7 +42204,7 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
     aside so the next attempt starts clean. Never raises."""
     try:
         _cloudtak_compose_run(cloudtak_dir, ['--profile', 'migrate', 'rm', '-sf', 'minio-legacy', 'store'], timeout=120)
-        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        _reverted = _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir, run_hooks=False)
         if not _cloudtak_compose_is_garage(cloudtak_dir):
             env_path = os.path.join(cloudtak_dir, '.env')
             if os.path.isfile(env_path):
@@ -42246,6 +42226,9 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
             rc, out = _cloudtak_compose_run(cloudtak_dir, ['start', 'api', 'events', 'tiles', 'retention'], timeout=300)
         plog("↩ CloudTAK restarted on the previous version and its MinIO store" if rc == 0
              else f"  ⚠ Could not restart the previous CloudTAK: {out.strip()[-300:]}")
+        # #150: re-patch the reverted tree only now — CloudTAK is down until the start above.
+        if _reverted:
+            _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
 
@@ -44334,7 +44317,127 @@ _CLOUDTAK_REMOTE_MEDIA_PERL = (
 )
 
 
-def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None):
+# v10.2.15 (#150): operator pre-build hooks. Update's `checkout -f` wipes any local edit to
+# CloudTAK's source, so an operator who carries one (a video-service.ts fix, say) lost it on
+# every Update. Scripts in this folder run right before every CloudTAK build and put it back.
+# The folder is in the console's own config dir, NOT in ~/CloudTAK: hooks run as the console
+# user (root on a root box), and a folder inside the upstream checkout is one a future
+# CloudTAK release could ship files into.
+_CLOUDTAK_HOOK_TIMEOUT = 300
+_CLOUDTAK_HOOK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_hooks_dir():
+    return os.path.join(CONFIG_DIR, 'cloudtak-hooks', 'pre-build.d')
+
+
+def _cloudtak_hook_untrusted(st):
+    """Why a hook (or its folder) must not be run, or '' when it is owned by the console
+    user and writable by no one else."""
+    if st.st_uid != os.geteuid():
+        return f"owned by uid {st.st_uid}, not the console user (uid {os.geteuid()})"
+    if st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH):
+        return "writable by group or others"
+    return ''
+
+
+def _run_cloudtak_prebuild_hooks(cloudtak_dir, phase, plog, tag='', prev_sha=''):
+    """Run the operator's pre-build hooks in name order, cwd = the CloudTAK checkout.
+
+    Returns (ok, name). ok=False means do NOT build: a hook exited non-zero, timed out, or
+    is not safe to run, and `name` says which. Fail loud rather than skip — a skipped hook
+    means building stock source the operator did not want. Non-executable files are
+    skipped (run-parts semantics: chmod -x disables a hook). No folder: nothing runs."""
+    import signal as _signal
+    hooks_dir = _cloudtak_hooks_dir()
+    if not os.path.lexists(hooks_dir):
+        plog("  no pre-build hooks")
+        return True, ''
+    # The folders must be ours too, or someone else could swap a hook in.
+    for d in (os.path.dirname(hooks_dir), hooks_dir):
+        try:
+            st = os.lstat(d)
+        except OSError as e:
+            plog(f"✗ Cannot read the pre-build hooks folder {d}: {e}")
+            return False, d
+        why = _cloudtak_hook_untrusted(st) if _stat.S_ISDIR(st.st_mode) else 'not a real folder'
+        if why:
+            plog(f"✗ Refusing to run pre-build hooks: {d} is {why}")
+            return False, d
+    if not tag:
+        try:
+            _r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                                 'describe', '--tags', '--exact-match', 'HEAD'],
+                                capture_output=True, text=True, timeout=30)
+            tag = _r.stdout.strip() if _r.returncode == 0 else ''
+        except Exception:
+            tag = ''
+    env = {k: os.environ[k] for k in ('PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ')
+           if k in os.environ}
+    env.update({'INFRATAK_HOOK_PHASE': phase, 'INFRATAK_CLOUDTAK_DIR': cloudtak_dir,
+                'INFRATAK_CLOUDTAK_TAG': tag or '', 'INFRATAK_CLOUDTAK_PREV_SHA': prev_sha or ''})
+    ran, name = 0, hooks_dir
+    # Any error here (a hook removed mid-run, a full /tmp, an unreadable folder) must fail
+    # closed, not escape: the callers revert on (False, name) and would skip that on a raise.
+    try:
+        for name in sorted(os.listdir(hooks_dir)):
+            if not _CLOUDTAK_HOOK_NAME_RE.fullmatch(name):
+                continue   # dotfiles, editor backups (name~)
+            path = os.path.join(hooks_dir, name)
+            st = os.lstat(path)
+            if _stat.S_ISLNK(st.st_mode):
+                plog(f"✗ Refusing to run pre-build hook {name}: it is a symlink — put the script itself in {hooks_dir}")
+                return False, name
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            if not st.st_mode & _stat.S_IXUSR:
+                plog(f"  skipped pre-build hook {name} (not executable)")
+                continue
+            why = _cloudtak_hook_untrusted(st)
+            if why:
+                plog(f"✗ Refusing to run pre-build hook {name}: it is {why}")
+                return False, name
+            plog(f"  running pre-build hook {name} ({phase})…")
+            with tempfile.TemporaryFile() as out:
+                p = subprocess.Popen([path], cwd=cloudtak_dir, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    rc = p.wait(timeout=_CLOUDTAK_HOOK_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    rc = None
+                # Always: nothing a hook left in the background may keep editing during the build.
+                try: os.killpg(p.pid, _signal.SIGKILL)
+                except OSError: pass
+                if rc is None:
+                    p.wait(timeout=30)
+                out.seek(max(0, out.seek(0, os.SEEK_END) - 65536))
+                lines = out.read().decode('utf-8', 'replace').splitlines()
+            for _l in lines[-40:]:
+                plog(f"    │ {_l}")
+            if rc is None:
+                plog(f"✗ Pre-build hook {name} timed out after {_CLOUDTAK_HOOK_TIMEOUT // 60} minutes")
+                return False, name
+            if rc != 0:
+                plog(f"✗ Pre-build hook {name} failed (exit {rc})")
+                return False, name
+            ran += 1
+    except Exception as e:
+        plog(f"✗ Pre-build hook {name} could not run: {str(e)[:200]}")
+        return False, name
+    plog(f"  ran {ran} pre-build hook(s)" if ran else "  no pre-build hooks")
+    return True, ''
+
+
+def _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog):
+    """#150: a revert's checkout -f wipes the operator's patch too — put it back, or the next
+    plugin rebuild bakes stock source. Never fails the caller."""
+    _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert', plog, prev_sha=prev_sha)
+    if not _hok:
+        plog(f"  ⚠ Pre-build hook {_hname} failed on the reverted tree — the running "
+             f"containers are unchanged, but fix it before the next plugin install")
+
+
+def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None, run_hooks=True):
     """Put ~/CloudTAK back on the commit it was on before a failed update's checkout.
 
     v10.1.85 (PWC incident, 2026-09-21): a build that died on a transient GitHub 504
@@ -44365,6 +44468,8 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
                     plog(f"  ⚠ Port-hardening re-apply after revert failed (non-fatal): {_pe}")
         if ok:
             plog(f"↩ Reverted the checkout to {prev_sha[:10]} — the tree matches the images that are still running")
+            if remote_cfg is None and run_hooks:
+                _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
         else:
             plog(f"  ⚠ Could not revert the checkout: {(out or '').strip()[:200]}")
         return bool(ok)
@@ -44581,6 +44686,8 @@ def run_cloudtak_update():
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            if os.path.isdir(_cloudtak_hooks_dir()):
+                plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
             try:
                 if _patch_cloudtak_tiles_arm64(cloudtak_dir):
@@ -44593,6 +44700,18 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+            # #150: the operator's own source patches, after ours and before the build.
+            # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
+            _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
+                                                        tag=release_tag, prev_sha=prev_sha)
+            if not _hok:
+                plog(f"✗ Update stopped before the build: pre-build hook {_hname} failed (output above)")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous build — nothing was removed.")
+                plog(f"  Fix or remove {_hname} in {_cloudtak_hooks_dir()}, then run Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
@@ -47210,7 +47329,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/node-red/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47221,7 +47340,6 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
 
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
             # 6) Restrict to authentik Admins — MUST run here, not only in the
             # Authentik deploy/reconfigure paths. Fleet deploy order is
             # Caddy → Authentik → … → Node-RED, so at Authentik-deploy time
@@ -47319,7 +47437,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47329,7 +47447,6 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'webodm', plog=log)
         else:
             log("  ⚠ Could not create or find WebODM proxy provider")
     except Exception as e:
@@ -47559,7 +47676,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/tak-video-restreamer/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47569,7 +47686,6 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-video-restreamer', plog=log)
         else:
             log("  ⚠ Could not create or find TAK Video Restreamer proxy provider")
     except Exception as e:
@@ -47657,7 +47773,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/federation-hub/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47667,7 +47783,6 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'federation-hub', plog=log)
         else:
             log("  ⚠ Could not create or find Federation Hub proxy provider")
     except Exception as e:
@@ -47719,6 +47834,10 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 entries.append(('MediaMTX', 'stream', f'https://{mtx_domain}'))
         except Exception:
             pass
+        # open_in_new_tab is set from the catalog when an app is created, never on an
+        # existing one: it is the operator's launch preference (#151), and this runs on
+        # every console update via the Authentik reconfigure.
+        new_tab = {e[2]: e[5] for e in _AUTHENTIK_PROXY_CHAIN_SERVICES}
         provider_pks = []
         base_domain = fqdn.split(':')[0]
         cookie_domain = f'.{base_domain}'
@@ -47780,7 +47899,8 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 try:
                     _ak_api_call(
                         f'{_ak_url}/api/v3/core/applications/',
-                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
+                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk,
+                                         'open_in_new_tab': new_tab.get(slug, True)}).encode(),
                         method='POST', headers=_ak_headers, max_retries=3, timeout=30
                     )
                     log(f"  ✓ Application created: {name}")
@@ -47788,7 +47908,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     if hasattr(e, 'code') and e.code == 400:
                         try:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/{slug}/',
-                                data=json.dumps({'provider': pk, 'open_in_new_tab': True}).encode(),
+                                data=json.dumps({'provider': pk}).encode(),
                                 headers=_ak_headers, method='PATCH')
                             _urlreq.urlopen(req, timeout=10)
                         except Exception:
@@ -47811,7 +47931,8 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         if results:
                             pk = results[0]['pk']
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
+                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk,
+                                                 'open_in_new_tab': new_tab.get(slug, True)}).encode(),
                                 headers=_ak_headers, method='POST')
                             _urlreq.urlopen(req, timeout=10)
                             if pk not in provider_pks:
@@ -47820,8 +47941,6 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     except Exception:
                         pass
 
-        for _name, _slug, _host in entries:
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, _slug, plog=log)
         if provider_pks:
             _outpost_add_providers_safe(_ak_url, _ak_headers, provider_pks, plog=log)
         return True
@@ -49386,7 +49505,6 @@ def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
 
 def _sync_authentik_takportal_provider_url(settings, plog=None):
     """Set TAK Portal Proxy external_host/cookie_domain, ensure provider+app exist and are on embedded outpost (fixes 404 on takportal.fqdn)."""
-    _tp_log = plog or (lambda _m: None)
     import urllib.request as _req
     import urllib.error
     fqdn = (settings.get('fqdn') or '').strip()
@@ -49461,10 +49579,9 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-        # Always PATCH open_in_new_tab when the proxy exists (was only done inside the
-        # "create provider" branch, so existing installs never got tak-portal updated).
+        # open_in_new_tab is only set when the app is created above: it is the
+        # operator's launch preference, and this runs on every console update (#151).
         if provider_pk is not None:
-            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
             _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
         # Ensure all deployed apps (infra-TAK, MediaMTX, Node-RED, TAK Portal) are on the outpost
         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
@@ -59502,7 +59619,10 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
       2. Application exists with:
          - correct slug + name
          - provider link to the above
-         - open_in_new_tab per the catalog entry
+         - open_in_new_tab per the catalog entry, ON CREATE ONLY. It is a launch
+           preference the operator owns (#151): the healer runs on every console
+           boot and the console restarts daily, so asserting it reverted an
+           operator's change within a day.
       3. Provider is in the embedded outpost's providers[] list
 
     Uses `_ak_api_call` (3 retries with 5s/10s/15s backoff, 30s timeout) instead
@@ -59811,7 +59931,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                         try:
                             _ak_api_call(
                                 f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                                data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                                data=json.dumps({'provider': provider_pk}).encode(),
                                 method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                             )
                             result['app'] = 'fixed'
@@ -59826,17 +59946,17 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     result['app'] = 'failed:create-timeout'
                     _log(f"  ✗ {app_name}: app create failed ({str(ae)[:120]})")
             else:
+                # open_in_new_tab is not asserted on an existing app — operator-owned (#151).
                 cur_prov = existing_app.get('provider')
-                cur_otb = bool(existing_app.get('open_in_new_tab'))
-                if cur_prov != provider_pk or cur_otb != bool(open_new_tab):
+                if cur_prov != provider_pk:
                     try:
                         _ak_api_call(
                             f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                         )
                         result['app'] = 'fixed'
-                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk}, open_in_new_tab {cur_otb} → {bool(open_new_tab)})")
+                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk})")
                     except Exception as pe2:
                         result['app'] = 'failed:patch-timeout'
                         _log(f"  ✗ {app_name}: app PATCH failed ({str(pe2)[:120]})")
@@ -63962,7 +64082,6 @@ entries:
                                         plog(f"  ✓ LDAP application already exists")
                                     else:
                                         plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
-                                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
     
                                 # Get or create LDAP outpost (blueprint may have created it)
                                 outpost_token_id = None
@@ -64266,7 +64385,6 @@ entries:
                                 app_slug = 'tak-portal'
                             else:
                                 plog(f"  ⚠ Application error: {e.code}")
-                        _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=plog)
 
                     # 12e: Add to embedded outpost
                     if app_slug:
@@ -86750,9 +86868,10 @@ def _startup_migrations():
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
 
-        # v0.9.55: Fleet-uniform login/MFA copy — replace the stock "Welcome to authentik!" /
-        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Idempotent no-op
-        # once applied; gated on Authentik being present + reachable.
+        # v0.9.55: login/MFA copy — replace the stock "Welcome to authentik!" /
+        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Seeded once
+        # (#151: re-applying it every boot reverted operator edits daily); gated on
+        # Authentik being present + reachable.
         try:
             if os.path.exists(os.path.expanduser('~/authentik/.env')):
                 _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
@@ -90097,10 +90216,9 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
-    # ATLAS MDM needs these two Authentik helpers, which this file
+    # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
-    '_authentik_application_open_in_new_tab': _authentik_application_open_in_new_tab,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at

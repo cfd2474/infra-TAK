@@ -4166,7 +4166,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                     try:
                         req = _urlreq.Request(
                             '%s/api/v3/core/applications/%s/' % (_ak_url, _names['app_slug']),
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -4185,8 +4185,6 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                                            plog=log),
                 plog=log)
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
-            ctx['_authentik_application_open_in_new_tab'](
-                _ak_url, _ak_headers, _names['app_slug'], plog=log)
             # ⚠️ The answer is recorded, not discarded (SEC_AUDIT.md H-1). ATLAS
             # runs with an empty admin group — it trusts Authentik to decide who is
             # an administrator — so this binding *is* the access control. It was
