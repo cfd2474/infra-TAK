@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.15-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.15-alpha)**
+**Current release: [v10.2.16-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.16-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.16-alpha — 2026-10-16 — CloudTAK Update keeps your source patches; Authentik edits survive restarts and updates
+
+**Headline: CloudTAK Update can re-apply your own source patches through pre-build hooks, and a failing hook rolls the update back with CloudTAK left running ([#150](https://github.com/takwerx/infra-TAK/issues/150)); the Authentik brand title and each application's open-in-new-tab setting are now yours to change, and stay changed across the daily console restart and console updates ([#151](https://github.com/takwerx/infra-TAK/issues/151)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.16-alpha))
+
+**CloudTAK pre-build hooks.** CloudTAK Update checks out the new tag, which wiped any local edit to CloudTAK's source, so the build shipped stock source. Executable scripts in `.config/cloudtak-hooks/pre-build.d/` now run in name order right before every local CloudTAK build (Update, plugin install/update/remove, and the rollback after a failed update). A hook that fails or runs past 5 minutes stops the build, and the Update rolls back exactly like a failed build. Hooks must be owned by the console user and not group- or world-writable. No folder means no change.
+
+**Authentik edits stick.** The console restarts once a day, and on every start it set the Authentik brand title back to `infra-TAK` and each application's open-in-new-tab back to the catalog value; console updates flipped open-in-new-tab again. The login wording is now seeded once, and open-in-new-tab is only set when an application is created. Provider links are still repaired.
+
+**Upgrade note.** Update the console. Nothing to do. To carry a CloudTAK source patch, put an executable script in `.config/cloudtak-hooks/pre-build.d/`.
 
 ### v10.2.15-alpha — 2026-10-15 — TAK Server stops restarting on every console start; console logins work on FIPS boxes; Docker TAK builds again
 
