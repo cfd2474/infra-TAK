@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.16-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.16-alpha)**
+**Current release: [v10.2.17-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.17-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.17-alpha — 2026-10-17 — TAK Portal Update keeps your settings; ATLAS uses the Email Relay; no more LDAP login herds from feeds
+
+**Headline: a TAK Portal Update can no longer reset `settings.json` to template defaults ([#158](https://github.com/takwerx/infra-TAK/issues/158)); ATLAS starts on InfraTAK's Email Relay when nobody has chosen yet ([#155](https://github.com/takwerx/infra-TAK/issues/155)); Node-RED feeds stop bursting TAK Server's mission API, and TAK Server reuses its LDAP connections, which ends the Authentik LDAP login herd and the Guard Dog restarts it caused.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.17-alpha))
+
+**TAK Portal settings survive Update.** infra-TAK wrote `settings.json` in place while the portal was running, and a portal read in that moment rebuilt the file from `settings.example.json`. The file is now swapped in atomically, the previous copy is backed up first (newest 10 kept), and the Update checks the TAK connection keys after the build and puts them back if they changed.
+
+**ATLAS email.** On deploy and update, ATLAS's *Use InfraTAK's email configuration* is ticked once, only if the Email Relay is configured, nobody has saved ATLAS's Email page yet, and ATLAS has no SMTP host of its own. An operator's choice is never changed.
+
+**Node-RED feeds and LDAP.** A feed whose layer churns IDs could send over 1,000 mission-API DELETEs in a minute, and TAK Server binds to LDAP on every API call, so each hourly Authentik LDAP cache expiry turned into a login herd and a Guard Dog restart. DELETEs are now paced at 1/s and capped per poll (the rest go next poll, still with offline-device ForceDeletes), one PUT chain runs per layer, and existing engine tabs are converted on the next Node-RED sync. TAK Server's LDAP connection pool (`enableConnectionPool`) is turned on, and Guard Dog no longer restarts Authentik for a herd that is already draining. **Restart TAK Server once after updating** so it picks up the LDAP pool.
 
 ### v10.2.16-alpha — 2026-10-16 — CloudTAK Update keeps your source patches; Authentik edits survive restarts and updates
 
