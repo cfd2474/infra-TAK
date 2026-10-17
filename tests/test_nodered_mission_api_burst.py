@@ -169,6 +169,99 @@ def test_one_shot_purge_stays_armed_until_finished(tmp_path):
     assert any('one-shot purge complete' in w for w in second['warns'])
 
 
+# ── ops #68: a deferred DELETE still gets its offline-device tombstone ───────────────
+# The cap defers removals to later polls. When each one's DELETE finally goes out it must
+# land in the tombstone map like any other removal, so the ForceDelete sweep (v10.1.5 W4)
+# still clears it off EUDs that were offline when the mission dropped it.
+
+def _del_uids(res):
+    return [re.search(r'uid=([^&]+)', d['url']).group(1) for d in _deletes(res)]
+
+
+def _force_deletes(res):
+    # The sweep's t-x-d-d + <__forcedelete/> broadcasts, by the UID they remove.
+    return [re.search(r'<link uid="([^"]+)"', m[0]['_rawCotXml']).group(1)
+            for m in res['sent'] if m and m[0] and m[0].get('_rawCotXml')]
+
+
+def _drain_backlog(tmp_path, n, poll_min, max_polls=30):
+    # Poll until a surge of n stale UIDs has been DELETEd. TAK applies each poll's DELETEs
+    # before the next poll, and polls are a full interval apart, so the sweep runs each time.
+    live = ['live-%d' % i for i in range(10)]
+    remaining = ['power-outage-areas-%d' % i for i in range(n)]
+    flow = {'_missStreak': _aged_misses(n), '_featureHashes': {u: 'h' for u in live}}
+    polls = []
+    while remaining and len(polls) < max_polls:
+        msg = _reconcile_msg(n, live, poll_min=poll_min)
+        msg['payload']['data'][0]['uids'] = remaining + live
+        flow['_tombSweepTs'] = 0
+        res = _run(tmp_path, RECONCILE, [msg], flow=flow)
+        flow = res['flow']
+        polls.append({'deleted': _del_uids(res), 'force': _force_deletes(res),
+                      'tombs': dict(flow['_tombstones']), 'warns': res['warns']})
+        gone = set(polls[-1]['deleted'])
+        remaining = [u for u in remaining if u not in gone]
+    assert not remaining, 'backlog did not drain in %d polls' % max_polls
+    return polls, flow
+
+
+DRAIN_CASES = [(5, 240, 600), (1, 48, 200)]   # (poll minutes, DELETE cap, surge size)
+
+
+@pytest.mark.parametrize('poll_min,cap,n', DRAIN_CASES)
+def test_surge_over_the_cap_is_deferred_not_dropped_and_drains_oldest_first(tmp_path, poll_min, cap, n):
+    polls, _ = _drain_backlog(tmp_path, n, poll_min)
+    assert [len(p['deleted']) for p in polls] == [cap] * (n // cap) + ([n % cap] if n % cap else [])
+    # Every removal goes out exactly once, oldest-missing first across the polls.
+    assert [u for p in polls for u in p['deleted']] == ['power-outage-areas-%d' % i for i in range(n)]
+    for i, p in enumerate(polls[:-1]):
+        assert any('DELETE cap' in w and 'deferred %d' % (n - cap * (i + 1)) in w for w in p['warns'])
+    assert not any('deferred' in w for w in polls[-1]['warns'])
+
+
+@pytest.mark.parametrize('poll_min,cap,n', DRAIN_CASES)
+def test_deferred_removal_is_tombstoned_when_its_delete_goes_out_not_before(tmp_path, poll_min, cap, n):
+    started = _aged_misses(n)
+    polls, _ = _drain_backlog(tmp_path, n, poll_min)
+    sent = set()
+    for p in polls:
+        sent |= set(p['deleted'])
+        # Tombstoned exactly when DELETEd: nothing still deferred, nothing sent missing.
+        assert set(p['tombs']) == sent
+        # The sweep only ever ForceDeletes UIDs whose DELETE has gone out.
+        assert p['force'] and set(p['force']) <= sent
+        assert len(p['force']) == min(250, len(sent))
+    # A poll's own removals are broadcast on that poll while the sweep has room.
+    assert set(polls[0]['force']) == set(polls[0]['deleted'])
+    # The 3-day TTL runs from the DELETE, not from when the UID first went missing.
+    for u, ts in polls[-1]['tombs'].items():
+        assert ts - started[u] > 59 * 60000
+    # Same on a poll where the sweep is skipped (it runs at most every 45s), so its
+    # live-shape guard is not what keeps the deferred UIDs out of the map.
+    import time
+    live = ['live-%d' % i for i in range(10)]
+    res = _run(tmp_path, RECONCILE, [_reconcile_msg(n, live, poll_min=poll_min)],
+               flow={'_missStreak': _aged_misses(n), '_featureHashes': {u: 'h' for u in live},
+                     '_tombSweepTs': int(time.time() * 1000)})
+    assert _force_deletes(res) == []
+    assert set(res['flow']['_tombstones']) == set(_del_uids(res))
+    assert len(res['flow']['_tombstones']) == cap
+
+
+@pytest.mark.parametrize('poll_min,cap,n', DRAIN_CASES)
+def test_every_removal_is_tombstoned_once_the_backlog_clears(tmp_path, poll_min, cap, n):
+    polls, flow = _drain_backlog(tmp_path, n, poll_min)
+    assert set(flow['_tombstones']) == {'power-outage-areas-%d' % i for i in range(n)}
+    assert not any(u.startswith('power-outage-areas-') for u in flow['_missStreak'])
+    # A quiet poll after the drain sends no DELETEs and keeps every tombstone for the sweep.
+    live = ['live-%d' % i for i in range(10)]
+    flow['_tombSweepTs'] = 0
+    res = _run(tmp_path, RECONCILE, [_reconcile_msg(0, live, poll_min=poll_min)], flow=flow)
+    assert _deletes(res) == []
+    assert set(res['flow']['_tombstones']) == set(flow['_tombstones'])
+    assert len(_force_deletes(res)) == min(250, n)
+
+
 def _put_msg(n, key=''):
     m = {'topic': 'POWER-OUTAGES', '_putUrl': 'https://h:8443/Marti/api/missions/P/contents',
          '_putUids': ['u%d' % i for i in range(n)]}
