@@ -1073,7 +1073,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.16-alpha"
+VERSION = "10.2.17-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -8353,7 +8353,8 @@ def _diag_section_takserver(settings):
     except Exception as e:
         cc = ''
         out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
-    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
+    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN',
+                                 'enableConnectionPool')),
                        ('auth', ('default', 'x509groups', 'x509useGroupCache')),
                        ('connector', ('port', 'clientAuth', '_name')),
                        # v10.2.11: where TAK looks for its database and as whom (never the password)
@@ -35486,14 +35487,24 @@ def _takportal_get_existing_settings():
     v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
     container; cp works on a created/stopped one. The deploy path seeds settings.json into a
     created-but-not-started container — without this fallback that seed read {} and rewrote
-    the whole file from our defaults, clobbering operator values on any redeploy."""
-    try:
-        r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and (r.stdout or '').strip():
-            return json.loads(r.stdout.strip())
-    except Exception:
-        pass
+    the whole file from our defaults, clobbering operator values on any redeploy.
+
+    v10.2.16 (GH #158): TAK Portal rewrites this file itself, in place, whenever it reloads it
+    (settings.service.js loadSettingsFromDisk), so a read can land on a half-written file. {}
+    makes the merge rebuild the file from our seeds alone, so a torn read is retried first."""
+    for _attempt in range(3):
+        try:
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+        except Exception:
+            break
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            break
+        try:
+            return json.loads(body)
+        except ValueError:
+            time.sleep(0.5)
     # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
     # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
     # would land root-owned and a non-root console could not read it back.
@@ -36015,6 +36026,44 @@ def _takportal_merged_settings_json(settings, adopt=()):
     return json.dumps(merged, indent=2)
 
 
+TAKPORTAL_SETTINGS_BACKUP_KEEP = 10
+
+
+def _takportal_backup_settings(plog=None):
+    """v10.2.16 (GH #158): copy TAK Portal's settings.json, as it is right now, to the host
+    before infra-TAK writes over it — the field report had no copy to go back to and re-entered
+    ~120 settings by hand. CONFIG_DIR/takportal-settings-backups, mode 600 (the file holds the
+    Authentik token and the P12 passphrase), newest TAKPORTAL_SETTINGS_BACKUP_KEEP kept. A copy
+    identical to the newest is not written again, so repeated guardrail pushes do not rotate a
+    good copy out. Returns the backup path, or '' when there was nothing to keep. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        current = _takportal_get_existing_settings()
+        if not isinstance(current, dict) or not current:
+            return ''
+        body = json.dumps(current, indent=2)
+        bdir = os.path.join(CONFIG_DIR, 'takportal-settings-backups')
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        kept = sorted(f for f in os.listdir(bdir) if f.startswith('settings-') and f.endswith('.json'))
+        if kept:
+            with open(os.path.join(bdir, kept[-1])) as f:
+                if f.read() == body:
+                    return os.path.join(bdir, kept[-1])
+        name = f"settings-{datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        fd = os.open(os.path.join(bdir, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(body)
+        for old in (kept + [name])[:-TAKPORTAL_SETTINGS_BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except OSError:
+                pass
+        return os.path.join(bdir, name)
+    except Exception as e:
+        _log(f"  takportal settings backup failed (non-fatal): {str(e)[:200]}")
+        return ''
+
+
 def _takportal_write_settings_json(settings_json, plog=None):
     """v10.1.42 (W-P2): the ONE and ONLY writer of TAK Portal's settings.json.
 
@@ -36024,13 +36073,40 @@ def _takportal_write_settings_json(settings_json, plog=None):
     own read-modify-write straight into the container and bypassed every rule. If you are about
     to add another `docker cp ... tak-portal:/usr/src/app/data/settings.json` — don't; call this.
 
+    v10.2.16 (GH #158): into a RUNNING portal the file is staged next to settings.json and
+    renamed over it. `docker cp` straight onto settings.json deletes it and rewrites it in place,
+    and TAK Portal reloads the file whenever its mtime changes (web AND worker): a read in that
+    window parses as {}, its template merge fills every key from settings.example.json, and it
+    writes that over the file — TAK_URL, the P12 and ~120 settings gone, on a 2.0.10 -> 2.0.11
+    update. A rename is atomic, so a reader sees the old file or the new one, never a torn one.
+
     Returns (ok, error_message). Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
+    _takportal_backup_settings(plog=_log)
     try:
         fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-settings-')
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(settings_json)
+            web = _takportal_web_container()
+            if web:
+                staged = '/usr/src/app/data/.settings.json.infratak'
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f"{web['id']}:{staged}"]),
+                                    capture_output=True, text=True, timeout=20)
+                if cp.returncode == 0:
+                    mv = subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'mv', '-f', staged,
+                                                    '/usr/src/app/data/settings.json']),
+                                        capture_output=True, text=True, timeout=20)
+                    if mv.returncode == 0:
+                        return True, ''
+                    subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'rm', '-f', staged]),
+                                   capture_output=True, text=True, timeout=20)
+                    why = (mv.stderr or mv.stdout or 'mv failed').strip()[:200]
+                else:
+                    why = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]
+                _log(f"  takportal settings: atomic replace failed ({why}) — writing in place")
+            # Not running (the deploy path seeds a created-but-not-started container), so nothing
+            # is reading the file — or the rename was refused and the old file is still whole.
             cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{_takportal_ref()}:/usr/src/app/data/settings.json']),
                                 capture_output=True, text=True, timeout=20)
         finally:
@@ -36686,7 +36762,11 @@ def takportal_control():
         try:
             _want = json.loads(settings_json) if settings_json else {}
             _have = _takportal_get_existing_settings() or {}
-            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
+            # v10.2.16 (GH #158): and the TAK Server connection keys. These are not ours to change,
+            # but the file was written seconds ago, so if they differ now the file was reset under
+            # us (TAK Portal's template fallback) and the write below puts the operator's file back.
+            _keys = [k for k in sorted(TAKPORTAL_AUTHORITATIVE_KEYS) + ['TAK_URL', 'TAK_API_P12_PATH',
+                     'TAK_API_P12_PASSPHRASE', 'TAK_CA_PATH'] if _want.get(k)]
             # An unreadable file after a successful pre-build write is a read failure, not
             # evidence the write was lost — do not restart a booting stack over it.
             _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
@@ -64800,6 +64880,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         'dnAttributeName': 'DN',
         'nameAttr': 'CN',
         'adminGroup': 'ROLE_ADMIN',
+        # ops #64: reuse bound LDAP connections — see _heal_coreconfig_ldap_connection_pool.
+        'enableConnectionPool': 'true',
     }
     _auth_attrs = {
         'default': 'ldap',
@@ -64990,7 +65072,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         f' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
         f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
         f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
-        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
+        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN" enableConnectionPool="true"/>\n'
         '    </auth>'
     )
     try:
@@ -65061,6 +65143,62 @@ def _heal_coreconfig_updateinterval_ms(log=None):
         return True
     except Exception as e:
         _log(f"CoreConfig updateinterval migration error (non-fatal): {str(e)[:160]}")
+        return False
+
+
+def _heal_coreconfig_ldap_connection_pool(log=None):
+    """ops #64: add enableConnectionPool="true" to CoreConfig's <ldap> on boxes already wired to LDAP.
+
+    Without it TAK Server opens a new LDAP connection and binds as adm_ldapservice for every
+    API call (test12: ~200 binds/min under a Node-RED feed). The outpost answers those from its
+    cached session until the session expires (AK_LDAP_SESSION_DURATION); then every bind in
+    flight runs its own ldap-authentication-flow until the first one finishes. On test12,
+    2026-10-16 10:31 AM PT, the first took 73 s, ~200 flows piled up behind it and hung for
+    2-7 min — the herd Guard Dog then restarted Authentik for. With the pool on, the bound
+    connections are reused: binds fell from ~200/min to ~0 and searches carried on unchanged.
+    The outpost's cached search mode authorizes a search from the bind's cached flags, not
+    the session, so a pooled connection keeps working across the session expiry.
+
+    TAK's own attribute (CoreConfig.xsd: enableConnectionPool, default false; idle connections
+    close after connectionPoolTimeout, default 30000 ms). Same shape as the updateinterval heal:
+      * only when the attribute is ABSENT — no infra-TAK version ever wrote it, so an explicit
+        value is somebody's decision and is left alone; a fresh LDAP sync writes "true".
+      * a targeted text insert, not an ElementTree round-trip, so the rest of the file stays
+        byte-for-byte.
+      * it does NOT restart TAK Server (a restart drops every connected client); the running
+        JVM picks it up on the next restart. Say so in the log.
+
+    Idempotent, non-fatal, returns True only when it actually changed the file."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists(CORECONFIG_PATH):
+            return False
+        content = _read_coreconfig(CORECONFIG_PATH)
+    except Exception as _re_err:
+        _log(f"CoreConfig LDAP connection-pool migration: cannot read CoreConfig.xml "
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
+        return False
+    try:
+        _tag_re = re.compile(r'<((?:[A-Za-z][\w-]*:)?ldap\b[^>]*?)(\s*/?>)', re.IGNORECASE)
+        changed = []
+
+        def _add_attr(m):
+            if re.search(r'\benableConnectionPool\s*=', m.group(1), re.IGNORECASE):
+                return m.group(0)
+            changed.append(1)
+            return f'<{m.group(1)} enableConnectionPool="true"{m.group(2)}'
+
+        new_content = _tag_re.sub(_add_attr, content)
+        if not changed:
+            return False
+        _write_priv(CORECONFIG_PATH, new_content)
+        _log('CoreConfig <ldap enableConnectionPool="true"> added (TAK Server reuses bound LDAP '
+             'connections instead of binding for every API call, so an outpost session expiry '
+             'no longer sets off a login-flow herd). TAK Server picks this up on its NEXT '
+             'restart; nothing was restarted for you.')
+        return True
+    except Exception as e:
+        _log(f"CoreConfig LDAP connection-pool migration error (non-fatal): {str(e)[:160]}")
         return False
 
 
@@ -87252,6 +87390,16 @@ def _startup_migrations():
             )
         except Exception as _ui_err:
             print(f"Startup migration: CoreConfig updateinterval error (non-fatal): {_ui_err}")
+
+        # ops #64 — same for <ldap enableConnectionPool>: without it TAK binds to LDAP for
+        # every API call, and an outpost session expiry turns a busy minute into a login-flow
+        # herd. Absent-only, idempotent, never restarts TAK Server.
+        try:
+            _heal_coreconfig_ldap_connection_pool(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _cp_err:
+            print(f"Startup migration: CoreConfig LDAP connection-pool error (non-fatal): {_cp_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
