@@ -8353,7 +8353,8 @@ def _diag_section_takserver(settings):
     except Exception as e:
         cc = ''
         out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
-    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
+    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN',
+                                 'enableConnectionPool')),
                        ('auth', ('default', 'x509groups', 'x509useGroupCache')),
                        ('connector', ('port', 'clientAuth', '_name')),
                        # v10.2.11: where TAK looks for its database and as whom (never the password)
@@ -64879,6 +64880,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         'dnAttributeName': 'DN',
         'nameAttr': 'CN',
         'adminGroup': 'ROLE_ADMIN',
+        # ops #64: reuse bound LDAP connections — see _heal_coreconfig_ldap_connection_pool.
+        'enableConnectionPool': 'true',
     }
     _auth_attrs = {
         'default': 'ldap',
@@ -65069,7 +65072,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         f' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
         f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
         f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
-        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
+        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN" enableConnectionPool="true"/>\n'
         '    </auth>'
     )
     try:
@@ -65140,6 +65143,62 @@ def _heal_coreconfig_updateinterval_ms(log=None):
         return True
     except Exception as e:
         _log(f"CoreConfig updateinterval migration error (non-fatal): {str(e)[:160]}")
+        return False
+
+
+def _heal_coreconfig_ldap_connection_pool(log=None):
+    """ops #64: add enableConnectionPool="true" to CoreConfig's <ldap> on boxes already wired to LDAP.
+
+    Without it TAK Server opens a new LDAP connection and binds as adm_ldapservice for every
+    API call (test12: ~200 binds/min under a Node-RED feed). The outpost answers those from its
+    cached session until the session expires (AK_LDAP_SESSION_DURATION); then every bind in
+    flight runs its own ldap-authentication-flow until the first one finishes. On test12,
+    2026-10-16 10:31 AM PT, the first took 73 s, ~200 flows piled up behind it and hung for
+    2-7 min — the herd Guard Dog then restarted Authentik for. With the pool on, the bound
+    connections are reused: binds fell from ~200/min to ~0 and searches carried on unchanged.
+    The outpost's cached search mode authorizes a search from the bind's cached flags, not
+    the session, so a pooled connection keeps working across the session expiry.
+
+    TAK's own attribute (CoreConfig.xsd: enableConnectionPool, default false; idle connections
+    close after connectionPoolTimeout, default 30000 ms). Same shape as the updateinterval heal:
+      * only when the attribute is ABSENT — no infra-TAK version ever wrote it, so an explicit
+        value is somebody's decision and is left alone; a fresh LDAP sync writes "true".
+      * a targeted text insert, not an ElementTree round-trip, so the rest of the file stays
+        byte-for-byte.
+      * it does NOT restart TAK Server (a restart drops every connected client); the running
+        JVM picks it up on the next restart. Say so in the log.
+
+    Idempotent, non-fatal, returns True only when it actually changed the file."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists(CORECONFIG_PATH):
+            return False
+        content = _read_coreconfig(CORECONFIG_PATH)
+    except Exception as _re_err:
+        _log(f"CoreConfig LDAP connection-pool migration: cannot read CoreConfig.xml "
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
+        return False
+    try:
+        _tag_re = re.compile(r'<((?:[A-Za-z][\w-]*:)?ldap\b[^>]*?)(\s*/?>)', re.IGNORECASE)
+        changed = []
+
+        def _add_attr(m):
+            if re.search(r'\benableConnectionPool\s*=', m.group(1), re.IGNORECASE):
+                return m.group(0)
+            changed.append(1)
+            return f'<{m.group(1)} enableConnectionPool="true"{m.group(2)}'
+
+        new_content = _tag_re.sub(_add_attr, content)
+        if not changed:
+            return False
+        _write_priv(CORECONFIG_PATH, new_content)
+        _log('CoreConfig <ldap enableConnectionPool="true"> added (TAK Server reuses bound LDAP '
+             'connections instead of binding for every API call, so an outpost session expiry '
+             'no longer sets off a login-flow herd). TAK Server picks this up on its NEXT '
+             'restart; nothing was restarted for you.')
+        return True
+    except Exception as e:
+        _log(f"CoreConfig LDAP connection-pool migration error (non-fatal): {str(e)[:160]}")
         return False
 
 
@@ -87331,6 +87390,16 @@ def _startup_migrations():
             )
         except Exception as _ui_err:
             print(f"Startup migration: CoreConfig updateinterval error (non-fatal): {_ui_err}")
+
+        # ops #64 — same for <ldap enableConnectionPool>: without it TAK binds to LDAP for
+        # every API call, and an outpost session expiry turns a busy minute into a login-flow
+        # herd. Absent-only, idempotent, never restarts TAK Server.
+        try:
+            _heal_coreconfig_ldap_connection_pool(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _cp_err:
+            print(f"Startup migration: CoreConfig LDAP connection-pool error (non-fatal): {_cp_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
