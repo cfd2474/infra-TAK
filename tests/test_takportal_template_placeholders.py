@@ -203,6 +203,20 @@ def test_heal_pushes_on_a_reset_file():
     assert not any('real-token' in m for m in box.logs), 'never log the token'
 
 
+def test_heal_partial_reset_repairs_authentik_and_leaves_real_tak_fields_alone():
+    """The field box: Authentik fields on the template, TAK connection real (its stats were fine)."""
+    partial = dict(HEALTHY, AUTHENTIK_URL=TEMPLATE['AUTHENTIK_URL'], AUTHENTIK_TOKEN=TEMPLATE['AUTHENTIK_TOKEN'])
+    assert _keys(partial) == frozenset({'AUTHENTIK_URL', 'AUTHENTIK_TOKEN'})
+    box = _Box(partial)
+    assert box.heal() is True and box.pushes == 1
+    assert any('(AUTHENTIK_TOKEN, AUTHENTIK_URL)' in m for m in box.logs)
+    out = _merge(partial)
+    assert out['AUTHENTIK_URL'] == BUILT['AUTHENTIK_URL'] and out['AUTHENTIK_TOKEN'] == BUILT['AUTHENTIK_TOKEN']
+    for k in HEALTHY:
+        if k not in ('AUTHENTIK_URL', 'AUTHENTIK_TOKEN'):
+            assert out[k] == HEALTHY[k], k
+
+
 def test_heal_leaves_a_healthy_box_alone():
     box = _Box(dict(HEALTHY))
     assert box.heal() is False and box.pushes == 0
