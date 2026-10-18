@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.17-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.17-alpha)**
+**Current release: [v10.2.18-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.18-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,14 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.18-alpha — 2026-10-17 — TAK Portal group changes work again on boxes left on template settings; TAK Portal Update no longer shows a false failure behind a gateway
+
+**Headline: a TAK Portal `settings.json` still holding its own template values (left over from [#158](https://github.com/takwerx/infra-TAK/issues/158) on boxes reset before v10.2.17) is now healed on console start, so group changes stop failing with "Authentik operation failed and remains queued for retry"; TAK Portal Update runs in the background, so a reverse proxy or gateway timeout no longer shows "Update failed" while the update actually succeeds.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.18-alpha))
+
+**TAK Portal template settings healed.** v10.2.17 stopped new resets but didn't repair a box that was already reset: the Authentik URL and token, the TAK URL and the API certificate paths stayed on TAK Portal's fill-in-the-blank placeholders, so every group change queued with a DNS error and the dashboard's TAK stats broke. On console start infra-TAK now replaces exactly those placeholders (and the template certificate paths, only while the TAK URL is still the placeholder) and pushes the settings. A real operator value is never touched; a healthy file is left byte-identical. Other template defaults a full reset put back (branding, hidden prefixes, agency types) can't be told apart from a choice and stay as they are.
+
+**TAK Portal Update behind a gateway.** Update was one long request covering the whole checkout and build. A gateway in front of the console (Azure Application Gateway defaults to 20 s) gave up first, and the page showed "Update failed" while the box finished the update. Update now starts a background job and the page follows its progress, shows the console's full error text on a real failure, and picks the result back up if the console restarted mid-update.
 
 ### v10.2.17-alpha — 2026-10-17 — TAK Portal Update keeps your settings; ATLAS uses the Email Relay; no more LDAP login herds from feeds
 

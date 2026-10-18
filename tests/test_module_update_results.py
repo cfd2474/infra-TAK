@@ -241,9 +241,10 @@ def test_results_api_is_login_required_and_name_checked():
 
 SYNC = {  # route -> module record
     "/api/authentik/control": 'authentik', "/api/netbird/control": 'netbird',
-    "/api/takportal/control": 'takportal', "/api/caddy/update": 'caddy',
-    "/api/guarddog/update": 'guarddog',
+    "/api/caddy/update": 'caddy', "/api/guarddog/update": 'guarddog',
 }
+# TAK Portal's Update became a background job in ops #72; its recorder sits on the job function
+# (tests/test_takportal_update_gateway_timeout.py::test_the_job_is_what_records_the_outcome).
 ASYNC = {  # module record -> the worker it tracks
     'cloudtak': 'run_cloudtak_update', 'fedhub': 'run_fedhub_remote_update',
     'webodm': '_run_webodm_update', 'remote-assist': '_run_remote_assist_update',
