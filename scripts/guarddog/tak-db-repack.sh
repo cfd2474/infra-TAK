@@ -32,6 +32,9 @@
 #     operator-pressed Online Compact exits 1 for that. Before, one failed install left the
 #     unit `failed` until someone ran reset-failed. A repack that RUNS and fails still exits 1.
 #   - The install's own output is logged when it does not yield pg_repack.
+#   - Container TAK (ops #76): the install ran inside takserver-db as postgres (the image's
+#     USER), so dnf always refused it. gd_db_shell now execs as root; a refused-for-root
+#     install is logged as that, not as "not available on this platform".
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -231,6 +234,14 @@ ${RSUDO}dnf install -y -q pg_repack_${PG_VER} 2>&1" 2>&1)
   fi
   if [ -z "$PG_REPACK_BIN" ]; then
     INSTALL_MSG=$(printf '%s' "${INSTALL_OUT:-}" | tr '\n' ' ' | cut -c1-200)
+    # ops #76: an install refused for lack of root is OUR bug, not a platform without a
+    # package. Saying "not available on this platform" for it hid the container-mode bug.
+    case "$INSTALL_OUT" in
+      *"superuser privileges"*|*"Permission denied"*|*"are you root"*|*"password is required"*|*"not in the sudoers"*)
+        log_line "DB-REPACK: pg_repack install was refused for lack of root on the database host (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}, install said: $INSTALL_MSG) — repack not run."
+        [ "$FORCE_RUN" = "1" ] && exit 1
+        exit 0 ;;
+    esac
     if [ "$FORCE_RUN" = "1" ]; then
       # A FAILURE, not a clean skip: the operator pressed Online Compact and must be told
       # it cannot run here — pg_repack has no package on every arch/PG combination — so
