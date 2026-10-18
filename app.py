@@ -35842,7 +35842,8 @@ def _takportal_build_settings_dict(settings):
     if not (ak_token or '').strip():
         _existing = _takportal_get_existing_settings()
         _prev_tok = (_existing.get('AUTHENTIK_TOKEN') or '').strip() if isinstance(_existing, dict) else ''
-        if _prev_tok:
+        # v10.2.18 (ops #71): the template's token is not a good token — never carry it forward.
+        if _prev_tok and _prev_tok != TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_TOKEN']:
             ak_token = _prev_tok
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
@@ -35971,12 +35972,60 @@ def _takportal_settings_value_is_blank(v):
 
     A blank value is not a choice — seeding over it is safe, and it is what un-sticks a key that
     was written as "" before its source existed (e.g. AUTHENTIK_PUBLIC_URL seeded before an FQDN
-    was set). Any non-empty value — including False / 0 — is treated as the operator's."""
+    was set). Any non-empty value — including False / 0 — is treated as the operator's.
+    See also _takportal_template_placeholder_keys(): TAK Portal's template sentinels are blank too."""
     if v is None:
         return True
     if isinstance(v, str):
         return not v.strip()
     return False
+
+
+# v10.2.18 (ops #71): the values TAK Portal's own settings.example.json ships for these keys.
+# Before v10.2.17, GH #158 could leave a portal's settings.json reset to that template, and on
+# such a box every Authentik call fails ("Authentik operation failed and remains queued for
+# retry"; last_error `getaddrinfo EAI_AGAIN your-authentik-url`) and the dashboard's TAK stats
+# go missing. Copied byte-for-byte from TAK Portal 2.0.12's settings.example.json.
+TAKPORTAL_TEMPLATE_PLACEHOLDERS = {
+    'AUTHENTIK_URL': 'http://your-authentik-url:9000',
+    'AUTHENTIK_TOKEN': 'your-real-token-here',
+    'TAK_URL': 'https://your-tak-server:8443/Marti',
+}
+# The rest of the template's TAK connection block. These look like real values (`atakatak` is a
+# real TAK default), so they never count as placeholders on their own — only while TAK_URL is
+# still the template's, i.e. the TAK connection was never configured after the reset.
+TAKPORTAL_TEMPLATE_TAK_CONNECTION = {
+    'TAK_API_P12_PATH': './data/certs/webadmin.p12',
+    'TAK_API_P12_PASSPHRASE': 'atakatak',
+    'TAK_CA_PATH': './data/certs/tak-ca.pem',
+}
+
+
+def _takportal_template_placeholder_keys(existing):
+    """The keys in TAK Portal's settings.json still holding a TAK Portal template placeholder.
+
+    The merge seeds these exactly as it seeds a blank key. This is NOT the value-based ownership
+    test CLAUDE.md forbids ("overwrite it if it equals what we would have written" — the
+    TAK_SSH_USER=root bug): that compared against OUR defaults, values an operator can choose
+    too. These are TAK Portal's fill-in-the-blank sentinels (`your-authentik-url`,
+    `your-real-token-here`, `your-tak-server`). They point at hosts that do not exist and a token
+    Authentik rejects; nobody sets them on purpose, so like "" they carry no operator intent.
+    Only an exact match counts.
+
+    The template's P12 path / passphrase / CA path are real-looking values, so they count only
+    while TAK_URL is still the sentinel and each still equals the template value — they arrived
+    with the reset in one file. An operator who typed a real TAK_URL owns the whole block."""
+    if not isinstance(existing, dict):
+        return frozenset()
+
+    def _is(k, template):
+        v = existing.get(k)
+        return isinstance(v, str) and v.strip() == template
+
+    keys = {k for k, t in TAKPORTAL_TEMPLATE_PLACEHOLDERS.items() if _is(k, t)}
+    if 'TAK_URL' in keys:
+        keys |= {k for k, t in TAKPORTAL_TEMPLATE_TAK_CONNECTION.items() if _is(k, t)}
+    return frozenset(keys)
 
 
 def _takportal_merged_settings_json(settings, adopt=()):
@@ -36009,8 +36058,10 @@ def _takportal_merged_settings_json(settings, adopt=()):
     # everything else, so a hand-configured portal SMTP survives every settings push.
     _relay = settings.get('email_relay') or {}
     _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
+    # v10.2.18 (ops #71): a TAK Portal template placeholder is not the operator's value either.
+    placeholders = _takportal_template_placeholder_keys(merged)
     for k, v in our.items():
-        if _takportal_settings_value_is_blank(merged.get(k)):
+        if k in placeholders or _takportal_settings_value_is_blank(merged.get(k)):
             merged[k] = v  # seed — the portal has no value of its own for this key
             continue
         if k in TAKPORTAL_AUTHORITATIVE_KEYS:
@@ -36158,27 +36209,41 @@ def _heal_takportal_authentik_token(plog=None):
     was never rebuilt. This re-pushes a valid token on the next console boot so an affected box
     self-heals through the normal update (pull + restart) path — no manual 'Update config'.
 
-    Idempotent: skips when the token is already present, TAK Portal isn't running, or no valid
-    token can be read. Best-effort; never raises."""
+    v10.2.18 (ops #71): also heals a settings.json still holding TAK Portal's template placeholders
+    (_takportal_template_placeholder_keys) — GH #158 could reset the file to settings.example.json
+    before v10.2.17, and nothing pushed settings on console start, so those boxes stayed broken
+    (every group change "remains queued for retry", no TAK stats). The push goes through the
+    normal merge, which re-seeds exactly those keys and leaves every operator value alone.
+
+    Idempotent: skips when nothing is blank or a placeholder, or TAK Portal isn't running. A token
+    that needs healing but cannot be read yet is skipped; the other placeholders still heal.
+    Best-effort; never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
         if not _takportal_web_running():
             return False  # container not running — nothing to heal / can't push
         existing = _takportal_get_existing_settings()
-        if not isinstance(existing, dict):
+        if not isinstance(existing, dict) or not existing:
             return False
-        if (existing.get('AUTHENTIK_TOKEN') or '').strip():
-            return False  # token present — healthy box, leave it alone
-        settings = load_settings()
-        new_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                   or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
-        if not new_tok:
-            _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
-            return False
-        _log("  takportal: AUTHENTIK_TOKEN blank in settings.json — re-pushing valid token (non-root flip-window heal)")
+        heal = set(_takportal_template_placeholder_keys(existing))
+        if not (existing.get('AUTHENTIK_TOKEN') or '').strip():
+            heal.add('AUTHENTIK_TOKEN')
+        if not heal:
+            return False  # healthy box, leave it alone
+        if 'AUTHENTIK_TOKEN' in heal:
+            settings = load_settings()
+            new_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                       or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
+            if not new_tok:
+                heal.discard('AUTHENTIK_TOKEN')
+                if not heal:
+                    _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
+                    return False
+                _log("  takportal: AUTHENTIK_TOKEN not readable from Authentik .env yet — healing the other keys")
+        _log(f"  takportal: blank or template-placeholder settings ({', '.join(sorted(heal))}) — re-pushing settings")
         if not _takportal_push_settings(plog=_log):
             return False
-        _log("  ✓ takportal: AUTHENTIK_TOKEN restored + container restarted")
+        _log(f"  ✓ takportal: {', '.join(sorted(heal))} restored + container restarted")
         return True
     except Exception as e:
         _log(f"  takportal: AUTHENTIK_TOKEN heal error (non-fatal): {e}")
@@ -87328,6 +87393,7 @@ def _startup_migrations():
         # rebuild that raced the non-root flip's Authentik re-home (test6/test8 hit this:
         # 'Missing AUTHENTIK_TOKEN in settings.json'). Re-pushes a valid token now that the
         # .env is readable. Idempotent: skips when the token is already present.
+        # v10.2.18 (ops #71): also heals TAK Portal template placeholders left by GH #158.
         try:
             _heal_takportal_authentik_token(
                 lambda m: print(f"Startup migration: {m}", flush=True)
