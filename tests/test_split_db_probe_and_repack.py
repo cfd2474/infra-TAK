@@ -187,9 +187,25 @@ esac
 '''
 
 
+# docker: `exec [-u USER] <container> cmd...` runs cmd here. With no -u it is the image's
+# USER, which for takserver-db is postgres (ops #76), so only `-u root` is root.
+DOCKER_STUB = r'''#!/bin/bash
+echo "docker $*" >> "%(dir)s/docker_calls"
+[ "$1" = exec ] || exit 0
+shift
+user=postgres
+while [ "${1#-}" != "$1" ]; do
+  case "$1" in -u) user=$2; shift 2 ;; *) shift ;; esac
+done
+shift
+[ "$user" = root ] && export FAKE_ROOT=1 || export FAKE_ROOT=0
+exec "$@"
+'''
+
+
 @pytest.fixture
 def repack(tmp_path):
-    def make(ssh_user='takdb', pkg='postgresql-15-repack'):
+    def make(ssh_user='takdb', pkg='postgresql-15-repack', container=False):
         stubs = tmp_path / 'bin'
         stubs.mkdir()
         gd = tmp_path / 'gd'
@@ -197,6 +213,7 @@ def repack(tmp_path):
         (tmp_path / 'state').mkdir()
         _stub(stubs / 'ssh', SSH_STUB)
         _stub(stubs / 'sudo', SUDO_STUB % {'dir': tmp_path})
+        _stub(stubs / 'docker', DOCKER_STUB % {'dir': tmp_path})
         _stub(stubs / 'psql', PSQL_STUB)
         # Debian: pg_config reports the newest CLIENT (16), not the server (15).
         _stub(stubs / 'pg_config', '#!/bin/sh\necho "PostgreSQL 16.4"\n')
@@ -204,7 +221,11 @@ def repack(tmp_path):
         _stub(gd / 'send-alert-email.sh', '#!/bin/sh\necho "$1" >> %s/alerts\n' % tmp_path)
         key = tmp_path / 'key'
         key.write_text('k')
-        (gd / 'guarddog.conf').write_text('{"two_server": true, "db_host": "db1"}')
+        if container:
+            (gd / '_gd-tak-lib.sh').write_text(_sandbox((GD / '_gd-tak-lib.sh').read_text(), tmp_path, gd))
+            (gd / 'guarddog.conf').write_text('{"tak_mode": "container"}')
+        else:
+            (gd / 'guarddog.conf').write_text('{"two_server": true, "db_host": "db1"}')
         script = (_sandbox((GD / 'tak-db-repack.sh').read_text(), tmp_path, gd)
                   .replace('DB_HOST_PLACEHOLDER', 'db1')
                   .replace('SSH_KEY_PLACEHOLDER', str(key))
@@ -255,6 +276,29 @@ def test_root_ssh_user_is_not_wrapped_in_sudo_for_the_install(repack):
     # A root login runs apt-get directly (the test runner is not root, so the fake refuses
     # it; check the call, not the outcome).
     assert 'apt-get update -qq root=0' in apt
+
+
+def test_container_mode_installs_pg_repack_as_root_inside_takserver_db(repack):
+    # aws-arm, container TAK: the install ran as the image's USER (postgres) and was refused.
+    rc, log, apt = repack(container=True)(force=True)
+    assert 'install -y -qq postgresql-15-repack root=1' in apt
+    assert rc == 0, log
+    assert 'pg_repack installed successfully' in log and 'DB-REPACK: completed' in log
+
+
+def test_container_mode_runs_pg_repack_and_psql_as_postgres_not_root(repack, tmp_path):
+    repack(container=True)(force=True)
+    calls = (tmp_path / 'docker_calls').read_text().splitlines()
+    assert any('-u postgres takserver-db psql' in c for c in calls)
+    assert any('-u postgres takserver-db' in c and 'pg_repack -d cot' in c for c in calls)
+    assert all('-u ' in c for c in calls if c.startswith('docker exec'))   # never the image default
+
+
+def test_install_refused_for_lack_of_root_is_not_reported_as_unsupported_platform(repack):
+    rc, log, _ = repack(ssh_user='root')(force=True)              # root login, runner is not root
+    assert rc == 1
+    assert 'refused for lack of root' in log and 'Permission denied' in log
+    assert 'not available on this platform' not in log
 
 
 def test_two_server_postgres_commands_never_prompt_for_a_password():
