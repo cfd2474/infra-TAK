@@ -8757,6 +8757,12 @@ def _diag_section_guarddog(settings):
               and 'fail2ban: Banned' not in l]
         out.append(f"restarts.log: {len(ev)} restart/alert line(s) in the recent tail")
         out.extend('  ' + l[:240] for l in ev[-15:])
+        # The weekly repack logs why it failed or skipped here, but a chatty watcher pushes
+        # it out of the last 15 (ops #74: takdbrepack `failed`, reason nowhere in the report).
+        rp = [l for l in lines if 'DB-REPACK:' in l]
+        if rp:
+            out.append(f"last DB-REPACK line(s), {len(rp)} in the recent tail:")
+            out.extend('  ' + l[:240] for l in rp[-3:])
     return out
 
 
