@@ -36537,10 +36537,6 @@ def takportal_use_domain_api():
 
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
-@_records_module_update(  # v10.2.8 W10
-    'takportal',
-    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
-    from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -36666,149 +36662,203 @@ def takportal_control():
                         'message': msg, 'warnings': warnings, 'tak_local': tak_local,
                         'chain_summary': chain_summary})
     elif action == 'update':
-        # v10.1.55: channel-aware, and it no longer pulls a branch.
-        #
-        # This used to be `git pull --rebase` on whatever branch the clone tracked —
-        # a different code path from Deploy, which has pinned to a published release
-        # tag since v10.1.49. On a main-tracking box the button therefore shipped
-        # unreleased TAK Portal code, and the returncode was never checked, so a
-        # checkout that could not fetch at all rebuilt the OLD tree behind a green
-        # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
-        # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
-        # hard 500 with the git error in it.
-        gitr = _takportal_update_git(portal_dir)
-        if not gitr['ok']:
-            return jsonify({'success': False, 'error': gitr['error'],
-                            'channel': gitr['channel']}), 500
-        pull_msg = gitr['message']
-        # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
-        # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
-        # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
-        # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
-        # the build below, never after: "after" means the container comes up exposed and
-        # stays that way until something recreates it. This is also why we do not shell
-        # out to upstream's `./takportal update`, which fuses the checkout and the build.
-        _write_takportal_override()
-        _patch_takportal_compose_ports(portal_dir)
-        for _ep in _takportal_compose_exposed_ports(portal_dir):
-            print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
-        # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
-        # build, not after. Both live under /usr/src/app/data, which is the project's named
-        # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
-        # the CURRENT container is exactly what the NEW containers read on their first boot,
-        # and nothing has to be restarted afterwards. The old order (build, cp, then a
-        # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
-        # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
-        # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
-        # one boot that must not be interrupted. Verified after the build (below), never
-        # assumed. [[takportal-main-postgres-three-container]]
-        settings_synced = False
-        settings_sync_error = ''
-        cloudtak_url = ''
-        settings_json = ''
-        try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            try:
-                cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
-            except Exception:
-                pass
-            # `docker cp` works on a stopped container; it needs SOME container to exist.
-            if _takportal_project_containers(all_states=True):
-                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-                if cp_ok:
-                    settings_synced = True
-                    _takportal_setup_ssh()
-                else:
-                    settings_sync_error = cp_err or 'docker cp failed'
-        except Exception as e:
-            settings_sync_error = str(e)[:300]
-        # v10.1.60 (W4): the recreate at the end of this build takes the web container
-        # down for 10-15 s. Open a window that outlives the build's own timeout; it is
-        # shrunk to a short grace as soon as the route knows the outcome (below).
-        _gd_maintenance_begin('takportal', 900 + 180)
-        # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
-        # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
-        # time out here on a slower box, and TimeoutExpired was not caught, so it
-        # surfaced as an unhandled 500 with no explanation at all.
-        try:
-            build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
-                                   cwd=portal_dir, capture_output=True, text=True, timeout=900)
-        except subprocess.TimeoutExpired:
-            plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
-            print(f'[takportal] update: {plog_msg}', flush=True)
-            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
-            return jsonify({'success': False, 'error': plog_msg}), 500
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
-        if build.returncode != 0:
-            # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
-            # said only "Build failed. Container may have stopped", and nothing was
-            # logged, so the actual reason existed nowhere. On test12 the real message
-            # was one line ("env file .env not found") and it took a manual re-run of
-            # the build to see it. Report what the build actually said, and journal it.
-            err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
-            print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
-            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
-            return jsonify({'success': False,
-                            'error': f'Build failed: {err}',
-                            'hint': 'The previous container may still be running the old version. '
-                                    'Check the container logs, fix the cause, and press Update again.'}), 500
-        # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
-        # them back from the new web container and compare every authoritative key we set.
-        # A miss (no container existed before the build, or a checkout whose data dir is a
-        # bind mount rather than the named volume) is the ONLY case that writes again and
-        # restarts — and that restart is app-services-only (W2): Postgres is never touched.
-        try:
-            _want = json.loads(settings_json) if settings_json else {}
-            _have = _takportal_get_existing_settings() or {}
-            # v10.2.16 (GH #158): and the TAK Server connection keys. These are not ours to change,
-            # but the file was written seconds ago, so if they differ now the file was reset under
-            # us (TAK Portal's template fallback) and the write below puts the operator's file back.
-            _keys = [k for k in sorted(TAKPORTAL_AUTHORITATIVE_KEYS) + ['TAK_URL', 'TAK_API_P12_PATH',
-                     'TAK_API_P12_PASSPHRASE', 'TAK_CA_PATH'] if _want.get(k)]
-            # An unreadable file after a successful pre-build write is a read failure, not
-            # evidence the write was lost — do not restart a booting stack over it.
-            _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
-                      if _have else ([] if settings_synced else list(_keys)))
-            if settings_json and _have == {} and settings_synced:
-                print('[takportal] update: could not read settings.json back from the new web '
-                      'container — leaving the stack alone (pre-build write succeeded)', flush=True)
-            if settings_json and (not settings_synced or _stale):
-                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-                if cp_ok:
-                    settings_synced = True
-                    settings_sync_error = ''
-                    _takportal_setup_ssh()
-                    _takportal_restart()  # app services only — never Postgres (W2)
-                    print('[takportal] update: settings were not on the data volume after the build '
-                          f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
-                          'and restarted the app services', flush=True)
-                else:
-                    settings_sync_error = cp_err or 'docker cp failed'
-        except Exception as e:
-            settings_sync_error = settings_sync_error or str(e)[:300]
-        subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
-        _update_boot_stagger_service()  # v10.1.59: the project may have gained services
-        time.sleep(3)
-        vinfo = _get_takportal_version_info()
-        new_version = vinfo['version'] or ''
-        running = _takportal_web_running()
-        # W4: the build is over — shrink the window to a boot grace (the app itself takes
-        # a few seconds to answer), then Guard Dog's own verdict rules again.
-        _gd_maintenance_begin('takportal', 90 if running else 15)
-        if not running:
-            return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
-        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
-                        'version': new_version, 'settings_synced': settings_synced,
-                        'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
-                        'channel': gitr['channel'], 'ref': gitr['ref'],
-                        'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']})
+        # ops #72: Update runs as a background job and this request returns at once.
+        # It used to BE the update — one request lasting as long as the checkout + image build
+        # (135 s for 1.4.8 -> 2.0.12 on test8). A gateway in front of the console gives up long
+        # before that: Azure Application Gateway's default request timeout is 20 s
+        # (https://learn.microsoft.com/en-us/azure/application-gateway/configuration-http-settings#request-timeout).
+        # On CORAZ (2026-10-17) the page therefore said "Update failed" over a portal that had
+        # already come up on the new release. The page polls /api/takportal/update/status.
+        with _TAKPORTAL_UPDATE_LOCK:
+            if _takportal_update_job.get('running'):
+                return jsonify({'success': False, 'running': True, 'job': _takportal_update_job.get('id'),
+                                'error': 'A TAK Portal update is already running. Wait for it to finish.'}), 409
+            job_id = secrets.token_hex(6)
+            _takportal_update_job.update({'running': True, 'id': job_id, 'result': None, 'code': None})
+        threading.Thread(target=_takportal_update_worker, args=(portal_dir, job_id), daemon=True).start()
+        return jsonify({'success': True, 'started': True, 'job': job_id, 'action': action}), 202
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
     running = _takportal_web_running()
     return jsonify({'success': True, 'running': running, 'action': action})
+
+
+# ops #72: TAK Portal Update as a background job (see the 'update' branch of takportal_control()).
+# One job at a time; its response stays here for the page to read until the next update starts.
+_TAKPORTAL_UPDATE_LOCK = threading.Lock()
+_takportal_update_job = {'running': False, 'id': '', 'result': None, 'code': None}
+
+
+def _takportal_update_worker(portal_dir, job_id):
+    """Thread target: run the update, then publish its response for /api/takportal/update/status."""
+    try:
+        result, code = _takportal_run_update(portal_dir)
+    except Exception as e:
+        # _records_module_update has already recorded the failure; the page needs it too.
+        result, code = {'success': False, 'error': f'{type(e).__name__}: {e}'[:300]}, 500
+    with _TAKPORTAL_UPDATE_LOCK:
+        if _takportal_update_job.get('id') == job_id:
+            _takportal_update_job.update({'running': False, 'result': result, 'code': code})
+
+
+@_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
+    'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
+def _takportal_run_update(portal_dir):
+    """The TAK Portal Update itself. Returns (response dict, HTTP code), never a Flask response:
+    it runs on a worker thread, outside any request context."""
+    # v10.1.55: channel-aware, and it no longer pulls a branch.
+    #
+    # This used to be `git pull --rebase` on whatever branch the clone tracked —
+    # a different code path from Deploy, which has pinned to a published release
+    # tag since v10.1.49. On a main-tracking box the button therefore shipped
+    # unreleased TAK Portal code, and the returncode was never checked, so a
+    # checkout that could not fetch at all rebuilt the OLD tree behind a green
+    # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
+    # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
+    # hard 500 with the git error in it.
+    gitr = _takportal_update_git(portal_dir)
+    if not gitr['ok']:
+        return {'success': False, 'error': gitr['error'],
+                'channel': gitr['channel']}, 500
+    pull_msg = gitr['message']
+    # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
+    # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
+    # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
+    # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
+    # the build below, never after: "after" means the container comes up exposed and
+    # stays that way until something recreates it. This is also why we do not shell
+    # out to upstream's `./takportal update`, which fuses the checkout and the build.
+    _write_takportal_override()
+    _patch_takportal_compose_ports(portal_dir)
+    for _ep in _takportal_compose_exposed_ports(portal_dir):
+        print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+    # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
+    # build, not after. Both live under /usr/src/app/data, which is the project's named
+    # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
+    # the CURRENT container is exactly what the NEW containers read on their first boot,
+    # and nothing has to be restarted afterwards. The old order (build, cp, then a
+    # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
+    # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
+    # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
+    # one boot that must not be interrupted. Verified after the build (below), never
+    # assumed. [[takportal-main-postgres-three-container]]
+    settings_synced = False
+    settings_sync_error = ''
+    cloudtak_url = ''
+    settings_json = ''
+    try:
+        settings = load_settings()
+        settings_json = _takportal_merged_settings_json(settings)
+        try:
+            cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
+        except Exception:
+            pass
+        # `docker cp` works on a stopped container; it needs SOME container to exist.
+        if _takportal_project_containers(all_states=True):
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
+                settings_synced = True
+                _takportal_setup_ssh()
+            else:
+                settings_sync_error = cp_err or 'docker cp failed'
+    except Exception as e:
+        settings_sync_error = str(e)[:300]
+    # v10.1.60 (W4): the recreate at the end of this build takes the web container
+    # down for 10-15 s. Open a window that outlives the build's own timeout; it is
+    # shrunk to a short grace as soon as the route knows the outcome (below).
+    _gd_maintenance_begin('takportal', 900 + 180)
+    # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
+    # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
+    # time out here on a slower box, and TimeoutExpired was not caught, so it
+    # surfaced as an unhandled 500 with no explanation at all.
+    try:
+        build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
+                               cwd=portal_dir, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+        print(f'[takportal] update: {plog_msg}', flush=True)
+        _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
+        return {'success': False, 'error': plog_msg}, 500
+    _ensure_infratak_network_for_portal()
+    _ensure_infratak_network_for_authentik()
+    if build.returncode != 0:
+        # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
+        # said only "Build failed. Container may have stopped", and nothing was
+        # logged, so the actual reason existed nowhere. On test12 the real message
+        # was one line ("env file .env not found") and it took a manual re-run of
+        # the build to see it. Report what the build actually said, and journal it.
+        err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+        print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+        _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
+        return {'success': False,
+                'error': f'Build failed: {err}',
+                'hint': 'The previous container may still be running the old version. '
+                        'Check the container logs, fix the cause, and press Update again.'}, 500
+    # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
+    # them back from the new web container and compare every authoritative key we set.
+    # A miss (no container existed before the build, or a checkout whose data dir is a
+    # bind mount rather than the named volume) is the ONLY case that writes again and
+    # restarts — and that restart is app-services-only (W2): Postgres is never touched.
+    try:
+        _want = json.loads(settings_json) if settings_json else {}
+        _have = _takportal_get_existing_settings() or {}
+        # v10.2.16 (GH #158): and the TAK Server connection keys. These are not ours to change,
+        # but the file was written seconds ago, so if they differ now the file was reset under
+        # us (TAK Portal's template fallback) and the write below puts the operator's file back.
+        _keys = [k for k in sorted(TAKPORTAL_AUTHORITATIVE_KEYS) + ['TAK_URL', 'TAK_API_P12_PATH',
+                 'TAK_API_P12_PASSPHRASE', 'TAK_CA_PATH'] if _want.get(k)]
+        # An unreadable file after a successful pre-build write is a read failure, not
+        # evidence the write was lost — do not restart a booting stack over it.
+        _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
+                  if _have else ([] if settings_synced else list(_keys)))
+        if settings_json and _have == {} and settings_synced:
+            print('[takportal] update: could not read settings.json back from the new web '
+                  'container — leaving the stack alone (pre-build write succeeded)', flush=True)
+        if settings_json and (not settings_synced or _stale):
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
+                settings_synced = True
+                settings_sync_error = ''
+                _takportal_setup_ssh()
+                _takportal_restart()  # app services only — never Postgres (W2)
+                print('[takportal] update: settings were not on the data volume after the build '
+                      f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
+                      'and restarted the app services', flush=True)
+            else:
+                settings_sync_error = cp_err or 'docker cp failed'
+    except Exception as e:
+        settings_sync_error = settings_sync_error or str(e)[:300]
+    subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
+    _update_boot_stagger_service()  # v10.1.59: the project may have gained services
+    time.sleep(3)
+    vinfo = _get_takportal_version_info()
+    new_version = vinfo['version'] or ''
+    running = _takportal_web_running()
+    # W4: the build is over — shrink the window to a boot grace (the app itself takes
+    # a few seconds to answer), then Guard Dog's own verdict rules again.
+    _gd_maintenance_begin('takportal', 90 if running else 15)
+    if not running:
+        # The controls sit ABOVE the status line this lands in (ops #72: the old text said "below").
+        return {'success': False, 'error': 'Container not running after update — press Start in Controls above.'}, 500
+    return {'success': True, 'running': running, 'action': 'update', 'pull': pull_msg,
+            'version': new_version, 'settings_synced': settings_synced,
+            'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
+            'channel': gitr['channel'], 'ref': gitr['ref'],
+            'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']}, 200
+
+
+@app.route('/api/takportal/update/status')
+@login_required
+def takportal_update_status():
+    """ops #72: where the background Update stands. `last` is the recorded outcome — all that is
+    left when the console restarted mid-update (the in-memory job is gone; `last` says 'interrupted')."""
+    with _TAKPORTAL_UPDATE_LOCK:
+        job = dict(_takportal_update_job)
+    return jsonify({'running': bool(job.get('running')), 'job': job.get('id') or '',
+                    'result': job.get('result'), 'code': job.get('code'),
+                    'last': _mod_result_last('takportal')})
+
 
 @app.route('/api/takportal/deploy', methods=['POST'])
 @login_required
