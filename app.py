@@ -30213,6 +30213,26 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+# A CA name is both the CA's CN and a filename under /opt/tak/certs/files, so it gets a
+# stricter set than _sanitize_cert_field. Underscores are the trap: `_` is not a
+# PrintableString char, so under our string_mask=nombstr openssl encodes the CA's CN as
+# T61String, while TAK's Java signer writes the issuer of every enrolled client cert as
+# UTF8String. Java's path builder compares the encodings, never matches, and rejects
+# every enrolled device on 8089 ("peer not verified") — while openssl-made certs (admin)
+# still work. Field case: ROOT_CA_03 / INTERMEDIATE_CA_03, GH #128.
+_CA_NAME_RE = _re_module.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$')
+
+
+def _validate_ca_name(value, field_name):
+    """Return the stripped CA name, or raise ValueError if it can't be used as a TAK CA name."""
+    value = (value or '').strip()
+    if not _CA_NAME_RE.match(value):
+        raise ValueError(f'{field_name} "{value}" is not allowed — use only letters, numbers, '
+                         f'hyphens and dots (e.g. INTERMEDIATE-CA-01), no underscores or spaces, '
+                         f'up to 64 characters')
+    return value
+
+
 # v10.2.8 W11a/b — the cert-subject variables makeCert.sh needs from cert-metadata.sh.
 _CERT_META_VARS = ('COUNTRY', 'STATE', 'CITY', 'ORGANIZATION', 'ORGANIZATIONAL_UNIT')
 _CERT_META_REQUIRED = ('STATE', 'CITY', 'ORGANIZATIONAL_UNIT')   # what makeCert.sh refuses without
@@ -35540,6 +35560,28 @@ def _takportal_stale_address_fields(settings, existing=None, built=None):
     return out
 
 
+# v10.2.20 — keys the operator's "Turn Portal login back on" button may adopt. TAK Portal's own
+# settings.example.json ships PORTAL_AUTH_ENABLED="false", and with that TAK Portal treats every
+# visitor as a bootstrap GLOBAL ADMIN (services/portalAuth.middleware.js). A GH #158 reset left
+# portals there, and the merge rightly never touches it on its own — "false" is a value an
+# operator can choose. So we only surface it, and write it only on the operator's click.
+# PORTAL_AUTH_REQUIRED_GROUP is not adopted: the reset blanked it, and blank keys already seed.
+TAKPORTAL_AUTH_ADOPT_KEYS = ('PORTAL_AUTH_ENABLED',)
+
+
+def _takportal_auth_disabled(settings, existing=None):
+    """True when TAK Portal's login is off on a box where infra-TAK would have turned it on
+    (it has a domain — see _takportal_build_settings_dict), i.e. every signed-in user is a
+    TAK Portal Global admin."""
+    if not (settings.get('fqdn') or '').strip():
+        return False
+    if existing is None:
+        existing = _takportal_get_existing_settings()
+    if not isinstance(existing, dict) or not existing:
+        return False
+    return str(existing.get('PORTAL_AUTH_ENABLED', '')).strip().lower() in ('', 'false', '0', 'no', 'off')
+
+
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
 # EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
@@ -36115,7 +36157,7 @@ def _takportal_merged_settings_json(settings, adopt=()):
 
     v10.2.8 W12: `adopt` — keys the operator explicitly asked to move to this box's domain
     (the "Use the domain" button). Intersected with TAKPORTAL_DOMAIN_KEYS; nothing else passes it."""
-    adopt = frozenset(adopt or ()) & frozenset(TAKPORTAL_DOMAIN_KEYS)
+    adopt = frozenset(adopt or ()) & (frozenset(TAKPORTAL_DOMAIN_KEYS) | frozenset(TAKPORTAL_AUTH_ADOPT_KEYS))
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
@@ -36617,10 +36659,36 @@ def takportal_address_check_api():
     """v10.2.8 W12 — TAK Portal fields still on this server's IP while the box has a domain."""
     settings = load_settings()
     try:
-        fields = _takportal_stale_address_fields(settings)
+        existing = _takportal_get_existing_settings()
+        fields = _takportal_stale_address_fields(settings, existing=existing)
+        auth_off = _takportal_auth_disabled(settings, existing=existing)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200], 'fields': []}), 500
-    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields})
+    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields,
+                    'auth_off': auth_off})
+
+
+@app.route('/api/takportal/enable-auth', methods=['POST'])
+@login_required
+def takportal_enable_auth_api():
+    """v10.2.20 — the operator's one-click recovery for a TAK Portal whose login is off (every
+    signed-in user a Global admin). Writes PORTAL_AUTH_ENABLED through the single merge + single
+    writer as an operator adopt, restarts the app services, and reads it back."""
+    settings = load_settings()
+    if not _takportal_auth_disabled(settings):
+        return jsonify({'success': True, 'message': 'TAK Portal login is already on.'})
+    ok, err = _takportal_write_settings_json(
+        _takportal_merged_settings_json(settings, adopt=TAKPORTAL_AUTH_ADOPT_KEYS))
+    if not ok:
+        return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
+    print("[takportal] enable-auth: PORTAL_AUTH_ENABLED turned back on (operator)", flush=True)
+    restarted = bool(_takportal_restart())
+    after = _takportal_get_existing_settings() or {}
+    verified = not _takportal_auth_disabled(settings, existing=after)
+    group = after.get('PORTAL_AUTH_REQUIRED_GROUP') or ''
+    return jsonify({'success': verified, 'restarted': restarted, 'group': group,
+                    'message': f'TAK Portal login is on. Admin group: {group or "(none set)"}' if verified else '',
+                    'error': '' if verified else 'TAK Portal did not keep the setting — check its Settings page'})
 
 
 @app.route('/api/takportal/use-domain', methods=['POST'])
@@ -70732,9 +70800,10 @@ def takserver_rotate_intca():
     new_ca_name = (data.get('new_ca_name') or '').strip()
     if not new_ca_name:
         return jsonify({'error': 'New CA name is required'}), 400
-    import re
-    if not re.match(r'^[a-zA-Z0-9._-]+$', new_ca_name):
-        return jsonify({'error': 'CA name can only contain letters, numbers, dots, hyphens, underscores'}), 400
+    try:
+        _validate_ca_name(new_ca_name, 'New CA name')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     cert_dir = '/opt/tak/certs/files'
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
@@ -77597,6 +77666,8 @@ def deploy_takserver():
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
                            ('Organizational Unit', 'cert_ou')]:
             _sanitize_cert_field(data.get(key, ''), field)
+        _validate_ca_name(data.get('root_ca_name', 'ROOT-CA-01'), 'Root CA Name')
+        _validate_ca_name(data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'), 'Intermediate CA Name')
     except ValueError as e:
         return jsonify({'error': str(e)[:200]}), 400
     # v10.0.5: TAK's makeRootCa.sh REFUSES to run (cert-gen exit 255) unless these are set,

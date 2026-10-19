@@ -89,6 +89,12 @@
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 {% from '_module_result.html' import last_update_result %}{{ last_update_result('takportal') }}
 </div>
+<div id="portal-auth-card" style="display:none;background:var(--bg-card);border:1px solid var(--red);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div style="font-weight:600;color:var(--red);margin-bottom:8px">&#9888; TAK Portal login is turned off: every signed-in user is a Global admin</div>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">TAK Portal's "Portal authentication" setting is off. With it off, TAK Portal gives full Global admin access to anyone who signs in through Authentik. This usually happens when TAK Portal's settings were reset to its defaults. <b>Press the button</b> to turn it back on. TAK Portal restarts (about 30 seconds); nothing else in it changes.</div>
+<button class="control-btn" id="portal-enable-auth-btn" type="button" style="border-color:var(--red);color:var(--red);font-weight:600">&#128274; Turn Portal login back on</button>
+<span id="portal-enable-auth-msg" style="margin-left:10px;font-size:12px"></span>
+</div>
 <div id="portal-address-card" style="display:none;background:var(--bg-card);border:1px solid var(--yellow);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div style="font-weight:600;color:var(--yellow);margin-bottom:8px">&#9888; TAK Portal needs a fix: it is still using this server's IP address</div>
 <div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">TAK Portal was set up before this server had its domain name, so these settings still point at the IP:</div>
@@ -602,6 +608,8 @@ async function portalAddressCheck(){
     try{
         var r=await fetch('/api/takportal/address-check');
         var d=await r.json();
+        var authCard=document.getElementById('portal-auth-card');
+        if(authCard) authCard.style.display=(d&&d.auth_off)?'block':'none';
         var fields=(d&&d.fields)||[];
         if(!fields.length){card.style.display='none';return;}
         var list=document.getElementById('portal-address-list');
@@ -641,8 +649,29 @@ async function portalUseDomain(){
     }catch(e){msg.style.color='var(--red)';msg.textContent='\u2717 '+e.message;}
     btn.disabled=false;btn.style.opacity='1';
 }
+// v10.2.20 — TAK Portal login off (settings reset to TAK Portal's defaults): every signed-in
+// user is a Global admin. Shown by portalAddressCheck(); written only on this click.
+async function portalEnableAuth(){
+    var btn=document.getElementById('portal-enable-auth-btn');
+    var msg=document.getElementById('portal-enable-auth-msg');
+    btn.disabled=true;btn.style.opacity='0.5';
+    msg.style.color='var(--text-secondary)';msg.textContent='Turning TAK Portal login on and restarting it...';
+    try{
+        var r=await fetch('/api/takportal/enable-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        var d=await r.json();
+        if(d.success){
+            msg.style.color='var(--green)';msg.textContent='✓ '+(d.message||'Done');
+            setTimeout(portalAddressCheck,3000);
+        }else{
+            msg.style.color='var(--red)';msg.textContent='✗ '+(d.error||'Failed');
+        }
+    }catch(e){msg.style.color='var(--red)';msg.textContent='✗ '+e.message;}
+    btn.disabled=false;btn.style.opacity='1';
+}
 (function(){
     var btn=document.getElementById('portal-use-domain-btn');
+    var authBtn=document.getElementById('portal-enable-auth-btn');
+    if(authBtn) authBtn.addEventListener('click',portalEnableAuth);
     if(btn){btn.addEventListener('click',portalUseDomain);portalAddressCheck();}
 })();
 
