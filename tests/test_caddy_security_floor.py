@@ -21,6 +21,10 @@ was mixed (2.11.4 on most boxes, 2.11.7 on one), and the only version gate was
 the 2.7 parse floor, so nothing ever moved a 2.11.4 box. _caddy_lift_to_secure_floor
 does, and console Update, Caddy → Update and the deploy gate all call it.
 
+2.11.6 also added a 1-minute request-body idle timeout that cuts NetBird's quiet
+gRPC streams (measured: a 90 s quiet HTTP/2 body is cut at 60.0 s through 2.11.7,
+completes through 2.11.4 and through 2.11.7 with `read_body_idle -1s`).
+
 app.py cannot be imported in a test, so the helper is cut out of it and run
 against stubs: the code under test is the shipped text.
 """
@@ -50,10 +54,10 @@ class _Box:
     """A fake host: a Caddy version that the package sources can move."""
 
     def __init__(self, version, pm='apt', repo_ok=True, pkg_gives=(2, 11, 7),
-                 fallback_gives=(2, 11, 7), validate=('ok', ''), validate_after_regen=None):
+                 fallback_gives=(2, 11, 7), validate=('ok', '')):
         self.version, self.pm, self.repo_ok = version, pm, repo_ok
         self.pkg_gives, self.fallback_gives = pkg_gives, fallback_gives
-        self.validates = [validate] + ([validate_after_regen] if validate_after_regen else [])
+        self.verdict = validate
         self.calls, self.log = [], []
 
     def run(self, argv, **kw):
@@ -78,9 +82,9 @@ class _Box:
 
     def validate(self, *a, **k):
         self.calls.append(('validate',))
-        return self.validates.pop(0) if len(self.validates) > 1 else self.validates[0]
+        return self.verdict
 
-    def lift(self, restart=True):
+    def lift(self, restart=True, regenerate=True):
         ns = {
             'subprocess': SimpleNamespace(run=self.run, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT),
             '_sudo_wrap': lambda argv: ['sudo'] + list(argv),
@@ -97,7 +101,8 @@ class _Box:
         }
         src = '\n\n'.join(_segment(n) for n in ('_CADDY_MIN_SECURE', '_caddy_lift_to_secure_floor'))
         exec(compile(src, 'app.py:_caddy_lift_to_secure_floor', 'exec'), ns)
-        return ns['_caddy_lift_to_secure_floor'](self.log.append, restart=restart)
+        return ns['_caddy_lift_to_secure_floor'](self.log.append, restart=restart,
+                                                 regenerate=regenerate)
 
     def did(self, name):
         return any(c[0] == name or name in c for c in self.calls)
@@ -170,25 +175,75 @@ def test_still_short_is_said_out_loud_and_not_restarted_into():
     assert box.restarts == []
 
 
-def test_a_caddyfile_the_new_caddy_rejects_is_regenerated_before_restart():
-    box = _Box((2, 11, 4), validate=('bad', 'x'), validate_after_regen=('ok', ''))
+def test_the_caddyfile_is_regenerated_for_the_new_version_before_the_restart():
+    """What the file emits depends on the version (read_body_idle for NetBird)."""
+    box = _Box((2, 11, 4))
     box.lift()
-    assert box.did('generate')
-    assert len(box.restarts) == 1
+    assert box.calls.index(('generate',)) < box.calls.index(('validate',)) \
+        < box.calls.index(box.restarts[0])
 
 
-def test_a_caddyfile_the_new_caddy_still_rejects_is_never_restarted_into():
+def test_a_caddyfile_the_new_caddy_rejects_is_never_restarted_into():
     box = _Box((2, 11, 4), validate=('bad', 'duplicate forward_auth uri'))
     box.lift()
-    assert box.did('generate')
     assert box.restarts == []
     assert any('NOT restarting' in m for m in box.log)
 
 
-def test_restart_false_leaves_restarting_to_the_caller():
+def test_restart_false_regenerates_but_leaves_restarting_to_the_caller():
     box = _Box((2, 11, 4))
     box.lift(restart=False)
+    assert box.did('generate')
     assert box.restarts == [] and not box.did('validate')
+
+
+def test_deploy_mode_touches_neither_the_file_nor_the_service():
+    box = _Box((2, 11, 4))
+    box.lift(restart=False, regenerate=False)
+    assert not box.did('generate') and box.restarts == []
+
+
+def test_no_version_change_means_no_regeneration_and_no_restart():
+    box = _Box((2, 11, 4), pkg_gives=None, fallback_gives=None)
+    box.lift()
+    assert not box.did('generate') and box.restarts == []
+
+
+# ── read_body_idle: Caddy 2.11.6+ cuts quiet gRPC streams (NetBird) after 1 minute ──
+
+def _rbi(version, grpc_streams):
+    ns = {'_caddy_version_tuple': lambda: version}
+    src = '\n\n'.join(_segment(n) for n in ('_CADDY_MIN_READ_BODY_IDLE', '_caddy_read_body_idle_lines'))
+    exec(compile(src, 'app.py:_caddy_read_body_idle_lines', 'exec'), ns)
+    return ns['_caddy_read_body_idle_lines'](grpc_streams)
+
+
+@pytest.mark.parametrize('version', [(2, 11, 6), (2, 11, 7), (2, 12, 0)])
+def test_netbird_boxes_on_2_11_6_and_newer_turn_read_body_idle_off(version):
+    assert '\n'.join(_rbi(version, True)) == (
+        '    servers {\n        timeouts {\n            read_body_idle -1s\n        }\n    }')
+
+
+@pytest.mark.parametrize('version', [(2, 11, 4), (2, 7, 6), ()])
+def test_older_or_unknown_caddy_gets_nothing(version):
+    """2.11.4 rejects the whole file: "unrecognized timeouts option 'read_body_idle'"."""
+    assert _rbi(version, True) == []
+
+
+def test_boxes_without_netbird_keep_the_hardening():
+    assert _rbi((2, 11, 7), False) == []
+
+
+def test_the_global_block_carries_it_and_the_generator_keys_it_off_netbird():
+    assert '_caddy_read_body_idle_lines(grpc_streams)' in _segment('_caddy_global_options_lines')
+    assert "grpc_streams=bool(modules.get('netbird', {}).get('installed'))" in \
+        _segment('generate_caddyfile')
+
+
+def test_boxes_already_on_2_11_6_converge_at_console_start():
+    body = _segment('_startup_migrations')
+    assert body.index('\n            _startup_caddy_read_body_idle_converge()') < \
+        body.index('\n            _startup_caddy_selfheal()')
 
 
 # ── every path that should move a box calls it ───────────────────────────────
@@ -206,5 +261,5 @@ def test_caddy_update_button_lifts_the_box_and_restarts_after():
 
 def test_deploy_lifts_a_caddy_that_was_already_installed():
     body = _segment('run_caddy_deploy')
-    assert '_caddy_lift_to_secure_floor(plog, restart=False)' in body
+    assert '_caddy_lift_to_secure_floor(plog, restart=False, regenerate=False)' in body
     assert body.index('_caddy_lift_to_secure_floor(') < body.index('Step 4/4')
