@@ -31780,10 +31780,11 @@ def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
         return before, before
     _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
     if _pkg_mgr() == 'dnf':
-        r = subprocess.run(_sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True, timeout=300)
-        if r.returncode != 0:
-            _log(f'  dnf upgrade caddy failed: {(r.stdout or "").strip()[-200:]}')
+        # Through the shim (Dependency Rule), so this is `dnf install`, which may or may not
+        # move an installed Caddy to the COPR's newest build. Either way the version is
+        # re-read below and anything still short gets the static build.
+        _pkg_install(['caddy'], log_fn=_log, timeout=300)
+        _caddy_version_cache['ver'] = None
         if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
             _log('  the COPR has no new enough Caddy — installing the official static build')
             _caddy_install_official_static(_log)
@@ -34255,8 +34256,9 @@ def run_caddy_deploy(domain):
                 _caddy_install_official_static(plog)
             _cv = _caddy_version_tuple(refresh=True)
         if _cv and _cv < _CADDY_MIN_SECURE:
-            # A box that already had Caddy keeps it through Step 1 (dnf install is a no-op on an
-            # installed package), so lift it to the security floor too. Step 4 restarts Caddy.
+            # A box that already had Caddy may keep it through Step 1 (the package step can
+            # leave an installed Caddy where it is), so lift it to the security floor too.
+            # Step 2 regenerates the Caddyfile and Step 4 restarts Caddy.
             _caddy_lift_to_secure_floor(plog, restart=False, regenerate=False)
             _cv = _caddy_version_tuple(refresh=True)
         if not _cv:

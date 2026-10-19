@@ -62,8 +62,6 @@ class _Box:
 
     def run(self, argv, **kw):
         self.calls.append(tuple(argv))
-        if tuple(argv[-4:]) == ('dnf', 'upgrade', '-y', 'caddy') and self.pkg_gives:
-            self.version = max(self.version, self.pkg_gives)
         return SimpleNamespace(returncode=0, stdout='', stderr='')
 
     def pkg_install(self, pkgs, **kw):
@@ -157,7 +155,7 @@ def test_apt_falls_back_when_the_repo_is_behind():
 def test_dnf_lifts_from_the_copr():
     box = _Box((2, 11, 4), pm='dnf')
     assert box.lift()[1] == (2, 11, 7)
-    assert ('sudo', 'dnf', 'upgrade', '-y', 'caddy') in box.calls
+    assert ('pkg_install', 'caddy') in box.calls
     assert not box.did('static')
     assert not box.did('ensure_repo')
 
