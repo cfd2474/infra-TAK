@@ -1073,7 +1073,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.18-alpha"
+VERSION = "10.2.19-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -8706,6 +8706,7 @@ def _diag_section_takportal(settings):
     out.extend('  ' + l[:260] for l in hits[-20:])
     # v10.2.8 W12: the addresses Portal uses for TAK, its own links and Authentik — the bcg-tak
     # report could not show that Portal was still on the server's IP.
+    existing = {}
     try:
         existing = _takportal_get_existing_settings() or {}
         out.append('addresses: ' + ', '.join(f"{k}={existing.get(k) or '(unset)'}" for k in TAKPORTAL_DOMAIN_KEYS))
@@ -8715,6 +8716,66 @@ def _diag_section_takportal(settings):
                        + ', '.join(f"{f['key']} (should be {f['suggested']})" for f in stale))
     except Exception as e:
         out.append(f'addresses: could not read ({str(e)[:100]})')
+    out.extend(_diag_takportal_authentik(settings, existing))
+    return out
+
+
+def _diag_takportal_token_state(token, infratak_token):
+    """'BLANK' / 'TEMPLATE PLACEHOLDER' / 'set (N chars, …)' for Portal's AUTHENTIK_TOKEN.
+    Never the value — only its length and whether it equals the token infra-TAK would push."""
+    t = str(token or '').strip()
+    if not t:
+        return 'BLANK'
+    if t == TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_TOKEN']:
+        return 'TEMPLATE PLACEHOLDER'
+    if not infratak_token:
+        same = "infra-TAK's Authentik .env has no token to compare"
+    elif hmac.compare_digest(t, infratak_token):
+        same = "same as infra-TAK's Authentik token"
+    else:
+        same = "DIFFERENT from infra-TAK's Authentik token"
+    return f'set ({len(t)} chars, {same})'
+
+
+def _diag_takportal_authentik(settings, existing):
+    """ops #71: TAK Portal's side of every Authentik write — the URL and token it calls with,
+    and its authentik_outbox queue, whose last_error is the real Authentik error behind
+    "Authentik operation failed and remains queued for retry". Read-only SELECTs."""
+    out = []
+    raw_url = str((existing or {}).get('AUTHENTIK_URL') or '').strip()
+    try:
+        p = urllib.parse.urlsplit(raw_url)
+        url = f'{p.scheme}://{p.hostname}{":" + str(p.port) if p.port else ""}' if p.hostname else raw_url
+    except ValueError:
+        url = raw_url
+    if raw_url == TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_URL']:
+        url += '  <-- TAK Portal template placeholder'
+    infratak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                      or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
+    out.append(f"authentik as TAK Portal calls it: AUTHENTIK_URL={url or '(unset)'}  "
+               f"AUTHENTIK_TOKEN={_diag_takportal_token_state((existing or {}).get('AUTHENTIK_TOKEN'), infratak_token)}")
+    db = next((c['name'] for c in _takportal_project_containers() if c['service'] == 'postgres'),
+              'tak-portal-postgres')
+
+    def q(sql):
+        return _diag_cmd(['docker', 'exec', db, 'psql', '-U', 'takportal', '-d', 'takportal',
+                          '-tA', '-F', '|', '-c', sql])
+    count = q('SELECT count(*) FROM authentik_outbox')
+    if not count.strip().isdigit():
+        out.append(f'authentik_outbox: could not read ({count.strip()[:160] or "no output"})')
+        return out
+    out.append(f'authentik_outbox: {count.strip()} queued row(s) (0 = every Authentik write applied)')
+    rows = q("SELECT id, kind, attempts, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI'), "
+             "regexp_replace(coalesce(last_error, ''), '\\s+', ' ', 'g') "
+             "FROM authentik_outbox ORDER BY id DESC LIMIT 5")
+    for ln in rows.splitlines():
+        f = ln.split('|', 4)
+        if len(f) == 5:
+            out.append(f"  id={f[0]} {f[1]} attempts={f[2]} queued {f[3]} UTC  "
+                       f"last_error: {f[4][:240] or '(none yet)'}")
+    # A row that fails 20 times is dead-lettered: deleted, its error kept only here.
+    dead = q("SELECT regexp_replace(coalesce(last_error, ''), '\\s+', ' ', 'g') FROM directory_sync WHERE id = 1").strip()
+    out.append(f"directory_sync last_error: {dead[:300] or '(none)'}")
     return out
 
 
@@ -8757,6 +8818,12 @@ def _diag_section_guarddog(settings):
               and 'fail2ban: Banned' not in l]
         out.append(f"restarts.log: {len(ev)} restart/alert line(s) in the recent tail")
         out.extend('  ' + l[:240] for l in ev[-15:])
+        # The weekly repack logs why it failed or skipped here, but a chatty watcher pushes
+        # it out of the last 15 (ops #74: takdbrepack `failed`, reason nowhere in the report).
+        rp = [l for l in lines if 'DB-REPACK:' in l]
+        if rp:
+            out.append(f"last DB-REPACK line(s), {len(rp)} in the recent tail:")
+            out.extend('  ' + l[:240] for l in rp[-3:])
     return out
 
 
