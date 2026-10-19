@@ -50389,6 +50389,17 @@ def _nodered_port_holders_as_conflicts(port=1880):
     return out
 
 
+# SECURITY: the old `nodered/node-red:4.0` tag is frozen at Node-RED 4.0.9 on Node.js 20
+# (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
+# 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
+# fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
+# 4.1.16-22 = Node-RED 4.1.16 on Node 22 (2026-10-08), amd64 + arm64. Exact tag on
+# purpose: the plain `4.1` tag is stale and there is no bare `4.1.16`. Fresh deploys
+# write it, and Update moves every existing box onto it (_auto_nodered).
+NODERED_IMAGE = 'nodered/node-red:4.1.16-22'
+_NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
     """Plain-English consequence of a foreign listener on 1880, for the deploy log.
 
@@ -50603,9 +50614,9 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
     # Port binding is 0.0.0.0:1880 for remote so Caddy on the console can reach it via
     # reverse_proxy. UFW source-scopes this to the console IP only (see below).
-    compose_yml = """services:
+    compose_yml = f"""services:
   node-red:
-    image: nodered/node-red:4.0
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -50867,8 +50878,8 @@ def run_nodered_deploy():
         with open(compose_yml, 'w') as f:
             f.write(f"""services:
   node-red:
-    # Pinned to Node-RED 4.0.x (minor pin — gets patches, no major-version drift).
-    image: nodered/node-red:4.0
+    # Pinned to an exact Node-RED tag (NODERED_IMAGE) — no drift between boxes.
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -88717,9 +88728,16 @@ def _post_update_auto_deploy():
                         # Phase 2 hardening — pin image (drop :latest), add cap_drop / no-new-privileges /
                         # mem_limit / user / restart / env_file. Idempotent string-level patches that
                         # respect any operator overrides already in place.
-                        if 'image: nodered/node-red:latest' in content:
-                            content = content.replace('image: nodered/node-red:latest', 'image: nodered/node-red:4.0')
-                            print("Post-update: Node-RED image pinned to 4.0 (was :latest)")
+                        # Every box converges on NODERED_IMAGE (the same tag a Redeploy
+                        # writes) — :latest, the old 4.0 pin, or any other tag.
+                        _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
+                        _nr_img_changed = bool(_nr_img_m) and \
+                            _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
+                        if _nr_img_changed:
+                            content = _NODERED_IMAGE_LINE_RE.sub(
+                                lambda m: m.group(1) + NODERED_IMAGE, content, count=1)
+                            print(f"Post-update: Node-RED image → {NODERED_IMAGE} "
+                                  f"(was {_nr_img_m.group(0).strip()[len('image:'):].strip()})")
                         if 'restart:' not in content and 'container_name: nodered' in content:
                             content = content.replace(
                                 'container_name: nodered\n',
@@ -88766,6 +88784,14 @@ def _post_update_auto_deploy():
                                     print("Post-update: Node-RED .env file created (empty scaffold)")
                                 except Exception as ee:
                                     print(f"Post-update: Node-RED .env create warning: {ee}")
+                            if _nr_img_changed:
+                                # Pull on its own budget first: `up -d`'s 120 s cannot fit a
+                                # ~200 MB download on a slow link (see _docker_compose_pull).
+                                # On failure `up -d` below retries the pull and, if that fails
+                                # too, leaves the running container alone.
+                                if not _docker_compose_pull(None, nr_dir, lambda m: print(f"Post-update: {m}"),
+                                                            label='Node-RED image'):
+                                    print("Post-update: Node-RED image pull failed — Update Now again retries it")
                             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=nr_dir, capture_output=True, text=True, timeout=120)
                             print("Post-update: Node-RED recreated (compose patch)")
                         _nodered_malware_scan()
@@ -89378,9 +89404,39 @@ def _post_update_auto_deploy():
                 except Exception as _rake:
                     print(f"Post-update: remote Authentik hardening error (non-fatal): {_rake}")
 
+            def _auto_nodered_image_remote():
+                """Move a remote Node-RED onto NODERED_IMAGE, same as _auto_nodered does
+                locally. No-op unless Node-RED is deployed remote, and no recreate when
+                the remote compose is already on the pin."""
+                try:
+                    _nr_cfg = _get_module_deployment_config(load_settings(), 'nodered_deployment')
+                    if not _nr_cfg or _nr_cfg.get('target_mode') != 'remote':
+                        return
+                    if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
+                        return
+                    _cmd = (
+                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+                        'docker compose pull --quiet 2>&1 && '
+                        'docker compose up -d 2>&1'
+                    )
+                    print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
+                    _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
+                    for _line in (_out or '').strip().splitlines()[:10]:
+                        print(f"  remote-nr: {_line}")
+                    if not _ok:
+                        print("Post-update: remote Node-RED image move failed (non-fatal) — Update Now again retries it")
+                except Exception as _rnre:
+                    print(f"Post-update: remote Node-RED image error (non-fatal): {_rnre}")
+
             _auto_authentik_ports()
             _auto_authentik_ports_remote()
             _auto_nodered()
+            _auto_nodered_image_remote()
             _auto_harden_containers()
 
             # v0.9.25 hotfix: synchronous webadmin role re-assert after the YAML
