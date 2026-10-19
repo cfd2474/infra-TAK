@@ -35579,7 +35579,9 @@ def _takportal_auth_disabled(settings, existing=None):
         existing = _takportal_get_existing_settings()
     if not isinstance(existing, dict) or not existing:
         return False
-    return str(existing.get('PORTAL_AUTH_ENABLED', '')).strip().lower() in ('', 'false', '0', 'no', 'off')
+    # Read it the way TAK Portal does (getBool in services/env.js): only 1/true/yes/on is on.
+    # Anything else, blank or a value it doesn't recognise (" true", "enabled"), falls back to off.
+    return str(existing.get('PORTAL_AUTH_ENABLED', '')).lower() not in ('1', 'true', 'yes', 'on')
 
 
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
