@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.18-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.18-alpha)**
+**Current release: [v10.2.19-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.19-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.19-alpha — 2026-10-18 — Two-server Guard Dog stops false DB alerts and log spam; Online Compact works on container TAK; Diagnostics show TAK Portal's Authentik state
+
+**Headline: on a two-server install Guard Dog now checks the database TAK Server actually uses, so the false "mgmt channel degraded" every 2 minutes and the restarts.log flood stop, and the weekly database repack no longer leaves `takdbrepack.service` failed; Online Compact can install pg_repack on container-mode TAK; the Diagnostics report shows TAK Portal's Authentik URL, token state and pending Authentik writes.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.19-alpha))
+
+**Two-server Guard Dog.** The remote-DB watcher ran `pg_isready` on the database host without a host or port, so it could ask a different PostgreSQL cluster than TAK Server's and report "mgmt channel degraded" while TAK's database was fine. It now probes the database TAK uses (falling back to the local socket on that port), and a restart still needs both to give no response. restarts.log gets one line when the state changes, once per alert window, and one "healthy again" line, instead of a line every run. The weekly repack on a two-server box uses `sudo` for a non-root SSH user, reads the PostgreSQL version from the server rather than the newest client, and when pg_repack can't be installed the weekly run now skips cleanly instead of leaving the unit failed. Online Compact still fails loudly with the reason. The Diagnostics Guard Dog section shows the latest repack lines.
+
+**Online Compact on container-mode TAK.** The TAK database container runs as `postgres`, so the pg_repack install inside it was refused and logged as "not available on this platform". It now installs as root inside the container (psql and pg_repack still run as postgres), and an install refused for lack of root is reported as that.
+
+**Diagnostics: TAK Portal and Authentik.** When a TAK Portal group change fails with "Authentik operation failed and remains queued for retry", the TAK Portal section now shows the Authentik URL TAK Portal calls, whether its token is blank, still the template placeholder, or different from infra-TAK's (the token itself is never printed), the queued Authentik writes with their last error, and the directory sync error.
 
 ### v10.2.18-alpha — 2026-10-17 — TAK Portal group changes work again on boxes left on template settings; TAK Portal Update no longer shows a false failure behind a gateway
 
