@@ -32115,6 +32115,12 @@ def _startup_caddy_read_body_idle_converge():
     if not (s.get('fqdn') or '').strip():
         return
     generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        # Startup migrations run before the module registry loads, so the write is deferred
+        # to the one catch-up regen + reload in _caddy_registry_loaded(). Seen on test6.
+        print('Startup migration: read_body_idle for NetBird queued — written with the '
+              'post-registry Caddyfile regen', flush=True)
+        return
     try:
         if 'read_body_idle' not in _read_priv(CADDYFILE_PATH):
             print('Startup migration: ⚠ read_body_idle converge FAILED — the regenerated '
