@@ -70792,6 +70792,35 @@ def takserver_ca_info():
 rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
+
+def _rotate_client_cert_names(cert_dir, skip=()):
+    """Client certs Rotate Intermediate CA re-issues: each NAME.p12 that is not CA material.
+
+    makeCert.sh `ca` leaves NAME.crl, truststore-NAME.jks and NAME-signing.p12 behind for
+    every intermediate ever made, so a box rotated N times holds INT-CA-01..0N and their
+    -signing keystores. Matching only the old/new CA names re-issued all of those as client
+    certs, which appends a non-CA private key to the live enrollment signing keystore that
+    CoreConfig's TAKServerCAConfig points at (ops #82, seen on test8 after nine rotations).
+    """
+    files = os.listdir(cert_dir)
+    cas = {'takserver', 'root-ca', 'ca'} | {s.lower() for s in skip if s}
+    for f in files:
+        if f.endswith('.crl'):
+            cas.add(f[:-4].lower())
+        elif f.startswith('truststore-') and f.endswith('.jks'):
+            cas.add(f[len('truststore-'):-4].lower())
+    names = []
+    for f in sorted(files):
+        if not f.endswith('.p12') or f.startswith('truststore-'):
+            continue
+        name = f[:-4]
+        low = name.lower()
+        if low in cas or (low.endswith('-signing') and low[:-len('-signing')] in cas):
+            continue
+        names.append(name)
+    return names
+
+
 @app.route('/api/takserver/rotate-intca', methods=['POST'])
 @login_required
 def takserver_rotate_intca():
@@ -70921,14 +70950,8 @@ def takserver_rotate_intca():
             log("")
             log("Step 4/7: Regenerating all client certificates...")
             run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
-            skip = {'takserver', 'root-ca', 'ca', old_ca_name.lower(), new_ca_name.lower()}
             regen_count = 0
-            for f in sorted(os.listdir(cert_dir)):
-                if not f.endswith('.p12'):
-                    continue
-                name = f[:-4]
-                if name.lower() in skip or name.startswith('truststore-'):
-                    continue
+            for name in _rotate_client_cert_names(cert_dir, skip=(old_ca_name, new_ca_name)):
                 log(f"  Regenerating: {name}")
                 run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh client {name} 2>&1')
                 regen_count += 1
