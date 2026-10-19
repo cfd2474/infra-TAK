@@ -28429,11 +28429,16 @@ def caddy_update():
                 _ok = _caddy_install_github_deb(_gh_log.append)
                 r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
-            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
                 _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Package source short of the security floor (COPR lagging, Cloudsmith down): take the
+        # fallback build. Also covers the old < 2.7 static lift on dnf. We restart below.
+        _lift_log = []
+        _caddy_lift_to_secure_floor(_lift_log.append, restart=False)
+        if _lift_log:
+            r.stdout = ((r.stdout or '').rstrip() + '\n' + '\n'.join(_lift_log)).strip()
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
@@ -31583,6 +31588,15 @@ _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 # loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
 # fails the handshake (same measurement).
 _CADDY_MIN_TRUST_POOL = (2, 8)
+# Security floor, separate from the parse floor above: every Caddy below it carries published
+# advisories that reach the forward_auth + reverse_proxy vhosts this console writes for every
+# SSO-protected service. Caddy is not pinned (apt repo / COPR / static fallback), so a box
+# stays on whatever it got at install time unless something moves it — console Update
+# (_startup_caddy_selfheal), Caddy → Update and the deploy gate all lift it to this.
+# 2.11.7, not 2.11.6: 2.11.6's new idle timeouts crashed HTTP/2 proxying and cut streams.
+# Verified 2026-10-19: Cloudsmith apt and the @caddy/caddy COPR (epel-9 x86_64 + aarch64)
+# both carry 2.11.7.
+_CADDY_MIN_SECURE = (2, 11, 7)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31712,6 +31726,66 @@ def _caddy_install_official_static(plog=None):
         except OSError:
             pass
         _caddy_version_cache['ver'] = None
+
+
+def _caddy_lift_to_secure_floor(log_fn=None, restart=True):
+    """Move an installed Caddy below _CADDY_MIN_SECURE onto it. Returns (before, after).
+
+    Package manager first, so the binary stays package-managed: apt from the Cloudsmith repo,
+    dnf from the @caddy/caddy COPR. Only when that leaves the box short (repo not serving,
+    COPR lagging) does it fall back to the same sources deploy already uses — the SHA-512
+    checked GitHub .deb on apt, the official static build on dnf. A box with no Caddy, an
+    unreadable version, or one already at the floor is a no-op, so this is safe on every
+    console start.
+
+    restart=True restarts Caddy after a version change, but only once the Caddyfile on disk
+    is confirmed to load under the NEW binary (regenerated once if not). A file the new
+    Caddy rejects is never restarted into — the running process keeps serving its config.
+    Callers that restart Caddy themselves (deploy, Caddy → Update) pass restart=False."""
+    _log = log_fn or (lambda m: None)
+    _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+    before = _caddy_version_tuple(refresh=True)
+    if not before or before >= _CADDY_MIN_SECURE:
+        return before, before
+    _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
+    if _pkg_mgr() == 'dnf':
+        r = subprocess.run(_sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, timeout=300)
+        if r.returncode != 0:
+            _log(f'  dnf upgrade caddy failed: {(r.stdout or "").strip()[-200:]}')
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _log('  the COPR has no new enough Caddy — installing the official static build')
+            _caddy_install_official_static(_log)
+    else:
+        if _caddy_ensure_apt_repo(_log):
+            _pkg_install(['caddy'], log_fn=_log, timeout=300)
+            _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _caddy_install_github_deb(_log)
+    after = _caddy_version_tuple(refresh=True)
+    if not after or after < _CADDY_MIN_SECURE:
+        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(_CADDY_MIN_SECURE)}) — no newer Caddy '
+             'was reachable from this box. Retry with Caddy → Update.')
+    else:
+        _log(f'  ✓ Caddy {_vs(before)} → {_vs(after)}')
+    if not restart or after == before:
+        return before, after
+    verdict, out = _caddy_validate_config()
+    if verdict == 'bad':
+        s = load_settings()
+        if (s.get('fqdn') or '').strip():
+            _log('  Caddyfile does not load under the new Caddy — regenerating it')
+            generate_caddyfile(s)
+            verdict, out = _caddy_validate_config()
+    if verdict == 'bad':
+        _log('  ⚠ the Caddyfile still does not load under the new Caddy — NOT restarting; the '
+             f'running Caddy keeps serving its current config: {(out or "")[-200:]}')
+        return before, after
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=90)
+    _log('  ✓ Caddy restarted on the new version' if r.returncode == 0
+         else f'  ⚠ Caddy restart failed: {(r.stdout or "").strip()[-200:]}')
+    return before, after
 
 
 _caddy_last_validate_error = {'err': '', 'ts': 0.0}
@@ -32092,6 +32166,15 @@ def _startup_caddy_selfheal():
     except Exception as _cvE:
         print('Startup migration: Caddy version floor check error (non-fatal): %s'
               % str(_cvE)[:160], flush=True)
+
+    # Security floor (_CADDY_MIN_SECURE). Rides console Update the same way the 2.7 lift
+    # above does: nothing else moves an unpinned Caddy off the version it was installed at.
+    # No session invalidation here — a box above 2.7 compiles the auth headers correctly.
+    try:
+        _caddy_lift_to_secure_floor(lambda m: print('Startup migration: %s' % m, flush=True))
+    except Exception as _csE:
+        print('Startup migration: Caddy security floor error (non-fatal): %s'
+              % str(_csE)[:160], flush=True)
 
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
@@ -34095,6 +34178,11 @@ def run_caddy_deploy(domain):
             else:
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
                 _caddy_install_official_static(plog)
+            _cv = _caddy_version_tuple(refresh=True)
+        if _cv and _cv < _CADDY_MIN_SECURE:
+            # A box that already had Caddy keeps it through Step 1 (dnf install is a no-op on an
+            # installed package), so lift it to the security floor too. Step 4 restarts Caddy.
+            _caddy_lift_to_secure_floor(plog, restart=False)
             _cv = _caddy_version_tuple(refresh=True)
         if not _cv:
             plog(f"  ⚠ Could not read the Caddy version — treating it as older than {_min_s}. "
