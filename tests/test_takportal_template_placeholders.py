@@ -90,7 +90,8 @@ def _consts(*names):
 def _load(names, ns=None):
     ns = {'json': json} if ns is None else dict({'json': json}, **ns)
     exec(compile(_consts('TAKPORTAL_TEMPLATE_PLACEHOLDERS', 'TAKPORTAL_TEMPLATE_TAK_CONNECTION',
-                         'TAKPORTAL_AUTHORITATIVE_KEYS', 'TAKPORTAL_DOMAIN_KEYS', 'EMAIL_TRANSPORT_KEYS'),
+                         'TAKPORTAL_AUTHORITATIVE_KEYS', 'TAKPORTAL_DOMAIN_KEYS', 'TAKPORTAL_AUTH_ADOPT_KEYS',
+                         'EMAIL_TRANSPORT_KEYS'),
                  'app.py', 'exec'), ns)
     exec(compile('\n\n'.join(_func(n) for n in names), 'app.py', 'exec'), ns)
     return ns
