@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.19-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.19-alpha)**
+**Current release: [v10.2.20-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.20-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.20-alpha — 2026-10-19 — Guard Dog frees disk at the 80% warning; CA names with an underscore are refused; TAK Portal flags login turned off
+
+**Headline: at the 80% disk warning Guard Dog now reclaims all unused Docker build cache and unused images and caps the system journal at 500 MB, so a box no longer sits in the warning while every run reclaims nothing; TAK Deploy and Rotate Intermediate CA refuse CA names with an underscore, which made TAK reject every enrolled device; the TAK Portal page flags login turned off (every signed-in user a Global admin) with a one-click fix.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.20-alpha))
+
+**Guard Dog disk reclaim ([#165](https://github.com/takwerx/infra-TAK/issues/165)).** Between 80% and 85% the hourly reclaim only pruned build cache older than 7 days, and above 85% it left non-dangling cache behind, while young cache, old image tags and an uncapped journal held tens of GB. At 80%+ it now prunes all unused build cache and images no container uses (running or stopped), and vacuums the journal to 500 MB. The image prune waits while Update Now or a compose / pull / build is running. journald gets a fleet-wide 500 MB cap on every run. 70–79% and the 20 GB cache cap are unchanged; volumes, containers and images in use are never touched.
+
+**CA names ([#128](https://github.com/takwerx/infra-TAK/issues/128)).** An underscore isn't a PrintableString character, so a CA named like `INTERMEDIATE_CA_03` was stored in a different string encoding than TAK's signer writes into enrolled client certs, and TAK rejected every enrolled device on 8089 with `peer not verified`. CA names now allow letters, digits, `-` and `.`, checked on TAK Deploy and Rotate Intermediate CA. Affected boxes: rotate the intermediate CA to a hyphenated name; the root can stay.
+
+**TAK Portal login off.** A TAK Portal settings reset to its template turns `PORTAL_AUTH_ENABLED` off, and TAK Portal then treats every signed-in user as a Global admin. The TAK Portal page now shows a red card when that happens on a box with a domain, with a **Turn Portal login back on** button. Nothing else in TAK Portal's settings changes.
 
 ### v10.2.19-alpha — 2026-10-18 — Two-server Guard Dog stops false DB alerts and log spam; Online Compact works on container TAK; Diagnostics show TAK Portal's Authentik state
 
