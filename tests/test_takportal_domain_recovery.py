@@ -73,7 +73,7 @@ def _consts(*names):
                      if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in names for t in n.targets))
 
 
-def _load(names, ns=None, consts=('TAKPORTAL_DOMAIN_KEYS', '_TAKPORTAL_DOMAIN_KEY_INFO',
+def _load(names, ns=None, consts=('TAKPORTAL_DOMAIN_KEYS', '_TAKPORTAL_DOMAIN_KEY_INFO', 'TAKPORTAL_AUTH_ADOPT_KEYS',
                                   'TAKPORTAL_AUTHORITATIVE_KEYS', 'EMAIL_TRANSPORT_KEYS',
                                   'TAKPORTAL_TEMPLATE_PLACEHOLDERS', 'TAKPORTAL_TEMPLATE_TAK_CONNECTION')):
     ns = {} if ns is None else ns
