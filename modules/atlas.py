@@ -3376,6 +3376,26 @@ def _verify_release(dirpath, plog, tag, commit):
     plog(f'  ✓ Signature verified: {tag} signed by {signer}')
 
 
+def _fetch_tag_argv(dirpath, tag):
+    """The one fetch install and update use: this release's tag and nothing else.
+
+    ⚠️ **Not `--tags`.** That pulls every tag on the mirror, and without
+    `--force` git refuses to replace a tag the box already holds ("would
+    clobber existing tag") and exits 1. So one old tag changed upstream, for
+    example re-signed in place, made *every* later Update on a box holding it
+    fail with "git fetch failed", whatever version it was updating to.
+
+    The forced single-tag refspec fetches only what is about to be installed,
+    and lets it replace a stale local copy. That is safe, because a moved tag
+    is no longer trusted for being unchanged: `_verify_release` checks its
+    signature and names, and `_verify_checkout` checks its commit.
+    `--no-tags` stops git following other tags in along with it.
+    """
+    ref = 'refs/tags/' + tag
+    return ['git', '-C', dirpath, 'fetch', '--no-tags', '--depth=1', 'origin',
+            '+%s:%s' % (ref, ref)]
+
+
 def _is_pin_fallback(tag, expected):
     """True for the offline fallback, the one install not checked by signature.
 
@@ -3520,7 +3540,7 @@ def deploy(ctx, job, params):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
             r = subprocess.run(
-                ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
+                _fetch_tag_argv(dirpath, tag),
                 capture_output=True, text=True, timeout=300, env=None,
             )
             if r.returncode != 0:
@@ -3543,7 +3563,17 @@ def deploy(ctx, job, params):
             if signed:
                 # After the clone (there is nothing to check before it), and
                 # before anything in it is built or run.
-                _verify_release(dirpath, plog, tag, expected)
+                try:
+                    _verify_release(dirpath, plog, tag, expected)
+                except RuntimeError:
+                    # ⚠️ Nothing would run it, but an unverified tree should not
+                    # sit in the install directory. `git clone` only accepts an
+                    # empty directory, so everything in it is the clone.
+                    # Through `_rm_priv`, the module's one way to delete.
+                    err = _rm_priv(dirpath, os.path.dirname(dirpath.rstrip('/')))
+                    plog('  ⚠ ' + err if err else
+                         '  Removed the refused clone from ' + dirpath)
+                    raise
         commit = _verify_checkout(ctx, dirpath, plog, tag, expected)
         _write_build_file(dirpath, plog)
         plog('✓ Source in place')
@@ -4913,7 +4943,7 @@ def _run_update(ctx, inst=None):
         # running deployment exactly as it was.
         commit = _channel_commit(_ls_remote(_channel_refs(channel, tag)), channel, tag)
         r = subprocess.run(
-            ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
+            _fetch_tag_argv(dirpath, tag),
             capture_output=True, text=True, timeout=600,
         )
         if r.returncode != 0:

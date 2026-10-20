@@ -98,6 +98,10 @@ class Repo:
         """A tag object signed with `key`, as `git tag -s` with gpg.format=ssh makes it."""
         body = self.path / 'tag-payload'
         body.write_bytes(self.payload(tag, commit, message))
+        # ⚠️ ssh-keygen will not overwrite an existing .sig, and with no
+        # terminal to ask it keeps the old one: a second tag would carry the
+        # first tag's signature.
+        (self.path / 'tag-payload.sig').unlink(missing_ok=True)
         _run('ssh-keygen', '-Y', 'sign', '-n', 'git', '-f', str(key), str(body))
         signature = (self.path / 'tag-payload.sig').read_bytes().replace(b'\r\n', b'\n')
         return self.payload(tag, commit, message) + signature
@@ -228,7 +232,7 @@ def test_the_update_path_checks_everything_before_touching_the_tree():
     source = _body('_run_update', "plog('━━━ Step 2/3")
 
     tip = source.index('_channel_commit(')
-    fetch = source.index("'fetch', '--tags'")
+    fetch = source.index('_fetch_tag_argv(dirpath, tag)')
     signature = source.index('_verify_release(dirpath, plog, tag, commit)')
     discard = source.index("'checkout', '--', '.'")
     checkout = source.index("'checkout', '-f', tag")
@@ -240,7 +244,7 @@ def test_the_update_path_checks_everything_before_touching_the_tree():
 def test_an_install_checks_the_signature_before_it_checks_out_or_builds():
     source = _body('deploy', '# ── 3/7 Configuration')
 
-    fetched = source.index("'fetch', '--tags'")
+    fetched = source.index('_fetch_tag_argv(dirpath, tag)')
     assert fetched < source.index('_verify_release(dirpath, plog, tag, expected)', fetched) \
         < source.index("'checkout', '-f', tag", fetched)
     cloned = source.index("'git', 'clone'")
@@ -283,3 +287,87 @@ def test_the_embedded_keys_are_the_release_and_recovery_keys(monkeypatch):
         listed = subprocess.run(['ssh-keygen', '-l', '-f', '-'], input=key.encode(),
                                 capture_output=True)
         assert listed.returncode == 0, 'not a parseable public key: ' + key
+
+
+# --------------------------------------------------------------------------- #
+# The fetch (review of PR #180)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def box(tmp_path, keys):
+    """A mirror with an old lightweight v1.0.0, and a box that installed it."""
+    source = Repo(tmp_path / 'source')
+    source.git('update-ref', 'refs/tags/v1.0.0', source.commit)
+    mirror = tmp_path / 'mirror.git'
+    _run('git', 'clone', '-q', '--bare', str(source.path), str(mirror))
+    deployed = tmp_path / 'deployed'
+    _run('git', 'clone', '-q', '--depth=1', '--branch', 'v1.0.0',
+         mirror.as_uri(), str(deployed))
+    return source, mirror, deployed
+
+
+def _publish(source, mirror, ref_name, raw):
+    source.place(ref_name, raw)
+    _run('git', '-C', str(source.path), 'push', '-q', '--force', str(mirror),
+         'refs/tags/' + ref_name)
+
+
+def test_an_old_tag_changed_upstream_breaks_the_old_fetch(box, keys):
+    """The reviewer's reproduction, kept as the reason for `_fetch_tag_argv`:
+    `--tags` refuses to clobber v1.0.0, so the update to v1.1.0 fails."""
+    source, mirror, deployed = box
+    _publish(source, mirror, 'v1.0.0', source.signed('v1.0.0', keys['release'][0]))
+    new = source.make_commit('v1.1.0')
+    _publish(source, mirror, 'v1.1.0', source.signed('v1.1.0', keys['release'][0], commit=new))
+
+    old = subprocess.run(['git', '-C', str(deployed), 'fetch', '--tags', '--depth=1',
+                          'origin', 'v1.1.0'], capture_output=True, text=True)
+
+    assert old.returncode != 0 and 'clobber' in old.stderr
+
+
+def test_the_single_tag_fetch_installs_despite_an_old_tag_changed_upstream(box, keys, plog):
+    source, mirror, deployed = box
+    _publish(source, mirror, 'v1.0.0', source.signed('v1.0.0', keys['release'][0]))
+    new = source.make_commit('v1.1.0')
+    _publish(source, mirror, 'v1.1.0', source.signed('v1.1.0', keys['release'][0], commit=new))
+    # Another tag on the same commit: git would follow it in unless told not to.
+    _publish(source, mirror, 'v1.1.0-rc', source.signed('v1.1.0-rc', keys['release'][0], commit=new))
+
+    _run(*atlas._fetch_tag_argv(str(deployed), 'v1.1.0'))
+
+    atlas._verify_release(str(deployed), plog.append, 'v1.1.0', new)
+    tags = _run('git', '-C', str(deployed), 'tag').stdout.decode().split()
+    assert sorted(tags) == ['v1.0.0', 'v1.1.0']
+    assert _run('git', '-C', str(deployed), 'cat-file', '-t', 'refs/tags/v1.0.0') \
+        .stdout.decode().strip() == 'commit', 'other tags must be left alone'
+
+
+def test_a_moved_tag_is_fetched_and_then_caught(box, keys, plog):
+    """Forcing the one tag means a moved tag replaces the local copy; the
+    signature check is what refuses it, which is the point."""
+    source, mirror, deployed = box
+    first = source.make_commit('v1.1.0')
+    _publish(source, mirror, 'v1.1.0', source.signed('v1.1.0', keys['release'][0], commit=first))
+    _run(*atlas._fetch_tag_argv(str(deployed), 'v1.1.0'))
+
+    moved = source.make_commit('something else')
+    _publish(source, mirror, 'v1.1.0', source.signed('v1.1.0', keys['stranger'][0], commit=moved))
+    _run(*atlas._fetch_tag_argv(str(deployed), 'v1.1.0'))
+
+    with pytest.raises(RuntimeError, match='not by a trusted ATLAS release key'):
+        atlas._verify_release(str(deployed), plog.append, 'v1.1.0', moved)
+
+
+def test_install_and_update_fetch_the_same_way():
+    assert MODULE.count('_fetch_tag_argv(dirpath, tag),') == 2
+    assert "'fetch', '--tags'" not in MODULE
+
+
+def test_a_refused_clone_is_removed():
+    source = _body('deploy', '# ── 3/7 Configuration')
+    cloned = source[source.index("'git', 'clone'"):]
+    refused = cloned[cloned.index('_verify_release(dirpath, plog, tag, expected)'):]
+    assert refused.index('except RuntimeError:') < refused.index('_rm_priv(dirpath') \
+        < refused.index('raise\n')
