@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.20-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.20-alpha)**
+**Current release: [v10.2.21-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.21-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.21-alpha — 2026-10-19 — Security release: CloudTAK video, TAK Video Restreamer, Caddy, WebODM and Node-RED updates; Rotate Intermediate CA leaves CA files alone
+
+**Headline: CloudTAK video moves to media-infra 9.12.1 (MediaMTX 1.21.2), fixing a critical MediaMTX hole; TAK Video Restreamer moves to MediaMTX 1.21.2 on a pinned source and publishing now needs a login; every box is lifted to Caddy 2.11.7 or newer; WebODM's broker moves off end-of-life redis 7.0.10 and the WebODM images are pinned; Node-RED moves to 4.1.16 on Node.js 22; Rotate Intermediate CA no longer re-issues CA signing keystores as client certs.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.21-alpha))
+
+**CloudTAK video.** The media container moves from `media-infra` v9.11.0 (MediaMTX 1.20.0) to v9.12.1 (MediaMTX 1.21.2). Existing boxes move on their own at the console restart after Update Now.
+
+**TAK Video Restreamer.** MediaMTX in the TVR image is now v1.21.2, checksum-verified, and the upstream source is pinned to a fixed commit. Publishing (RTSP, RTMP, SRT) now needs the `publish` login shown on the TVR page; viewing stays open. Existing installs get a "Security update available" banner: run **Update Now**, then add the publish login to each camera, drone or encoder.
+
+**Caddy.** New minimum Caddy 2.11.7. Console Update, Caddy → Update and deploy lift older boxes onto it from the package source, and Caddy is restarted only after the new binary accepts the config. Boxes with NetBird keep their gRPC streams open past Caddy 2.11.6's new 60-second idle cut.
+
+**WebODM.** The broker moves from redis 7.0.10 (end of life) to 8.10.2 at the next console restart. The WebODM images are pinned (WebODM 3.3.1, NodeODX 2.4.0); WebODM's Update now installs the pins instead of `:latest`.
+
+**Node-RED.** `nodered/node-red:4.0` (Node.js 20, end of life) → `4.1.16-22` (Node.js 22). Update Now moves existing boxes; configurator configs are kept.
+
+**Rotate Intermediate CA.** A box rotated several times had every old `INT-CA-NN-signing` keystore re-issued as a client cert, including the live enrollment signing keystore. Rotate now re-issues only real client certs.
 
 ### v10.2.20-alpha — 2026-10-19 — Guard Dog frees disk at the 80% warning; CA names with an underscore are refused; TAK Portal flags login turned off
 
