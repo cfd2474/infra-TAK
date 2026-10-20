@@ -27230,7 +27230,30 @@ def _caddy_acme_inner_lines(cfg=None):
     return out
 
 
-def _caddy_global_options_lines(cfg=None):
+def _caddy_read_body_idle_lines(grpc_streams):
+    """Turn off Caddy's request-body idle timeout when the box proxies long-lived gRPC streams.
+
+    Caddy 2.11.6 added a default 1-minute `read_body_idle`: a request body that makes no
+    progress for a minute gets the connection aborted. A bidirectional gRPC stream whose
+    client has nothing to say is exactly that — NetBird's signal and management streams
+    over `reverse_proxy h2c://`. Measured with the official builds, 2026-10-19: a 90 s quiet
+    HTTP/2 request body through 2.11.7 is cut at 60.0 s ("reading: i/o timeout"); the same
+    stream through 2.11.4, or through 2.11.7 with `read_body_idle -1s`, completes. HTTP/1.1
+    WebSockets (WebTAK, CloudTAK) are not affected and need nothing.
+
+    The per-route `timeouts` directive cannot lengthen it — the server-wide value takes
+    precedence (https://caddyserver.com/docs/caddyfile/directives/timeouts) — so this is the
+    server-wide option, emitted only on boxes with NetBird so every other box keeps the
+    hardening. Fails closed: an older or unknown Caddy rejects the whole file on an unknown
+    subdirective, so nothing is emitted unless Caddy is KNOWN to be >= 2.11.6."""
+    v = _caddy_version_tuple()
+    if not (grpc_streams and v and v >= _CADDY_MIN_READ_BODY_IDLE):
+        return []
+    return ['    servers {', '        timeouts {', '            read_body_idle -1s',
+            '        }', '    }']
+
+
+def _caddy_global_options_lines(cfg=None, grpc_streams=False):
     """The Caddyfile global options block. ALWAYS emitted, on every box.
 
     v10.1.50 — grace_period is the fix for a reload that hangs forever. Caddy's default
@@ -27251,6 +27274,7 @@ def _caddy_global_options_lines(cfg=None):
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
     out += _caddy_acme_inner_lines(cfg)
+    out += _caddy_read_body_idle_lines(grpc_streams)
     out.append('}')
     out.append('')
     return out
@@ -28429,11 +28453,16 @@ def caddy_update():
                 _ok = _caddy_install_github_deb(_gh_log.append)
                 r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
-            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
                 _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Package source short of the security floor (COPR lagging, Cloudsmith down): take the
+        # fallback build. Also covers the old < 2.7 static lift on dnf. We restart below.
+        _lift_log = []
+        _caddy_lift_to_secure_floor(_lift_log.append, restart=False)
+        if _lift_log:
+            r.stdout = ((r.stdout or '').rstrip() + '\n' + '\n'.join(_lift_log)).strip()
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
@@ -31583,6 +31612,17 @@ _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 # loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
 # fails the handshake (same measurement).
 _CADDY_MIN_TRUST_POOL = (2, 8)
+# Security floor, separate from the parse floor above: every Caddy below it carries published
+# advisories that reach the forward_auth + reverse_proxy vhosts this console writes for every
+# SSO-protected service. Caddy is not pinned (apt repo / COPR / static fallback), so a box
+# stays on whatever it got at install time unless something moves it — console Update
+# (_startup_caddy_selfheal), Caddy → Update and the deploy gate all lift it to this.
+# 2.11.7, not 2.11.6: 2.11.6's new idle timeouts crashed HTTP/2 proxying and cut streams.
+# Verified 2026-10-19: Cloudsmith apt and the @caddy/caddy COPR (epel-9 x86_64 + aarch64)
+# both carry 2.11.7.
+_CADDY_MIN_SECURE = (2, 11, 7)
+# `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
+_CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31712,6 +31752,72 @@ def _caddy_install_official_static(plog=None):
         except OSError:
             pass
         _caddy_version_cache['ver'] = None
+
+
+def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
+    """Move an installed Caddy below _CADDY_MIN_SECURE onto it. Returns (before, after).
+
+    Package manager first, so the binary stays package-managed: apt from the Cloudsmith repo,
+    dnf from the @caddy/caddy COPR. Only when that leaves the box short (repo not serving,
+    COPR lagging) does it fall back to the same sources deploy already uses — the SHA-512
+    checked GitHub .deb on apt, the official static build on dnf. A box with no Caddy, an
+    unreadable version, or one already at the floor is a no-op, so this is safe on every
+    console start.
+
+    After a version change the Caddyfile is regenerated (regenerate=True), because what it
+    emits depends on the version — e.g. read_body_idle for NetBird's gRPC streams, which a
+    2.11.4-era file lacks. generate_caddyfile() keeps the previous file if Caddy rejects the
+    new one. Deploy passes regenerate=False: its own Step 2 generates the file.
+
+    restart=True then restarts Caddy, but only once the Caddyfile on disk is confirmed to
+    load under the NEW binary. A file the new Caddy rejects is never restarted into — the
+    running process keeps serving its config. Callers that restart Caddy themselves
+    (deploy, Caddy → Update) pass restart=False."""
+    _log = log_fn or (lambda m: None)
+    _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+    before = _caddy_version_tuple(refresh=True)
+    if not before or before >= _CADDY_MIN_SECURE:
+        return before, before
+    _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
+    if _pkg_mgr() == 'dnf':
+        # Through the shim (Dependency Rule), so this is `dnf install`, which may or may not
+        # move an installed Caddy to the COPR's newest build. Either way the version is
+        # re-read below and anything still short gets the static build.
+        _pkg_install(['caddy'], log_fn=_log, timeout=300)
+        _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _log('  the COPR has no new enough Caddy — installing the official static build')
+            _caddy_install_official_static(_log)
+    else:
+        if _caddy_ensure_apt_repo(_log):
+            _pkg_install(['caddy'], log_fn=_log, timeout=300)
+            _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _caddy_install_github_deb(_log)
+    after = _caddy_version_tuple(refresh=True)
+    if not after or after < _CADDY_MIN_SECURE:
+        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(_CADDY_MIN_SECURE)}) — no newer Caddy '
+             'was reachable from this box. Retry with Caddy → Update.')
+    else:
+        _log(f'  ✓ Caddy {_vs(before)} → {_vs(after)}')
+    if after == before:
+        return before, after
+    if regenerate:
+        s = load_settings()
+        if (s.get('fqdn') or '').strip():
+            generate_caddyfile(s)
+    if not restart:
+        return before, after
+    verdict, out = _caddy_validate_config()
+    if verdict == 'bad':
+        _log('  ⚠ the Caddyfile still does not load under the new Caddy — NOT restarting; the '
+             f'running Caddy keeps serving its current config: {(out or "")[-200:]}')
+        return before, after
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=90)
+    _log('  ✓ Caddy restarted on the new version' if r.returncode == 0
+         else f'  ⚠ Caddy restart failed: {(r.stdout or "").strip()[-200:]}')
+    return before, after
 
 
 _caddy_last_validate_error = {'err': '', 'ts': 0.0}
@@ -31987,6 +32093,49 @@ def _startup_caddy_stream_close_delay_converge():
           flush=True)
 
 
+def _startup_caddy_read_body_idle_converge():
+    """Put read_body_idle into the Caddyfile on NetBird boxes already on Caddy >= 2.11.6.
+
+    A box lifted by _caddy_lift_to_secure_floor() is regenerated there. This covers the
+    one that got 2.11.6+ some other way (an OS patch run, a fresh deploy before this
+    release) and is cutting NetBird's gRPC streams every minute. Same shape as
+    _startup_caddy_stream_close_delay_converge(): one read on every box it does not apply to."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: read_body_idle converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'read_body_idle' in generated or '# NetBird VPN' not in generated:
+        return
+    if not _caddy_read_body_idle_lines(True):
+        return                      # Caddy older than 2.11.6 (or unknown): nothing to emit
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        # Startup migrations run before the module registry loads, so the write is deferred
+        # to the one catch-up regen + reload in _caddy_registry_loaded(). Seen on test6.
+        print('Startup migration: read_body_idle for NetBird queued — written with the '
+              'post-registry Caddyfile regen', flush=True)
+        return
+    try:
+        if 'read_body_idle' not in _read_priv(CADDYFILE_PATH):
+            print('Startup migration: ⚠ read_body_idle converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. Caddy keeps cutting quiet NetBird '
+                  'gRPC streams after one minute on this box.', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ Caddyfile now keeps NetBird gRPC streams open '
+          '(read_body_idle off) and Caddy %s' % ('reloaded' if _ok else
+                                                 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -32092,6 +32241,15 @@ def _startup_caddy_selfheal():
     except Exception as _cvE:
         print('Startup migration: Caddy version floor check error (non-fatal): %s'
               % str(_cvE)[:160], flush=True)
+
+    # Security floor (_CADDY_MIN_SECURE). Rides console Update the same way the 2.7 lift
+    # above does: nothing else moves an unpinned Caddy off the version it was installed at.
+    # No session invalidation here — a box above 2.7 compiles the auth headers correctly.
+    try:
+        _caddy_lift_to_secure_floor(lambda m: print('Startup migration: %s' % m, flush=True))
+    except Exception as _csE:
+        print('Startup migration: Caddy security floor error (non-fatal): %s'
+              % str(_csE)[:160], flush=True)
 
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
@@ -32245,7 +32403,8 @@ def generate_caddyfile(settings=None):
     # Emits nothing when unset, so a box that never touches this generates a byte-identical
     # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
-    lines += _caddy_global_options_lines()
+    lines += _caddy_global_options_lines(
+        grpc_streams=bool(modules.get('netbird', {}).get('installed')))
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
@@ -34095,6 +34254,12 @@ def run_caddy_deploy(domain):
             else:
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
                 _caddy_install_official_static(plog)
+            _cv = _caddy_version_tuple(refresh=True)
+        if _cv and _cv < _CADDY_MIN_SECURE:
+            # A box that already had Caddy may keep it through Step 1 (the package step can
+            # leave an installed Caddy where it is), so lift it to the security floor too.
+            # Step 2 regenerates the Caddyfile and Step 4 restarts Caddy.
+            _caddy_lift_to_secure_floor(plog, restart=False, regenerate=False)
             _cv = _caddy_version_tuple(refresh=True)
         if not _cv:
             plog(f"  ⚠ Could not read the Caddy version — treating it as older than {_min_s}. "
@@ -87945,6 +88110,11 @@ def _startup_migrations():
             _startup_caddy_stream_close_delay_converge()
         except Exception as _scd_err:
             print(f"Startup migration: stream_close_delay converge error (non-fatal): {_scd_err}",
+                  flush=True)
+        try:
+            _startup_caddy_read_body_idle_converge()
+        except Exception as _rbi_err:
+            print(f"Startup migration: read_body_idle converge error (non-fatal): {_rbi_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
