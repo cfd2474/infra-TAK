@@ -35143,10 +35143,11 @@ def _get_fail2ban_version_info():
 
 
 def _get_webodm_version_info():
-    """Return {version, update_available, latest} for the running WebODM instance."""
+    """Return {version, update_available, latest} for the running WebODM instance. `latest`
+    is the pinned, tested WEBODM_VERSION — not upstream's newest release, which Update would
+    not install (ops #92)."""
     import subprocess as _sp
-    import json as _json
-    info = {'version': '', 'update_available': False, 'latest': None}
+    info = {'version': '', 'update_available': False, 'latest': WEBODM_VERSION}
     try:
         r = _sp.run(
             _sudo_wrap(['docker', 'exec', 'webapp', 'python3', '-c',
@@ -35157,22 +35158,11 @@ def _get_webodm_version_info():
             info['version'] = v
     except Exception:
         pass
-    try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/WebODM/WebODM/releases/latest',
-                          headers={'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        latest = data.get('tag_name', '').lstrip('v')
-        if latest:
-            info['latest'] = latest
-            if info['version']:
-                def _tv(s):
-                    try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
-                    except: return (0,)
-                info['update_available'] = _tv(latest) > _tv(info['version'])
-    except Exception:
-        pass
+    if info['version']:
+        def _tv(s):
+            try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
+            except: return (0,)
+        info['update_available'] = _tv(WEBODM_VERSION) > _tv(info['version'])
     return info
 
 
@@ -45584,25 +45574,56 @@ def _webodm_odm_limits(detected_cores, cfg):
     return cpus, max(2, mem)
 
 
+# Pinned WebODM stack (ops #92): the exact images we test, never a floating :latest — an
+# untested upstream release must not land on a box just because something ran `pull`.
+# Bump them together, and only after a deploy + Update on a test box (amd64 and arm64).
+#   wo_broker  — upstream WebODM still ships redis:7.0.10, end of life with open CVEs
+#                (CVE-2025-49844 Lua use-after-free, CVE-2025-21605, CVE-2025-32023, …).
+#                WebODM's Celery 4.4 / kombu 4.6 / redis-py 3.2 client runs against 8.x.
+#   wo_db      — upstream publishes only :latest (PostgreSQL 9.5 / PostGIS 2.3, an upstream
+#                limitation), so it is pinned by digest.
+WEBODM_VERSION = '3.3.1'
+WEBODM_IMAGES = {
+    'wo_db':      'webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_nodeodm': 'webodm/nodeodx:2.4.0',
+}
+
+
+def _webodm_pin_images(compose_txt, services=None):
+    """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
+    only those in `services`). Installs from before the pins carry the floating refs they were
+    deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
+    in place. Idempotent — an already-pinned file comes back unchanged."""
+    for svc, image in WEBODM_IMAGES.items():
+        if services and svc not in services:
+            continue
+        compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
+                             lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
+    return compose_txt
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
   wo_appmedia:
 services:
   wo_db:
-    image: webodm/webodm_db
+    image: {images[wo_db]}
     container_name: wo_db
     volumes:
       - {wo_dir}/db:/var/lib/postgresql/data:Z
     restart: unless-stopped
     oom_score_adj: -100
   wo_broker:
-    image: redis:7.0.10
+    image: {images[wo_broker]}
     container_name: wo_broker
     restart: unless-stopped
     oom_score_adj: -500
   wo_webapp:
-    image: webodm/webodm_webapp
+    image: {images[wo_webapp]}
     container_name: webapp
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
@@ -45625,7 +45646,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_worker:
-    image: webodm/webodm_webapp
+    image: {images[wo_worker]}
     container_name: wo_worker
     entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
@@ -45643,7 +45664,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_nodeodm:
-    image: webodm/nodeodx
+    image: {images[wo_nodeodm]}
     container_name: wo_nodeodm
     command: ["--max_concurrency", "{wo_odm_cpus}"]
     cpus: {wo_odm_cpus}
@@ -45850,7 +45871,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
-        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
+        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
     # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
@@ -46046,6 +46067,7 @@ def _run_webodm_deploy(settings):
             wo_secret=wo_secret,
             wo_odm_cpus=_odm_cpus,
             wo_odm_mem=_odm_mem,
+            images=WEBODM_IMAGES,
         )
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -46257,7 +46279,14 @@ def _run_webodm_update():
         log.append(msg)
         _webodm_update_status['log'] = list(log)
     try:
-        plog('Pulling latest WebODM images…')
+        # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        compose_txt = _read_priv(compose_path)
+        pinned = _webodm_pin_images(compose_txt)
+        if pinned != compose_txt:
+            _write_priv(compose_path, pinned)
+            plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
@@ -87019,30 +87048,43 @@ def _startup_migrations():
                 _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
                 if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
                     _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
-                    _wo_nodeodm_block = (
-                        '  wo_nodeodm:\n'
-                        '    image: webodm/nodeodx\n'
-                        '    container_name: wo_nodeodm\n'
-                        f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
-                        f'    cpus: {_wo_cpus}\n'
-                        f'    mem_limit: {_wo_mem}g\n'
-                        '    restart: unless-stopped\n'
-                        '    oom_score_adj: 250\n'
-                    )
+
+                    def _wo_nodeodm_block(_m):
+                        # Keep the image the box already runs: moving NodeODX to the pin is a
+                        # large pull, so it happens on Update/redeploy, not on a console restart.
+                        _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
+                        return (
+                            '  wo_nodeodm:\n'
+                            f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
+                            '    container_name: wo_nodeodm\n'
+                            f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                            f'    cpus: {_wo_cpus}\n'
+                            f'    mem_limit: {_wo_mem}g\n'
+                            '    restart: unless-stopped\n'
+                            '    oom_score_adj: 250\n'
+                        )
                     _wo_before_cap = _wo_patched
                     _wo_patched = _re_wo.sub(
                         r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
-                        lambda _m: _wo_nodeodm_block,
+                        _wo_nodeodm_block,
                         _wo_patched,
                         count=1,
                     )
                     _wo_cap_changed = (_wo_patched != _wo_before_cap)
+                # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
+                # restart — a small image, and only wo_broker is recreated. The WebODM images
+                # move to their pins on Update/redeploy (large pulls + DB migrations).
+                _wo_before_redis = _wo_patched
+                _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
+                _wo_redis_changed = (_wo_patched != _wo_before_redis)
                 if _wo_patched != _wo_txt:
                     with open(_wo_compose, 'w') as _f:
                         _f.write(_wo_patched)
                     print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
                     if _wo_cap_changed:
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
+                    if _wo_redis_changed:
+                        print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
                     import subprocess as _sp_wo
                     _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
                                capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
