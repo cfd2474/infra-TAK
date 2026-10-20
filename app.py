@@ -57947,9 +57947,16 @@ def _authentik_apply_official_tunings(plog):
 
 # Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
 # scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
-# env vars. v1.25.1-p0 is the latest stable release as of Dec 2025 — pinning
-# rather than :latest avoids surprise version bumps on `docker compose pull`
-# during Update Now. Image is ~15MB so the pull cost is negligible.
+# env vars. Pinning rather than :latest avoids surprise version bumps on
+# `docker compose pull` during Update Now. Image is ~15MB so the pull cost is
+# negligible.
+#
+# v10.2.21: v1.25.1-p0 → v1.26.1-p0 (edoburu build of 2026-10-19, amd64+arm64)
+# for the PgBouncer security releases 1.25.2 / 1.26.0 / 1.26.1 — pre-auth
+# crashes and hangs in SCRAM/packet parsing, KILL_CLIENT authz, and a SCRAM
+# login-as-another-user flaw. https://www.pgbouncer.org/changelog.html
+# Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
+# (the install path only writes it when it first adds the service).
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -57957,7 +57964,7 @@ def _authentik_apply_official_tunings(plog):
 # for that pgbouncer version. Tags MUST be the exact DockerHub tag —
 # `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.26.1-p0'
 
 
 def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
@@ -59274,7 +59281,7 @@ def _ensure_authentik_pgbouncer(plog):
     # tag) get distinct errors from container-start issues (compose YAML
     # errors, depends_on chain breaks, port conflicts). Without this split,
     # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
-    # docker compose versions while only printing "Image edoburu/pgbouncer:v1.25.1-p0 Pulling"
+    # docker compose versions while only printing "Image edoburu/pgbouncer:<tag> Pulling"
     # to stdout — the actual error gets buried (tak-10, May 2026).
     # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
     # can show both streams distinctly.
@@ -59606,6 +59613,139 @@ def _ensure_authentik_worker_direct_pg(plog):
         return None
     plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
          f"server unchanged on PgBouncer")
+    _record('applied')
+    return True
+
+
+def _ensure_authentik_pgbouncer_image(plog):
+    """v10.2.21: move an existing PgBouncer sidecar onto `_AUTHENTIK_PGBOUNCER_IMAGE`.
+
+    `_ensure_authentik_pgbouncer` writes the image only when it first adds the service
+    and is an idempotent no-op afterwards, so bumping the pin never reached a box that
+    already had PgBouncer — every box installed since v0.9.23 was still on v1.25.1-p0.
+    This converges the compose `image:` to the pin (fleet constant, either direction).
+
+    Only an `edoburu/pgbouncer:*` image is managed; any other image is somebody's
+    deliberate swap with different env semantics and is left alone.
+
+    Pulls first (nothing is mutated if the pull fails), then rewrites compose and
+    recreates pgbouncer only — never server, worker or the LDAP outpost. The server's
+    client connections drop for the few seconds the container takes to come back,
+    the same blip as a pool-size reconcile. Verifies the RUNTIME (the container's
+    image and health), and rolls compose back to the old image if it doesn't come up.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer image: PyYAML unavailable — skipped (the pgbouncer step bootstraps it; next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+    except Exception as e:
+        plog(f"  pgbouncer image: compose unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    pgb = services.get('pgbouncer') if isinstance(services, dict) else None
+    if not isinstance(pgb, dict):
+        return False
+    target = _AUTHENTIK_PGBOUNCER_IMAGE
+    cur = str(pgb.get('image') or '').strip()
+    if cur == target:
+        return False
+    if not cur.startswith('edoburu/pgbouncer:'):
+        plog(f"  pgbouncer image: compose image {cur!r} is not edoburu/pgbouncer — left alone")
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-pgbouncer-image.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pgbouncer') or {}
+            if outcome == 'applied':
+                cfg['image'] = target
+            cfg['image_last_outcome'] = outcome
+            cfg['image_last_attempt_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['image_compose_backup'] = compose_bak
+            s['authentik_pgbouncer'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_pgbouncer():
+        return subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
+            cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    def _rollback(why):
+        plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
+        with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
+            if _locked:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+                _compose_up_pgbouncer()
+            else:
+                plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
+                     f"restore {compose_bak} by hand")
+
+    plog(f"  pgbouncer image: {cur} → {target} (PgBouncer security fixes) — pulling first...")
+    p = subprocess.run(_sudo_wrap(['docker', 'pull', target]), capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        plog(f"  ✗ pgbouncer image: pull failed, nothing changed (next boot retries): "
+             f"{((p.stderr or '') + (p.stdout or ''))[-300:]}")
+        _record('pull-failed')
+        return None
+
+    pgb['image'] = target
+    with _authentik_compose_lock('pgbouncer-image', plog=plog) as _locked:
+        if not _locked:
+            plog("  pgbouncer image: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(compose_bak, 'w') as f:
+                f.write(raw_compose)
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+        except Exception as e:
+            plog(f"  ✗ pgbouncer image: compose write failed ({e}) — restoring")
+            try:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_pgbouncer()
+    if r.returncode != 0:
+        _rollback(f"recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+        _record('recreate-failed')
+        return None
+
+    # Same 120s window the install path gives it; the healthcheck is pg_isready every 30s.
+    status = ''
+    for _ in range(24):
+        time.sleep(5)
+        h = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{.Config.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=10)
+        status = (h.stdout or '').strip()
+        parts = status.split()
+        if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
+            break
+    if status != f"{target} running healthy":
+        _rollback(f"container is {status or 'state unknown'}")
+        _record('rolled-back')
+        return None
+    plog(f"  ✓ pgbouncer image: running {target} (healthy); server+worker untouched")
     _record('applied')
     return True
 
@@ -87616,6 +87756,14 @@ def _startup_migrations():
             _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_wd_err:
             print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
+
+        # v10.2.21: the install step above only writes the PgBouncer image when it first
+        # adds the service, so existing boxes never left v1.25.1-p0. Converge them onto
+        # _AUTHENTIK_PGBOUNCER_IMAGE (PgBouncer security fixes); recreates pgbouncer only.
+        try:
+            _ensure_authentik_pgbouncer_image(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_img_err:
+            print(f"Startup migration: pgbouncer image error (non-fatal): {ak_pgb_img_err}")
 
         # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
         # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
